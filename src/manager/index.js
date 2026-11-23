@@ -1,0 +1,3189 @@
+// dsh-sessions-manager — host half.
+//
+// Serves /archived-sessions/* JSON routes (list / restore / restore-many /
+// delete / delete-many / sessions / workspaces / move) over the host
+// `webServer`. The browser Settings sections ("归档会话" & "移动会话") talk to
+// these. Reads/writes the durable workspace archive set
+// (workspaceRegistry + storageDomain), folds titles/dates/workspace tags from
+// session persistence, physically removes a session's log file on delete, and
+// relocates a conversation (session) between workspaces on move.
+import { mkdir, readFile, readdir, realpath, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
+import { basename, dirname, isAbsolute, join } from 'node:path'
+import { readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { rewriteFrame0CwdInMemory, scanZstdFrames } from './zstd-frame.js'
+import { createSessionMarkdownBuilder } from './markdown.js'
+import { createStarIndex } from './star-index.js'
+import { createTagIndex } from './tag-index.js'
+import { createSavedFilters } from './saved-filters.js'
+import { createPendingMoveStore } from './pending-moves.js'
+import { createMoveNoticeStore } from './move-notices.js'
+import { sweepStaleStateTemps } from './state-temp-sweep.js'
+import { aggregateStorage } from './storage-stats.js'
+import { createAutoArchiveStore, pickInactiveCandidates } from './auto-archive.js'
+import { createSessionMetaCache, fingerprintOf, persistFingerprintOf } from './session-meta-cache.js'
+import { createTitleIndexStore } from './title-persist-index.js'
+import { createEmptyScanStore } from './empty-scan-index.js'
+import { createActiveSessionTracker } from './active-session.js'
+import { createPersistenceAdapter } from './compat/persistence.js'
+import { detectCapabilities, requireCapability } from './compat/capabilities.js'
+import { pathOwnsSession } from './path-guard.js'
+import { purgeSessionArtifacts, moveSessionToCwd } from './handle-era-ops.js'
+import { classifyLineage, emptyScanCandidate, isEmptyEventTypes, subagentDescendantsOf, EMPTY_DECODE_LIMIT } from './lineage.js'
+import { cachedTitleOf, readCachedHints } from './projection-hints.js'
+
+// 构建指纹：build.mjs 以 define 在编译期注入；直接以源码运行（测试）时为 'dev'。
+// 用途：capabilities 带出 buildStamp，一眼判断「运行中的 host 是不是这份构建」——
+// 插件 host 端只在宿主启动时加载一次，改完 lib 不重启宿主等于白改。
+const BUILD_STAMP = typeof __BUILD_STAMP__ !== 'undefined' ? __BUILD_STAMP__ : 'dev'
+
+
+export const name = 'dsh-sessions-manager'
+export const inject = ['webServer', 'workspaceRegistry', 'sessionPersistence', 'sessionQuery', 'storageDomain']
+
+const MAX_TITLE = 80
+// 插件自有状态目录（星标 / 标签 / 保存筛选 / 自动归档 / 标题索引共用）。与 star-index.js、
+// tag-index.js、auto-archive.js
+// 的默认目录保持一致，环境变量同名，便于测试注入。
+const STATE_DIR = process.env.DSH_SESSIONS_MANAGER_STAR_DIR || join(homedir(), '.dsh', 'sessions-manager')
+// Recycle bin (回收站): normal deletes land here instead of being erased.
+const TRASH_DIR = process.env.DSH_SESSIONS_MANAGER_TRASH_DIR || join(homedir(), '.dsh', 'sessions-manager-trash')
+const TRASH_INDEX = join(TRASH_DIR, 'index.json')
+const TRASH_SCHEMA_VERSION = 2
+const DEFAULT_TRASH_SETTINGS = Object.freeze({ retentionDays: 0 })
+// -- per-session detail aggregation (v2.0: 取 Zephyr-vibe buildDetails 精华) --
+// 识别“搜索/抓取”类工具，用来收集 fetch 记录。
+const FETCH_TOOL_RE = /search|fetch|download|browse/i
+const MAX_FETCHES = 12   // fetch 记录上限（防响应过大）
+const MAX_FILES = 20     // write/edit 文件列表上限
+const MAX_STORAGE_TOP = 50 // 存储排行返回上限（防响应过大）
+
+function json(res, value, status = 200) {
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+  res.end(JSON.stringify(value))
+}
+
+function errorStatus(error) {
+  return error && Number.isInteger(error.status) ? error.status : 500
+}
+
+// 极简并发闸：整本日志读取（详情 / 导出）同时最多 max 个在跑，排队等待。
+// 防止批量导出把宿主 CPU/内存打满（SessionHandle 世代逐块解码仍是 CPU 活）。
+function createLimiter(max) {
+  let active = 0
+  const queue = []
+  return async function run(fn) {
+    if (active >= max) await new Promise((resolve) => queue.push(resolve))
+    active++
+    try { return await fn() } finally {
+      active--
+      const next = queue.shift()
+      if (next) next()
+    }
+  }
+}
+
+async function readJsonBody(req) {
+  const chunks = []
+  let total = 0
+  for await (const chunk of req) {
+    chunks.push(chunk)
+    total += chunk.length
+    if (total > 1 << 20) return null
+  }
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString('utf8'))
+  } catch {
+    return null
+  }
+}
+
+function parseIds(body) {
+  const raw = body && body.sessionIds
+  if (!Array.isArray(raw)) return null
+  const ids = []
+  for (const v of raw) if (typeof v === 'string' && isSafeSessionId(v)) ids.push(v)
+  return ids
+}
+
+function isSafeSessionId(value) {
+  return typeof value === 'string' && value.length > 0 && value.length <= 200 && !/[\\/\0]/.test(value) && value !== '.' && value !== '..'
+}
+
+function requireSessionId(value) {
+  if (!isSafeSessionId(value)) {
+    const error = new Error('无效的 sessionId')
+    error.status = 400
+    throw error
+  }
+  return value
+}
+
+// Best-effort: figure out which conversation is the host's *currently active*
+// one. DSH's in-memory session store (ctx.sessions) keeps EVERY instantiated
+// session alive even after you switch away in the UI, so "is it in
+// ctx.sessions" is NOT the same as "is it the active conversation". We probe a
+// few known accessors for the active id; if none is available we return null
+// and callers should treat the session as movable (the move path is
+// crash-safe via backup+rollback and re-syncs the live object afterwards).
+//
+// 这些访问器只在旧核心（≤0.1.6）里存在。0.1.7+ / 0.2.x 把「当前选中哪个会话」
+// 完全移到了客户端（uiWorkspace 持 mainView 引用），host 侧三个探测全部落空 →
+// 恒 null。所以真正的判定入口是下面的 getActiveSessionIds（客户端心跳优先），
+// 这个函数退化为旧核心的兜底探测。
+function legacyActiveSessionId(context) {
+  try {
+    const a = context.get('activeSession')
+    if (a != null) return (a && a.id != null) ? a.id : (typeof a === 'string' ? a : null)
+  } catch (e) { /* no such key */ }
+  try {
+    const c = context.get('currentSession')
+    if (c != null) return (c && c.id != null) ? c.id : (typeof c === 'string' ? c : null)
+  } catch (e) { /* no such key */ }
+  try {
+    const store = context.get('sessions')
+    if (store && store.active && store.active.id != null) return store.active.id
+  } catch (e) { /* no such key */ }
+  return null
+}
+
+// 活跃会话判定：优先采信客户端心跳（0.1.7+ 唯一可信来源），没有心跳才退回旧核心
+// 访问器探测。心跳过期/没有客户端连接 → 空集合，调用方按「无法证明活跃」处理。
+function getActiveSessionIds(context, tracker) {
+  const reported = tracker ? tracker.activeIds() : null
+  if (reported && reported.size) return reported
+  const legacy = legacyActiveSessionId(context)
+  return legacy != null ? new Set([String(legacy)]) : new Set()
+}
+
+// foldTitle（v3.6.1 删除路径的兜底折叠）随 v3.6.2 #7 的「删除路径零解码」一并
+// 移除；标题折叠逻辑的权威实现现在是 runtime 投影（src/index.js projectTitlesStatus）。
+
+export function apply(ctx) {
+  const w = ctx.workspaceRegistry
+  const sp = ctx.sessionPersistence
+  const persistence = createPersistenceAdapter(sp)
+  const capabilities = detectCapabilities({ persistence: sp, workspaceRegistry: w })
+  const sq = ctx.sessionQuery
+  const dom = () => ctx.storageDomain.get('workspace')
+  const authorityTitleCache = new Map()
+  // 会话原始元数据缓存（title / cwd / createdAt），按日志文件 (mtime, size) 指纹校验。
+  // 见 src/session-meta-cache.js 的说明：列表构建原本每条会话都要整本解压日志，
+  // 这个缓存让「日志没变」的会话直接跳过解码。
+  const metaCache = createSessionMetaCache()
+  // 持久标题索引（冷启动加速）：metaCache 是进程内的，重启即空——第一次列表
+  // 仍要全库解码。索引按同样的 (mtime, size) 指纹存解码结果，指纹没变的会话
+  // 重启后也直接复用。见 src/title-persist-index.js。
+  const titleIndex = createTitleIndexStore({ dir: TRASH_DIR, file: join(TRASH_DIR, 'title-index.json') })
+  // T1（3.7.0）：空白精判结论的持久层。只有**真解码成功**的判定落盘（unknown
+  // 与失败兜底都不是结论），sz 指纹 + 14 天 TTL 双闸门防「同尺寸原地改写」。
+  const emptyIndex = createEmptyScanStore({ dir: TRASH_DIR })
+  // 活跃会话（客户端心跳上报，见 src/active-session.js）：0.1.7+ host 侧无法
+  // 自行判断「用户正在看哪个会话」，靠客户端周期性上报。过期即失效。
+  const activeTracker = createActiveSessionTracker()
+  const EMPTY_VERDICT_TTL_MS = 14 * 24 * 3600 * 1000
+
+  // P4：对「内存缓存未命中」的会话查持久索引，指纹一致才可信。
+  // 返回 Map<id, meta>；调用方应把命中条目回填 metaCache 并从 missing 里剔除。
+  // revision 指纹（SessionHandle 世代）跳过持久索引：跨进程无意义。
+  async function hydrateFromPersist(ids, statsById) {
+    const hits = new Map()
+    if (!ids || !ids.length) return hits
+    let store
+    try { store = await titleIndex.entries() } catch (e) { return hits }
+    for (const id of ids) {
+      const stat = statsById.get(id)
+      const entry = store && store[id]
+      if (!stat || !entry) continue
+      // 持久索引只认可跨重启的指纹（legacy 的文件指纹 / handle 世代的 sz 指纹，
+      // 见 session-meta-cache.persistFingerprintOf——issue #8 之前 handle 世代
+      // 从不落盘，导致每次重启都全量重新解码）。
+      const fp = persistFingerprintOf(stat)
+      if (!fp) continue
+      // v3.6.2 #1：title 为 null 的条目必须是「投影确实成功过」（resolved）才可信。
+      // v3.6.1 把投影失败当结果落盘的污染条目（null 标题、无标记）在这里被丢弃，
+      // 调用方按未命中处理 → 重新入队预热，索引自愈。
+      if (entry.fingerprint === fp && (entry.title || entry.resolved)) {
+        hits.set(id, { title: entry.title, cwd: entry.cwd, createdAt: entry.createdAt })
+      }
+    }
+    return hits
+  }
+
+  // 把本批真正解码出的元数据回写持久索引（索引只是加速器：写失败不影响响应，
+  // 队列内部已串行化 + 原子替换）。**必须 await** —— 它是持久写入，浮动写入会在
+  // 调用方/测试 teardown 已开始清理状态目录时落地（`ENOTEMPTY: rmdir .../state`），
+  // 且"响应已返回但索引没落盘"时进程若恰好退出就会丢条目。
+  // 指纹用 persistFingerprintOf：legacy 文件指纹 + handle 世代 sz(sizeBytes) 指纹
+  // 都可跨重启；rev: 指纹仍被排除（实例内 opaque token，issue #8）。
+  // v3.6.2 #1：decoded 的值是 { meta, resolved } —— resolved=false（投影失败）
+  // 的条目绝不落盘；null 标题只有 resolved=true 才允许（否则读取端会当污染丢弃）。
+  async function persistDecoded(decoded, statsById) {
+    if (!decoded || !decoded.size) return
+    const batch = {}
+    const now = Date.now()
+    for (const [id, pack] of decoded) {
+      if (!pack || !pack.resolved) continue
+      const meta = pack.meta
+      const fp = persistFingerprintOf(statsById.get(id))
+      if (!fp) continue
+      batch[id] = { title: meta.title, cwd: meta.cwd, createdAt: meta.createdAt, fingerprint: fp, updatedAt: now, resolved: 1 }
+    }
+    if (!Object.keys(batch).length) return
+    try { await titleIndex.merge(batch) } catch (e) { /* 索引写失败不影响本次响应 */ }
+  }
+
+  // 从投影快照里抽出元数据；快照缺失/异常时返回零值 meta（调用方决定兜底）。
+  function metaFromSnapshot(o) {
+    let title = null, createdAt = null, cwd = null
+    if (o) {
+      if (o.title && o.title.title) title = String(o.title.title)
+      if (o.session) { cwd = o.session.cwd || null; createdAt = o.session.createdAt || null }
+    }
+    return { title, cwd, createdAt }
+  }
+
+  // 投影快照的两种返回形态都兼容：新版 runtime 返回 settled 结果
+  // （{ status: 'fulfilled', value }），老版本直接返回快照本身。
+  function unwrapSnapshot(result) {
+    if (!result) return null
+    if (result.status === 'fulfilled') return result.value || null
+    if (result.status === 'rejected') return null
+    return result
+  }
+
+  // —— 0.2.0+ 官方 title 投影快路径（2026-09-29 审计 P2）————————————————
+  // dsh-session-title（0.2.0 起 dsh-base 默认组合挂载）把标题折叠官方化为
+  // O(1) 投影（key='title'，state 为 string|null），注册表对已 materialize 的
+  // cell 提供 cachedSnapshot——只读 watermark 缓存，**零折叠、零磁盘 I/O**
+  // （对比 readTitleSnapshots 每条整本解码，issue #8）。命中即免预热。
+  // 红线：
+  //   1. 只信 cachedSnapshot（绝不调 stateOf——那会对内存日志做同步折叠，
+  //      违反「请求路径零重活」纪律）；
+  //   2. 服务不存在（0.1.7）/会话未实例化/任何异常 → 静默返回 null，行为与
+  //      3.7.4 完全一致；
+  //   3. cachedSnapshot 的 title=null 只说明「该 cell 还没有非空标题」（可能
+  //      会话从未打开、cell 未折叠）——一律当**未知**交回预热队列，绝不冒充
+  //      「会话真的无标题」（empty 三态纪律，v3.7.0 T1）。
+  function projectionTitleOf(liveStore, id) {
+    try {
+      const reg = ctx.get('sessionProjections')
+      if (!reg || typeof reg.cachedSnapshot !== 'function') return null
+      const session = liveStore && liveStore.get && liveStore.get(id)
+      if (!session) return null
+      const snap = reg.cachedSnapshot(session, ['title'])
+      const title = snap && snap.values ? snap.values.title : null
+      return typeof title === 'string' && title.length > 0 ? title : null
+    } catch (e) { return null }
+  }
+
+  // —— 0.2.2+ 官方持久投影缓存（3.8.1 底座换轨）——————————————————————————
+  // 上面的 projectionTitleOf 只覆盖**已实例化**的 live 会话；历史会话（冷会话）
+  // 以前只能等 readTitleSnapshots 把整本日志解码（issue #8）。0.2.2-rc.3 默认
+  // 挂载的 sessionProjectionCache 补上了这一层：cachedSnapshot(header, keys)
+  // 只读 header、零 I/O，冷会话也能直接拿到标题与 sessionListMetadata.blank。
+  //
+  // 红线：
+  //   1. 服务不存在（0.1.7 / 0.2.0 早期）→ null，行为与 3.8.0 完全一致；
+  //   2. 只当提示用（缓存可能过期但永不超前），title 为空仍是「未知」→ 交预热；
+  //   3. blank 只做单向预筛（见 projection-hints.js 的说明）。
+  function cachedHintsOf(header) {
+    if (!header || typeof header !== 'object') return null
+    try { return readCachedHints(ctx.get('sessionProjectionCache'), ctx.get('sessionProjections'), header) } catch (e) { return null }
+  }
+
+  function cachedTitleOfHeader(header) {
+    try { return cachedTitleOf(ctx.get('sessionProjectionCache'), ctx.get('sessionProjections'), header) } catch (e) { return null }
+  }
+
+  // 持久缓存只服务**冷会话**：live 会话的标题以注册表投影为准（上游也这么分：
+  // api-session-controller 的 projectionsFor 对 live 走 snapshot、对 header 才走
+  // cache）。否则刚改名、cell 还没折叠的那一瞬间会被上一代缓存顶回旧标题。
+  function isLiveSession(liveStore, id) {
+    try { return !!(liveStore && typeof liveStore.get === 'function' && liveStore.get(id)) } catch (e) { return false }
+  }
+
+  async function archivedState() {
+    const d = dom()
+    if (!d) throw new Error('workspace domain is not open')
+    return d.global.get()
+  }
+
+  async function writeArchived(nextIds) {
+    const d = dom()
+    if (!d) throw new Error('workspace domain is not open')
+    const cur = d.global.get()
+    const next = Object.assign({}, cur, { archivedSessionIds: nextIds })
+    await d.global.set(next)
+    // Keep the registry's in-memory cache in sync so the live sidebar refreshes.
+    if (w && 'state' in w) { try { w.state = next } catch (e) { /* best-effort */ } }
+    return next
+  }
+
+  let archiveMutation = Promise.resolve()
+  function mutateArchived(mutator) {
+    const operation = archiveMutation.then(async () => {
+      const state = await archivedState()
+      const list = (state.archivedSessionIds || []).map(String)
+      const result = await mutator(list)
+      if (result.next) await writeArchived(result.next)
+      return result.value
+    })
+    archiveMutation = operation.catch(() => {})
+    return operation
+  }
+
+  let wsByPath = {}
+
+  // 把原始元数据渲染成列表项。缓存命中与解码两条路径共用，保证输出一致。
+  function buildItem(key, meta, usage, exposeUsage) {
+    const cwd = meta.cwd || null
+    const ws = cwd ? wsByPath[cwd] : undefined
+    const title = meta.title || null
+    const display = title ? (String(title).length > MAX_TITLE ? String(title).slice(0, MAX_TITLE) + '…' : String(title)) : null
+    const base = {
+      sessionId: key,
+      title: display,
+      createdAt: meta.createdAt || null,
+      workspacePath: cwd,
+      workspaceTitle: (ws && ws.title) ? ws.title : null,
+      workspaceGone: !!(cwd && !ws),
+      hasWorkspace: !!cwd,
+    }
+    // sizeBytes / updatedAt 只在需要的路由里带出（存储分析 / 自动归档 / 会话
+    // 列表——3.7.0 起列表也要：分支组时间回退键读 updatedAt）。它们本就来自
+    // usage，只是 payload 体积，不引入任何解码。
+    if (exposeUsage && usage) {
+      if (usage.sizeById && usage.sizeById.has(key)) base.sizeBytes = usage.sizeById.get(key)
+      if (usage.mtimeById && usage.mtimeById.has(key)) base.updatedAt = usage.mtimeById.get(key)
+    }
+    return base
+  }
+
+  // Resolve one session's display metadata.
+  //
+  // 成本模型（issue #1 → issue #8）：runtime 的标题投影（readTitleSnapshots）
+  // 在 0.1.x 上对每条非 live 会话都是**整本日志解码**（SessionCorpus.projectMany
+  // → inspectPersisted）。列表构建绝不能在请求路径上同步触发它——issue #8 实测：
+  // 87 本日志 / 249MB 的库，一次冷启动全量投影把宿主打满 ~90s CPU。
+  //
+  // 因此请求路径只消费两级缓存（metaCache 内存缓存 → titleIndex 持久索引），
+  // 缺失的会话交给后台预热队列分批补齐（见 enqueueWarm/runWarm）；侧栏高频
+  // 轮询 + 管理面板刷新会让补齐结果自然浮现。
+  const EMPTY_META = { title: null, cwd: null, createdAt: null }
+
+  // —— 冷启动后台预热（issue #8）—————————————————————————————————————
+  // 单飞队列：请求路径发现缓存未命中的会话，把 { stat, header } 快照丢进
+  // warmQueue，由 runWarm 以小批次消费。每批之间 setImmediate 让步事件循环，
+  // 绝不独占宿主主线程；结果写 metaCache + 持久标题索引。stat 是入队时刻的
+  // 快照——若日志在预热期间又变了，下次请求的指纹比对会再次判未命中并重新
+  // 入队，天然自愈。
+  const WARM_CHUNK = 4
+  const warmQueue = new Map()
+  let warmRunning = false
+  let warmKickTimer = null
+
+  // v3.6.2 #1：投影失败的三态处理（issue #8 审计）。旧实现把「投影失败」和
+  // 「会话真没标题」混为同一个 null → 失败被写进缓存/持久索引，跨重启固化成
+  // 永久占位且永不重试。现在：
+  //   - resolved（fulfilled，title 可以是 null = 事实无标题）→ 正常入缓存+落盘；
+  //   - failed（rejected / 批量异常 / 结果缺条）→ 不缓存、不落盘，按 id 计数退避。
+  // 退避：15s×2^n 递增，最多 WARM_MAX_ATTEMPTS 次；此后 parked 一小时后再探一次
+  // （坏日志长期停摆时不至于永久静默）。日志指纹任何变化都清零计数重新武装。
+  const WARM_MAX_ATTEMPTS = 5
+  const warmFail = new Map() // id → { count, fp, nextAt }
+
+  function warmFpOf(stat) {
+    return fingerprintOf(stat) || persistFingerprintOf(stat)
+  }
+
+  function warmBlocked(id, fp) {
+    const rec = warmFail.get(id)
+    if (!rec) return 0
+    if (fp && rec.fp && rec.fp !== fp) { warmFail.delete(id); return 0 } // 内容变了 → 重新武装
+    const now = Date.now()
+    return rec.nextAt > now ? rec.nextAt - now : 0
+  }
+
+  function warmMarkFailure(id, stat, header) {
+    const rec = warmFail.get(id) || { count: 0, fp: null, nextAt: 0 }
+    rec.count += 1
+    rec.fp = warmFpOf(stat) || rec.fp
+    // 退避到点后由 scheduleWarmRetry 原样重新入队（含本轮的 stat/header 快照）。
+    if (stat) rec.stat = stat
+    if (header) rec.header = header
+    const backoff = rec.count >= WARM_MAX_ATTEMPTS
+      ? 60 * 60 * 1000
+      : Math.min(5 * 60 * 1000, 15 * 1000 * Math.pow(2, rec.count))
+    rec.nextAt = Date.now() + backoff
+    warmFail.set(id, rec)
+  }
+
+  // 队列里还有「未放弃」的活 → 侧栏/面板应缩短轮询节拍（client 消费）。
+  function warmPendingNow() {
+    if (!warmHasApi) return false
+    if (warmRunning || warmQueue.size) return true
+    for (const rec of warmFail.values()) if (rec.nextAt > Date.now()) return true
+    return false
+  }
+
+  // 退避到点的条目由一个 unref 定时器重新入队（每轮只挂最近的一个）。
+  let warmRetryTimer = null
+  function scheduleWarmRetry() {
+    if (warmRetryTimer) return
+    let soonest = 0
+    for (const rec of warmFail.values()) {
+      const wait = rec.nextAt - Date.now()
+      if (wait <= 0) { soonest = 1; break }
+      if (!soonest || wait < soonest) soonest = wait
+    }
+    if (!soonest) return
+    warmRetryTimer = setTimeout(() => {
+      warmRetryTimer = null
+      // 到点的条目重新入队（enqueue 时会重新校验 blocked/fp）。
+      const now = Date.now()
+      for (const [id, rec] of warmFail) {
+        if (rec.nextAt <= now && !warmQueue.has(id)) warmQueue.set(id, { stat: rec.stat || null, header: rec.header || null })
+      }
+      if (warmQueue.size) scheduleWarm()
+    }, soonest)
+    if (typeof warmRetryTimer.unref === 'function') warmRetryTimer.unref()
+  }
+
+  function scheduleWarm() {
+    if (warmKickTimer || warmRunning) return
+    warmKickTimer = setTimeout(() => { warmKickTimer = null; runWarm() }, 25)
+    // unref：预热绝不反过来把宿主进程钉住（与 autoArchive「无定时器」同一原则）。
+    if (typeof warmKickTimer.unref === 'function') warmKickTimer.unref()
+  }
+
+  function enqueueWarm(ids, statsById, entryById) {
+    if (!ids || !ids.length) return
+    // 无投影 API 的 runtime：预热注定无果，不入队（占位行为退回「列表不带标题」
+    // 的诚实形态，而不是让退避定时器永远转下去）。
+    if (!warmHasApi) return
+    for (const id of ids) {
+      const key = String(id)
+      const stat = statsById ? (statsById.get(key) || null) : null
+      // #9：任何指纹都算不出来的会话（live 未落盘等）既进不了内存缓存也进不了
+      // 持久索引——投影结果注定无处安放，每轮轮询重复入队只是白烧 CPU（churn）。
+      // 跳过；这类行的标题由 DSH 自己的 live 渲染保证。
+      const fp = warmFpOf(stat)
+      if (!fp) continue
+      // #1：仍在失败退避窗口内的条目不重复入队（runWarm 会按 blocked 跳过）。
+      const blockedMs = warmBlocked(key, fp)
+      const entry = entryById ? entryById.get(key) : null
+      const rec = warmFail.get(key)
+      if (rec) { rec.stat = stat || rec.stat; if (entry) rec.header = entry.header || rec.header }
+      if (blockedMs > 0) continue
+      warmQueue.set(key, {
+        stat,
+        header: (entry && entry.header) || null,
+      })
+    }
+    if (warmQueue.size) scheduleWarm()
+    scheduleWarmRetry()
+  }
+
+  // #7：软删除时标题可能还没预热出来（回收站条目落一条 title:null 的诚实记录），
+  // 之后任何一轮 warm 解出该会话标题就补写进回收站索引——只补空标题，
+  // 绝不覆盖已有值。回收站渲染端（t.title || t.sessionId）随下次拉取自然更新。
+  async function backfillTrashTitles(decoded) {
+    if (!decoded || !decoded.size) return
+    try {
+      const items = await readTrash()
+      const worth = items.some((t) => !t.title && decoded.get(String(t.sessionId)) && decoded.get(String(t.sessionId)).meta && decoded.get(String(t.sessionId)).meta.title)
+      if (!worth) return
+      await mutateTrash((store) => {
+        for (const item of store.items) {
+          if (item.title) continue
+          const pack = decoded.get(String(item.sessionId))
+          const t = pack && pack.meta && pack.meta.title
+          if (t) item.title = String(t)
+        }
+      })
+    } catch (e) { /* 补写失败无害：索引只是加速器 */ }
+  }
+
+  async function runWarm() {
+    if (warmRunning) return
+    warmRunning = true
+    try {
+      while (warmQueue.size) {
+        const batch = [...warmQueue.entries()].slice(0, WARM_CHUNK)
+        for (const [id] of batch) warmQueue.delete(id)
+        try {
+          const ids = batch.map(([id]) => id)
+          const resultById = await projectTitlesStatus(ids)
+          const decoded = new Map()
+          const statsById = new Map()
+          for (const [id, desc] of batch) {
+            const r = resultById.get(id)
+            if (!r || !r.resolved) {
+              // 投影失败：绝不写缓存/持久索引（否则失败被固化为永久占位）。
+              warmMarkFailure(id, desc.stat, desc.header)
+              continue
+            }
+            warmFail.delete(id)
+            const meta = metaFromSnapshot(r.snapshot || null)
+            // cwd/createdAt 永远以最新 list header 为权威（投影的 session 头可能
+            // 陈旧；移动会话后尤其如此），投影只负责标题。
+            if (desc.header) {
+              if (typeof desc.header.cwd === 'string') meta.cwd = desc.header.cwd
+              if (desc.header.createdAt != null) meta.createdAt = desc.header.createdAt
+            }
+            metaCache.set(id, desc.stat, meta)
+            statsById.set(id, desc.stat)
+            decoded.set(id, { meta, resolved: true })
+          }
+          await persistDecoded(decoded, statsById)
+          // #7：回收站条目删除时可能没有标题（软删除只记录）；预热解出来后补写。
+          await backfillTrashTitles(decoded)
+        } catch (e) { /* 单批失败不影响后续批次：索引/缓存只是加速器 */ }
+        // 批间让步：保证宿主事件循环（RPC/心跳/其他插件）始终可调度。
+        await new Promise((resolve) => setImmediate(resolve))
+      }
+    } finally {
+      warmRunning = false
+      // 预热期间又有新请求入队 → 再排一轮。
+      if (warmQueue.size) scheduleWarm()
+      scheduleWarmRetry()
+    }
+  }
+
+  // Disk usage + last-write time for every session, in one pass. Also produces
+  // the per-id change token (`statsById`) that drives the metadata cache:
+  //   - SessionHandle 世代（0.1.3+）：公共服务不再暴露 locate/raw 路径，
+  //     snapshot.revision（list 一次就带回）就是官方唯一变更令牌；
+  //   - legacy：沿用 sp.locate + 一次 stat 的 (mtime, size) 文件指纹。
+  // mtime doubles as the session's last-activity time — appending an event
+  // rewrites the log, so the file's last write tracks the conversation's last
+  // turn. It errs safe: a log we relocated (move) gets a fresh mtime and
+  // therefore looks *more* active than it is, which can only delay an
+  // auto-archive, never cause a wrong one. Handle-era runtimes provide no
+  // activity timestamp at all; auto-archive must then skip instead of guessing
+  // (see autoArchiveSweep).
+  // entries 可由调用方传入复用（列表构建里已经 sp.list() 过一次，避免重复列目录）。
+  async function collectUsage(preloadedEntries) {
+    const sizeById = new Map()
+    const mtimeById = new Map()
+    const statsById = new Map()
+    let entries = null
+    if (Array.isArray(preloadedEntries)) entries = preloadedEntries
+    else { try { entries = await persistence.listEntries() } catch (e) { entries = [] } }
+    if (!Array.isArray(entries)) entries = []
+    const CHUNK = 8
+    for (let i = 0; i < entries.length; i += CHUNK) {
+      await Promise.all(entries.slice(i, i + CHUNK).map(async (entry) => {
+        const header = entry && entry.header ? entry.header : entry
+        const id = entry && entry.id != null ? String(entry.id) : (header && header.id != null ? String(header.id) : null)
+        if (!id) return
+        // SessionHandle 世代：snapshot（header/revision/sizeBytes）是权威轻量
+        // 观察，绝不再绕道私有磁盘路径补 stat。revision 进内存缓存指纹；
+        // sizeBytes 供 persistFingerprintOf 派生跨重启的 sz 持久指纹（issue #8）。
+        if (entry && typeof entry.revision === 'string' && entry.revision) {
+          if (Number.isFinite(entry.sizeBytes)) sizeById.set(id, Number(entry.sizeBytes))
+          statsById.set(id, Number.isFinite(entry.sizeBytes)
+            ? { revision: entry.revision, sizeBytes: Number(entry.sizeBytes) }
+            : { revision: entry.revision })
+          return
+        }
+        if (entry && Number.isFinite(entry.sizeBytes)) sizeById.set(id, Number(entry.sizeBytes))
+        try {
+          const loc = persistence.locate(header)
+          if (!loc || typeof loc.path !== 'string' || !loc.path) return
+          const st = await stat(loc.path)
+          if (!st) return
+          if (typeof st.size === 'number') sizeById.set(id, st.size)
+          if (typeof st.mtimeMs === 'number' && st.mtimeMs > 0) {
+            mtimeById.set(id, Math.floor(st.mtimeMs))
+            statsById.set(id, { mtimeMs: Math.floor(st.mtimeMs), size: typeof st.size === 'number' ? st.size : undefined })
+          }
+        } catch (e) { /* best-effort: an unreadable log just stays unknown */ }
+      }))
+    }
+    return { sizeById, mtimeById, statsById, hasActivityData: mtimeById.size > 0 }
+  }
+
+  // Restore (unarchive) one session; throws on failure.
+  async function restoreOne(sid) {
+    requireSessionId(sid)
+    return mutateArchived((list) => list.includes(sid)
+      ? { next: list.filter((x) => x !== sid), value: { ok: true, restored: true } }
+      : { next: null, value: { ok: true, restored: false } })
+  }
+
+  // ---- Recycle bin (回收站) helpers ----------------------------------------
+  let trashMutation = Promise.resolve()
+  function normalizeTrashStore(raw) {
+    if (Array.isArray(raw)) return { schemaVersion: TRASH_SCHEMA_VERSION, settings: { ...DEFAULT_TRASH_SETTINGS }, items: raw, purgedSessionIds: [] }
+    const settings = raw && typeof raw.settings === 'object' ? raw.settings : {}
+    const retentionDays = Number.isInteger(settings.retentionDays) && settings.retentionDays >= 0 ? settings.retentionDays : 0
+    return {
+      schemaVersion: TRASH_SCHEMA_VERSION,
+      settings: { retentionDays },
+      items: raw && Array.isArray(raw.items) ? raw.items : [],
+      purgedSessionIds: raw && Array.isArray(raw.purgedSessionIds) ? [...new Set(raw.purgedSessionIds.filter(isSafeSessionId).map(String))] : [],
+    }
+  }
+  async function readTrashStore() {
+    try { return normalizeTrashStore(JSON.parse(readFileSync(TRASH_INDEX, 'utf8'))) } catch (e) { return normalizeTrashStore(null) }
+  }
+  async function readTrash() { return (await readTrashStore()).items }
+  async function writeTrashStore(store) {
+    await mkdir(TRASH_DIR, { recursive: true })
+    const tmp = join(TRASH_DIR, `.index-${process.pid}-${Date.now()}.tmp`)
+    await writeFile(tmp, JSON.stringify(normalizeTrashStore(store), null, 2), { encoding: 'utf8', mode: 0o600 })
+    await rename(tmp, TRASH_INDEX)
+  }
+  function mutateTrash(mutator) {
+    const operation = trashMutation.then(async () => {
+      const store = await readTrashStore()
+      const result = await mutator(store)
+      await writeTrashStore(store)
+      return result
+    })
+    trashMutation = operation.catch(() => {})
+    return operation
+  }
+
+  // ---- Starred sessions (收藏, schema v3) -----------------------------------
+  // User marks, kept in the plugin's own index (never touches DSH logs). Stars
+  // survive archive & soft-delete — both are reversible — and are dropped only
+  // when the session is really gone (purge, or externally removed; the latter
+  // is caught by gcStars during list builds).
+  const stars = createStarIndex()
+  // 标签（3.7.0，schema v4）：与星标同型、同状态目录（tags.json）。纯用户元数据，
+  // rename/merge/delete 只重写标签文档，永不触碰会话本体（方案 §1.3 红线）。
+  const tags = createTagIndex()
+  // 保存的筛选（schema v1，saved-filters.json）：filters 为不透明 JSON，host
+  // 只限条数/名称/序列化体积，绝不解析其内容。
+  const savedFilters = createSavedFilters()
+  // 待移动队列：会话被占用（DSH 打开中）时登记，等它释放后自动完成移动。
+  // 见 src/pending-moves.js 的模块注释（0.1.5 单写者锁没有公共释放 API）。
+  const pendingMoves = createPendingMoveStore()
+  // T2：排队移动的后台终局（完成/放弃）落成持久通知，sidebar-state 带出、
+  // client 弹出后 ack 清除。独立于队列文件（终局与队列项同生死，挂条目上观察不到）。
+  const moveNotices = createMoveNoticeStore()
+  // Auto-archive settings live in their own schema-v4 store, off by default.
+  const autoArchive = createAutoArchiveStore()
+  // 启动清扫：进程在「写临时文件 → rename」之间被杀会留下 .<name>-<pid>-<ts>.tmp
+  // 孤儿（实测一次累积 153 个）。这里把 1 小时前的旧临时文件收掉，不碰正在写的。
+  sweepStaleStateTemps([STATE_DIR, TRASH_DIR], {}).catch(() => {})
+
+  async function gcStars(validIds) {
+    try {
+      const store = await stars.read()
+      const valid = new Set(validIds.map(String))
+      const gone = store.starredSessionIds.filter((id) => !valid.has(id))
+      if (gone.length) await stars.removeIds(gone)
+    } catch (e) { /* best-effort */ }
+  }
+
+  // 标签的会话侧引用同样要 GC：会话被外部移除（不在 list 基线里）时，
+  // assignments 里的键会变成永远列不出来的幽灵。与 gcStars 同挂点、同信任条件。
+  async function gcTags(validIds) {
+    try {
+      const store = await tags.read()
+      const valid = new Set(validIds.map(String))
+      const gone = Object.keys(store.assignments).filter((id) => !valid.has(id))
+      if (gone.length) await tags.removeIds(gone)
+    } catch (e) { /* best-effort */ }
+  }
+
+  // Soft-delete one session: record it in the recycle-bin index but KEEP its
+  // log in the original workspace directory. Moving the file out (and detaching
+  // it from the workspace) orphaned the session into DSH's "未分组" group and
+  // made restore land in 未分组 instead of the original workspace — so we leave
+  // the file where it is and let the sidebar DOM shim hide the row instead.
+  async function deleteOne(sid, opts = {}) {
+    requireSessionId(sid)
+    // Soft-delete is always allowed — including the currently-active conversation.
+    // The log file stays in its original workspace dir (recorded in the 回收站
+    // index below), so the live session is unaffected and the entry stays
+    // recoverable from 回收站. (Move, by contrast, physically relocates the file
+    // and still guards the active session in moveTargetWorkspace.)
+    let header = null
+    let cwd = null
+    let title = null
+    let removedPath = null
+    let persistenceEntry = null
+    try {
+      // 级联删除时由调用方传入同一份 listEntries 快照：一个父会话带上 N 个子代理
+      // 时不重复扫盘（issue #18 第 4 条）。
+      const entries = Array.isArray(opts.entries) ? opts.entries : await persistence.listEntries()
+      const found = entries.find((entry) => entry.id === sid) || null
+      persistenceEntry = found
+      header = found ? found.header : null
+      if (header) {
+        // 用校验版定位：官方 locate() 按 header.version 拼名，老会话磁盘上仍是
+        // legacy 命名，采信它会把这个不存在路径永久写进回收站条目，日后
+        // restore / purge 全部对着空气操作（issue #26 现象 2 的源头）。
+        const loc = await persistence.locateVerified(header).catch(() => null)
+        if (loc && typeof loc.path === 'string') removedPath = loc.path
+        cwd = header.cwd || null
+        title = header.title || (header.meta && header.meta.title) || null
+      }
+      if (!title) {
+        // v3.6.2 #7：删除路径**绝不**做标题投影/分块解码——issue #8 的教训：
+        // 大日志上单条兜底投影也是整本解压，删除 = 秒级卡宿主。只消费现成缓存：
+        // metaCache（用 list 快照算指纹）→ 持久索引 → 侧栏权威缓存。都没有就存
+        // null（诚实占位，不再把 cwd/裸 id 冒充标题永久写进回收站），
+        // 后台预热解出标题后由 backfillTrashTitles 补写。
+        try {
+          const delStat = persistenceEntry && typeof persistenceEntry.revision === 'string' && persistenceEntry.revision
+            ? { revision: persistenceEntry.revision, sizeBytes: Number.isFinite(persistenceEntry.sizeBytes) ? Number(persistenceEntry.sizeBytes) : undefined }
+            : (removedPath ? await stat(removedPath).then((st) => ({ mtimeMs: st.mtimeMs, size: st.size })) : null)
+          if (delStat) {
+            const m = metaCache.get(sid, delStat) || (await hydrateFromPersist([sid], new Map([[sid, delStat]]))).get(sid)
+            if (m && m.title) title = String(m.title)
+          }
+        } catch (e) { /* best-effort */ }
+        if (!title) { const at = authorityTitleCache.get(sid); if (at) title = String(at) }
+      }
+    } catch (e) { /* best-effort */ }
+    // Record in the trash index only — the log stays in its workspace dir.
+    if (!header && !removedPath) {
+      const error = new Error('找不到该会话')
+      error.status = 404
+      throw error
+    }
+    const archived = await mutateArchived((list) => ({ next: null, value: list.includes(sid) })).catch(() => false)
+    // 删除时同步原生归档（issue #27）。
+    //
+    // 回收站会话的日志留在原工作区，DSH 的原生账本（sessionCount / 水位线 /
+    // 「展开其余 N 个会话」按钮）仍然把它算作可见。插件只能渲染后藏 DOM，而按钮
+    // 每次被 React 重建都会带着原生旧计数闪回来，形成 HIDDEN/VISIBLE 振荡。
+    // 让原生账本本身收敛才是稳定的解法：删除即归档，原生列表不再计入。
+    //
+    // `wasArchived` 仍然记录「删除前」的真实状态，恢复时按它对称处理
+    // （见 restoreFromTrash 的 `entry.wasArchived === false` 分支）。
+    if (!archived) {
+      try { await archiveOne(sid) } catch (e) { /* 原生归档失败不阻塞删除：DOM shim 仍兜底 */ }
+    }
+    await mutateTrash((store) => {
+      const entry = {
+        // v3.6.2 #7：不再把 cwd/裸 id 冒充标题永久定格——存 null，预热解出后
+        // backfillTrashTitles 补写；渲染端（t.title || t.sessionId）自然降级。
+        sessionId: sid, title: title || null, cwd: cwd || null,
+        header: header || null, originalPath: removedPath || null,
+        sizeBytes: persistenceEntry && Number.isFinite(persistenceEntry.sizeBytes) ? persistenceEntry.sizeBytes : null,
+        wasArchived: archived, deletedAt: Date.now(),
+      }
+      // 跟随父会话一起回收的子代理：记住来源，恢复/彻底删除父会话时按它级联
+      // （用户单独删除的子代理没有这个字段，不会被父会话的恢复带着走）。
+      if (opts.cascadeFrom) entry.cascadeFrom = String(opts.cascadeFrom)
+      const at = store.items.findIndex((t) => String(t.sessionId) === sid)
+      if (at >= 0) store.items[at] = entry
+      else store.items.push(entry)
+      store.purgedSessionIds = store.purgedSessionIds.filter((id) => id !== sid)
+    })
+    return { ok: true, trashed: true }
+  }
+
+  // issue #18 第 4 条：子代理会话的生命周期跟随父会话。
+  //
+  // 用户反馈「删除父会话，子代理会遗留在活动会话中，污染列表」——先前删除只处理
+  // 传入的那一个 id，子代理成了无父孤儿。这里按官方 header 的 origin/parentSession
+  // 收集后代（零解码，复用同一个 listEntries 快照），父会话删除时一并回收。
+  //
+  // 只走官方字段，且有步数上限与 visited 防环；任何异常都退回「只删父会话」，
+  // 绝不因为血缘表坏掉而拒绝删除。判定本身是纯函数（lineage.js），单测覆盖。
+  function subagentDescendantIdsFrom(entries, rootId) {
+    const headers = []
+    for (const entry of Array.isArray(entries) ? entries : []) {
+      if (entry && entry.header) headers.push(entry.header)
+    }
+    // live 会话可能还没进 listEntries 快照，但它不会有「已落盘的后代」缺失问题；
+    // 已持久化的子代理都在 entries 里，所以这里只走快照，避免重复扫描。
+    return subagentDescendantsOf(headers, rootId)
+  }
+
+  // 删除一个会话 +（可选）它的子代理后代。返回 cascaded 数量供 UI 如实提示。
+  async function deleteWithSubagents(sid, opts = {}) {
+    let entries = Array.isArray(opts.entries) ? opts.entries : null
+    if (!entries) {
+      try { entries = await persistence.listEntries() } catch (e) { entries = null }
+    }
+    const out = await deleteOne(sid, { entries })
+    const cascade = opts.cascade !== false
+    if (!cascade || !entries) return { ...out, cascaded: 0, cascadedIds: [] }
+    const kids = subagentDescendantIdsFrom(entries, sid)
+    // 已经在回收站里的子代理不再碰：它可能是用户**单独**删掉的，重新写一遍会把
+    // 它的删除时间与来源改成「跟随父会话」，此后恢复父会话就会把它带回来——
+    // 与「用户自己删的不会被带走」的承诺相反。跳过即保留它原来的删除语义。
+    let alreadyTrashed = null
+    try {
+      const store = await readTrashStore()
+      alreadyTrashed = new Set(store.items.map((t) => String(t.sessionId)))
+    } catch (e) { alreadyTrashed = null }
+    const cascadedIds = []
+    for (const kid of kids) {
+      if (alreadyTrashed && alreadyTrashed.has(String(kid))) continue
+      try {
+        await deleteOne(kid, { entries, cascadeFrom: sid })
+        metaCache.invalidate(kid)
+        cascadedIds.push(kid)
+      } catch (e) { /* 单个子代理失败不拖垮整次删除 */ }
+    }
+    return { ...out, cascaded: cascadedIds.length, cascadedIds }
+  }
+
+  // 与删除对称：恢复 / 彻底删除父会话时，把它连带回收的子代理一并处理。
+  // 只认 entry.cascadeFrom（用户单独删掉的子代理没有该字段，不会被带走），
+  // 且只在回收站里找——父会话恢复后子代理不会留在回收站里变成孤儿。
+  async function cascadeTrashChildren(sid, op) {
+    let kids = []
+    try {
+      const store = await readTrashStore()
+      kids = store.items
+        .filter((t) => String(t.cascadeFrom || '') === String(sid))
+        .map((t) => String(t.sessionId))
+    } catch (e) { return [] }
+    const results = []
+    for (const kid of kids) {
+      try {
+        results.push({ sessionId: kid, ok: true, ...(await op(kid)) })
+        metaCache.invalidate(kid)
+      } catch (e) {
+        results.push({ sessionId: kid, ok: false, error: String((e && e.message) || e) })
+      }
+    }
+    return results
+  }
+
+  async function purgeTrashEntry(sid) {
+    const result = await purgeFromTrash(sid)
+    metaCache.invalidate(sid)
+    await titleIndex.remove([sid]).catch(() => {})
+    await emptyIndex.remove([sid]).catch(() => {})
+    return result
+  }
+
+  // 恢复前的底层校验（0.1.3 契约下 restoreIndexedSession 不再无条件可用）：
+  //   1. 底层 stored session 仍存在（live / stat / list 三级判定）；
+  //   2. 日志文件仍在原处（软删除不动文件，originalPath 丢失即外部破坏）；
+  //   3. 工作区丢失不算失败——会话仍可恢复，UI 以 workspaceGone 提示。
+  // 返回 { ok:true, workspaceGone, verified } 或 { ok:false, status, code, message }。
+  // verified=false 表示无法核验日志文件（SessionHandle 世代无 locate），按
+  // 索引为准放行，但绝不假装校验过。
+  async function verifyTrashRestore(sid) {
+    const sessions = ctx.get('sessions')
+    if (sessions && sessions.get && sessions.get(sid)) {
+      return { ok: true, workspaceGone: false, verified: true }
+    }
+    let exists = false
+    let header = null
+    try {
+      const stat = await persistence.statSession(sid)
+      if (stat) { exists = true; header = stat.header }
+    } catch (e) { /* stat 缺失或失败：落入 legacy 判定 */ }
+    if (!exists) {
+      try {
+        const entries = await persistence.listEntries()
+        const found = entries.find((entry) => entry.id === sid)
+        if (found) { exists = true; header = found.header }
+      } catch (e) { /* list 失败：继续走错误分支 */ }
+    }
+    if (!exists) {
+      const store = await readTrashStore()
+      if (store.purgedSessionIds.map(String).includes(sid)) {
+        return { ok: false, status: 410, code: 'DSM_SESSION_PURGED', message: '该会话已彻底删除，无法从回收站恢复' }
+      }
+      return { ok: false, status: 409, code: 'DSM_SESSION_MISSING', message: '底层会话已不存在（可能被外部删除或重建），无法恢复' }
+    }
+    // 软删除把日志留在原工作区目录；originalPath 消失 = 外部破坏。
+    // 无法核验（无 locate / 无记录）时放行但如实标注。
+    let verified = false
+    const store = await readTrashStore()
+    const entry = store.items.find((t) => String(t.sessionId) === sid)
+    let originalPath = entry && typeof entry.originalPath === 'string' ? entry.originalPath : null
+    let repairedPath = null
+    if (!originalPath && header) {
+      // handle 时代官方收走了 locate，用守卫式推导（root → 目录结构 → id 归属）
+      // 代替：推导成功且文件在盘 = 真核验通过，而不是标注 unverified 放行。
+      const loc = await persistence.locateVerified(header).catch(() => null)
+      if (loc && typeof loc.path === 'string') { originalPath = loc.path; repairedPath = loc.path }
+    }
+    if (originalPath) {
+      let existsOnDisk = await stat(originalPath).then(() => true).catch(() => false)
+      if (!existsOnDisk && header) {
+        // 存量条目纠偏（issue #22 现象 B / #26 现象 2）：索引里记的可能是
+        // 「按 header.version 拼出来的名字」，而磁盘上还停在老代命名。3.7.10
+        // 会直接报 DSM_SESSION_LOG_MISSING，把「文件明明在」说成「已消失」。
+        // 这里按当前磁盘布局重新推导一次；推导结果本身已通过 stat 校验。
+        const loc = await persistence.locateVerified(header).catch(() => null)
+        if (loc && typeof loc.path === 'string' && loc.path !== originalPath) {
+          originalPath = loc.path
+          repairedPath = loc.path
+          existsOnDisk = true
+        }
+      }
+      if (!existsOnDisk) {
+        return { ok: false, status: 409, code: 'DSM_SESSION_LOG_MISSING', message: '回收站索引仍记录该会话，但其日志文件已消失（可能被外部移动或删除）' }
+      }
+      verified = true
+    }
+    let workspaceGone = false
+    const cwd = (header && header.cwd) || (entry && entry.cwd) || null
+    if (cwd) {
+      try { workspaceGone = !w.list().some((ent) => ent.path === cwd) } catch (e) { workspaceGone = false }
+    }
+    return { ok: true, workspaceGone, verified, repairedPath }
+  }
+
+  // Restore a trashed session: the log never left its original workspace dir,
+  // so we just drop it from the recycle-bin index and the sidebar reveals it in
+  // its original workspace (no move / no re-attach needed). Repeated restores
+  // fail with an accurate 404 — there is no second entry to restore.
+  async function restoreFromTrash(sid) {
+    requireSessionId(sid)
+    requireCapability(capabilities, 'restoreIndexedSession')
+    let outcome = null
+    await mutateTrash(async (store) => {
+      const entry = store.items.find((t) => String(t.sessionId) === sid)
+      if (!entry) {
+        if (store.purgedSessionIds.map(String).includes(sid)) {
+          const error = new Error('该会话已彻底删除，无法从回收站恢复')
+          error.status = 410
+          error.code = 'DSM_SESSION_PURGED'
+          throw error
+        }
+        const error = new Error('回收站中找不到该会话（可能已恢复过）')
+        error.status = 404
+        error.code = 'DSM_TRASH_NOT_FOUND'
+        throw error
+      }
+      // Verify BEFORE removing the durable entry: if verification fails the
+      // mutator throws, mutateTrash does not write, and the item remains
+      // recoverable instead of disappearing into an inconsistent state.
+      const verification = await verifyTrashRestore(sid)
+      if (!verification.ok) {
+        const error = new Error(verification.message)
+        error.status = verification.status
+        error.code = verification.code
+        throw error
+      }
+      // Restore the pre-delete archive state before removing the durable trash
+      // entry. If this fails, mutateTrash does not write and the item remains
+      // recoverable instead of disappearing into an inconsistent state.
+      if (entry.wasArchived === false) await restoreOne(sid)
+      store.items = store.items.filter((t) => String(t.sessionId) !== sid)
+      store.purgedSessionIds = store.purgedSessionIds.filter((id) => id !== sid)
+      outcome = { ok: true, restored: true, workspaceGone: verification.workspaceGone, verified: verification.verified }
+    })
+    return outcome || { ok: true, restored: true }
+  }
+
+  // Permanently erase a trashed session: physically delete its log (still in
+  // the original workspace dir) and detach it from any workspace so DSH drops it.
+  async function purgeFromTrash(sid) {
+    requireSessionId(sid)
+    requireCapability(capabilities, 'purge')
+    let purged = false
+    await mutateTrash(async (store) => {
+      const entry = store.items.find((t) => String(t.sessionId) === sid)
+      if (!entry) { const error = new Error('回收站中找不到该会话'); error.status = 404; throw error }
+      let target = null
+      let locatedHeader = null
+      try {
+        const entries = await persistence.listEntries()
+        const current = entries.find((entry) => entry.id === sid)
+        locatedHeader = current ? current.header : null
+        // locateVerified：legacy 走官方 locate；handle 时代官方收走了 locate，
+        // 改由三层守卫推导（root → 目录结构 → id 归属），失败返回 null。
+        // 比仅靠回收站条目里的 originalPath 更可靠：originalPath 过期或缺失时
+        // 仍能从当前存储布局重新推导。
+        const located = current ? await persistence.locateVerified(current.header) : null
+        if (located && typeof located.path === 'string') target = located.path
+      } catch (e) {}
+      // 幽灵记录兜底：会话不在 list 里（后端索引滞后/索引缺失）但日志仍在盘上。
+      // 用 statSession 拿官方 header，再走守卫推导，避免退化成「只删单文件」
+      // 或直接 409 拒绝。
+      if (!locatedHeader && typeof persistence.statSession === 'function') {
+        try {
+          const snap = await persistence.statSession(sid)
+          if (snap && snap.header) {
+            locatedHeader = snap.header
+            const located = await persistence.locateVerified(snap.header)
+            if (located && typeof located.path === 'string') target = located.path
+          }
+        } catch (e) {}
+      }
+      if (!target && typeof entry.originalPath === 'string') {
+        // 兜底路径必须先验存在：originalPath 可能是老代命名拼出来的假路径，
+        // 采信它会让下面的 unlink 对着空气操作（ENOENT 被当成功后仍写 tombstone，
+        // 条目从此不可回退 —— issue #26 现象 2）。
+        const ok = await stat(entry.originalPath).then(() => true).catch(() => false)
+        if (ok) target = entry.originalPath
+      }
+      if (!target) {
+        const error = new Error('无法确认该会话的物理日志位置（日志可能已被外部移动或删除），已停止永久删除')
+        error.status = 409
+        error.code = 'DSM_SESSION_LOG_MISSING'
+        throw error
+      }
+      // JSONL persistence stores logs as
+      //   .../<sessionId>/session.jsonl.zstd
+      // Older backends may instead include the id in the filename itself.
+      // pathOwnsSession accepts both layouts on POSIX and Windows separators
+      // and rejects every unrelated path (including id-substring collisions)
+      // before any unlink.
+      const targetOwnsSession = pathOwnsSession(target, sid)
+      if (target && !targetOwnsSession) {
+        const error = new Error('日志路径与会话 ID 不匹配，已停止永久删除')
+        error.status = 409
+        throw error
+      }
+      // Persist the tombstone before any irreversible work. A crash after this
+      // point may leave the trash item retryable, but can never resurrect the
+      // session in a later list baseline.
+      if (!store.purgedSessionIds.includes(sid)) store.purgedSessionIds.push(sid)
+      await writeTrashStore(store)
+      // A freshly-created or recently-opened Session can remain resident after
+      // its file is unlinked. Flush once, then use SessionStore's entered-record
+      // detach capability so DSH emits host/session-removed and the client list
+      // drops the row instead of resurrecting it from live memory.
+      try {
+        const sessions = ctx.get('sessions')
+        const liveSession = sessions && sessions.get && sessions.get(sid)
+        if (liveSession && typeof sessions.flush === 'function') await sessions.flush(liveSession)
+        const entered = sessions && sessions.store && sessions.store.get && sessions.store.get(sid)
+        if (liveSession && (!entered || typeof entered.detach !== 'function')) throw new Error('宿主未提供 live Session detach 能力')
+        if (entered && typeof entered.detach === 'function') entered.detach()
+        // session/disposed starts an asynchronous persistence retirement. Wait
+        // for it before unlinking, otherwise its final drain can race the file
+        // deletion and briefly (or permanently) republish an orphan that the
+        // official sidebar groups under “未分组”.
+        const retirement = sp && sp.retirements && sp.retirements.get && sp.retirements.get(sid)
+        if (retirement && typeof retirement.then === 'function') await retirement
+      } catch (e) {
+        const error = new Error('无法从宿主内存移除会话，已停止永久删除：' + String((e && e.message) || e))
+        error.status = 409
+        throw error
+      }
+      if (target && persistence.kind === 'session-handle' && locatedHeader) {
+        // handle 时代：写所有权探测（活跃写者 409）→ 整目录删除 → 官方 stat 复核。
+        // 内部复用与移动同一套路径守卫；删除失败会带 status 冒泡。
+        await purgeSessionArtifacts(sp, sid, locatedHeader)
+      } else if (target) {
+        try { await unlink(target) } catch (e) { if (e && e.code !== 'ENOENT') throw new Error('删除文件失败：' + String((e && e.message) || e)) }
+        // legacy 布局：同一会话目录里可能并存多代日志（session.jsonl.zstd 与
+        // session.v3.jsonl.zstd，见 issue #22 的实测）。只删最高代会让 DSH 回退
+        // 读到旧代，等于没删。这里把同目录其它代际一并清掉。
+        try {
+          const dir = dirname(target)
+          for (const name of await readdir(dir)) {
+            if (name === basename(target)) continue
+            if (!/^session(\.v\d+)?\.jsonl(\.zstd|\.zst)?$/.test(name)) continue
+            try { await unlink(join(dir, name)) } catch (e) { /* 单个旧代失败由下面的复核兜住 */ }
+          }
+        } catch (e) { /* 目录不可读：交给下面的复核 */ }
+      }
+      // 删除后复核：unlink 返回不代表文件真的没了（路径被并发改写、后端走了
+      // 另一份副本、或 purgeSessionArtifacts 只删了部分产物）。3.7.10 在这里
+      // 直接报成功并移除条目，用户看到的是「已彻底删除」而文件仍在原处，
+      // 之后 restore 只能得到 410 —— 条目和文件都回不去了（issue #26）。
+      {
+        let stillThere = await stat(target).then(() => true).catch(() => false)
+        if (!stillThere) {
+          // 目录里若还剩别的代际日志，DSH 仍能读到这本会话。
+          try {
+            const names = await readdir(dirname(target))
+            stillThere = names.some((n) => /^session(\.v\d+)?\.jsonl(\.zstd|\.zst)?$/.test(n))
+          } catch (e) { /* 目录已不在 = 干净 */ }
+        }
+        if (stillThere) {
+          // 回滚 tombstone：条目要留在回收站里可重试，且不能被判成「已彻底删除」。
+          store.purgedSessionIds = store.purgedSessionIds.filter((id) => String(id) !== sid)
+          try { await writeTrashStore(store) } catch (e) { /* 回滚失败时条目仍在，下次重试 */ }
+          const error = new Error('日志文件仍在磁盘上，彻底删除未完成；回收站条目已保留，可重试')
+          error.status = 409
+          error.code = 'DSM_PURGE_INCOMPLETE'
+          throw error
+        }
+      }
+      try { for (const ent of w.list()) { if (ent.sessionIds.includes(sid)) { try { await ent.detachSession(sid) } catch (e) {} } } } catch (e) {}
+      try { if (w.sessionPaths && w.sessionPaths.delete) w.sessionPaths.delete(sid) } catch (e) {}
+      try { if (w.headers && w.headers.delete) w.headers.delete(sid) } catch (e) {}
+      await restoreOne(sid)
+      // Rebuild from the post-unlink disk baseline before reporting success.
+      // Merely deleting the two Maps above does not notify/rebuild Workspace
+      // entities, leaving the client with an orphaned “未分组” snapshot.
+      try { await reindexRegistry() } catch (e) { /* tombstone still prevents resurrection */ }
+      store.items = store.items.filter((t) => String(t.sessionId) !== sid)
+      purged = true
+    })
+    if (!purged) throw new Error('彻底删除失败')
+    // 星标清理必须 await。原先这里是浮动写入（`stars.removeIds([sid]).catch(...)`）：
+    // 删除结果先返回、星标文件随后才落地，正好会撞上调用方（或测试 teardown）已开始的
+    // 状态目录清理 → `ENOTEMPTY: rmdir .../state`（全量测试里约 1/4 概率偶发失败）。
+    // 而且"删除成功"不该早于状态落盘：进程恰好在此刻退出就会留下指向已删会话的星标。
+    try { await stars.removeIds([sid]) } catch (e) { /* 星标清理失败不阻塞删除结果 */ }
+    // 标签 assignments 同理（S4 教训位）：清理必须 await、不得浮动写——purgeFromTrash
+    // 是唯一的彻底删除收口（trash/purge、trash/purge-many、到期清理都经过它），
+    // 在这里落盘即覆盖所有路径，且"删除成功"不早于状态落盘。
+    try { await tags.removeIds([sid]) } catch (e) { /* 标签清理失败不阻塞删除结果 */ }
+    return { ok: true, purged: true }
+  }
+
+  async function trashSettings(next) {
+    if (next === undefined) return (await readTrashStore()).settings
+    const days = Number(next.retentionDays)
+    if (!Number.isInteger(days) || ![0, 7, 30, 90].includes(days)) {
+      const error = new Error('retentionDays 仅支持 0、7、30、90')
+      error.status = 400
+      throw error
+    }
+    await mutateTrash((store) => { store.settings = { retentionDays: days } })
+    return (await readTrashStore()).settings
+  }
+
+  async function cleanupExpiredTrash() {
+    if (!capabilities.actions.purge.available) return 0
+    const store = await readTrashStore()
+    const days = store.settings.retentionDays
+    if (!days) return 0
+    const cutoff = Date.now() - days * 86400000
+    const ids = store.items.filter((item) => Number(item.deletedAt) > 0 && Number(item.deletedAt) < cutoff).map((item) => String(item.sessionId))
+    let count = 0
+    for (const sid of ids) { try { await purgeFromTrash(sid); count++ } catch (e) {} }
+    return count
+  }
+
+  // ---- "move conversation between workspaces" helper -----------------------
+  // DSH binds a conversation to the workspace whose canonical directory path
+  // equals the session's stored cwd. Moving it therefore means: (1) adopt the
+  // target path as a workspace (create if needed), (2) durably relocate the
+  // session's log so its header carries the new cwd, and (3) reassign the
+  // workspace membership (detach everywhere, attach to target). The log
+  // relocation goes through the persistence service's own encoder (handles the
+  // zstd artifact encoding) with a backup + rollback so a failure never leaves
+  // the session half-moved.
+
+  async function moveTargetWorkspace(rawPath) {
+    if (typeof rawPath !== 'string' || !rawPath.trim()) throw new Error('缺少目标工作区路径')
+    let p = String(rawPath).trim()
+    if (p.startsWith('~/')) p = join(homedir(), p.slice(2))
+    if (!isAbsolute(p)) p = join(homedir(), p)
+    let canonical = null
+    try { canonical = await realpath(p) } catch (e) { canonical = null }
+    if (canonical === null) {
+      await mkdir(p, { recursive: true })
+      canonical = await realpath(p)
+    }
+    return { canonical, entity: await w.create(canonical, basename(canonical) || 'workspace') }
+  }
+
+  async function moveOne(sid, targetPath, scope) {
+    requireCapability(capabilities, 'move')
+    requireSessionId(sid)
+    const registered = scope && w.get(scope.targetWorkspaceId)
+    if (scope && registered?.path !== targetPath) throw new Error('目标项目已变更或不可用')
+    if (registered?.path === scope?.expectedCwd && registered?.sessionIds.includes(sid)) {
+      return { ok: true, already: true, workspaceId: registered.id, workspaceTitle: registered.title }
+    }
+    // Only block the *active* conversation. ctx.sessions keeps instantiated
+    // sessions alive after you switch away, so the old check (sessions.get(sid))
+    // wrongly rejected every opened session — you could never move one you'd
+    // merely looked at. When the host exposes no active-session accessor we
+    // can't prove activeness, so we allow the move; the relocation below is
+    // crash-safe (backup + rollback) and re-syncs the live object.
+    const activeIds = getActiveSessionIds(ctx, activeTracker)
+    const activeId = activeIds.values().next().value != null ? activeIds.values().next().value : null
+    if (activeIds.has(String(sid)) || (activeId != null && String(activeId) === String(sid))) {
+      const error = new Error('会话正被 DSH 打开，暂时无法移动；请重启 DSH 后再试。')
+      error.status = 409
+      error.code = 'DSM_SESSION_BUSY'
+      throw error
+    }
+    const r = await persistence.readSession(sid, 0)
+    if (!r || !r.meta) throw new Error('无法读取该会话的日志')
+    const meta = r.meta
+    const events = r.events
+    const oldCwd = meta.cwd || null
+
+    const { canonical, entity: target } = registered
+      ? { canonical: registered.path, entity: registered }
+      : await moveTargetWorkspace(targetPath)
+    if (scope && oldCwd !== scope.expectedCwd && oldCwd !== canonical) {
+      throw new Error('会话已离开原项目，请重新确认会话所在项目')
+    }
+
+    if (oldCwd) {
+      let oldCanon = null
+      try { oldCanon = await realpath(oldCwd) } catch (e) { oldCanon = null }
+      if (oldCanon === canonical) {
+        if (scope) await assignWorkspace(sid, meta, target)
+        return { ok: true, already: true, workspaceId: target.id, workspaceTitle: target.title }
+      }
+    }
+
+    const newHeader = Object.assign({}, meta, { cwd: canonical })
+
+  // 移动过程的非致命提示（如源目录仍有旧代日志未能清理），随成功结果一并
+  // 回报给客户端展示。
+  const moveNotes = []
+
+    // 1) Decide relocation strategy. `sessionPersistence.create()` rejects
+    // ("already exists in this backend") for ANY session the host has
+    // instantiated into its in-memory `states` — and DSH instantiates *every*
+    // session it can find on disk at startup, including ARCHIVED ones. So a
+    // supposedly "closed" archived session is NOT safe for the create()+append()
+    // path; create() will throw. The only universally safe move is to physically
+    // relocate the on-disk log (rewriting frame0's cwd) and redirect the live
+    // object + persistence state. We still attempt create()+append() as the
+    // fast path for genuinely-virgin session ids, but on an already-exists
+    // collision we fall back to the relocate path. That covers live, archived,
+    // and restored sessions alike.
+    const live = ctx.get('sessions')
+    const liveObj = live && live.get && live.get(sid)
+    const isOpen = !!liveObj
+
+    const ALREADY_EXISTS_RE = /already exists in this backend/i
+
+    // Physically relocate a session's on-disk log to `newHeader`'s cwd,
+    // rewriting frame0's cwd so sp.list()/reindex attribute it correctly.
+    // Returns true if a relocation actually happened.
+    const relocateLog = async (header, newHeaderObj) => {
+      const oldPath = locatePath(header)
+      const newPath = locatePath(newHeaderObj)
+      if (!oldPath || !newPath || oldPath === newPath) return false
+      const backupPath = `${oldPath}.move-backup-${Date.now()}`
+      const stagedPath = `${newPath}.move-stage-${process.pid}-${Date.now()}`
+      let destinationInstalled = false
+      try {
+        // Ensure the destination project directory exists (rename does not
+        // create it). Without this, the rename silently no-ops on ENOENT and
+        // the log stays put while workspace.json is wrongly updated.
+        await mkdir(dirname(newPath), { recursive: true })
+        try {
+          await stat(newPath)
+          throw new Error('移动失败：目标位置已存在同名会话日志')
+        } catch (e) {
+          if (e && e.code !== 'ENOENT') throw e
+        }
+        await rename(oldPath, backupPath) // keep the original byte-identical until verification succeeds
+        const original = await readFile(backupPath)
+        const originalFrames = scanZstdFrames(original).frames
+        if (originalFrames.length === 0) throw new Error('移动前校验失败：会话日志没有完整 zstd 帧')
+        const rewritten = rewriteFrame0CwdInMemory(original, canonical)
+        const rewrittenFrames = scanZstdFrames(rewritten).frames
+        if (rewrittenFrames.length !== originalFrames.length) throw new Error('移动后校验失败：会话日志帧数发生变化')
+        const originalTail = original.subarray(originalFrames[0].end)
+        const rewrittenTail = rewritten.subarray(rewrittenFrames[0].end)
+        if (!originalTail.equals(rewrittenTail)) throw new Error('移动后校验失败：会话事件内容发生变化')
+        await writeFile(stagedPath, rewritten, { mode: 0o600 })
+        await rename(stagedPath, newPath)
+        destinationInstalled = true
+        await unlink(backupPath)
+        const keptInSource = await cleanupMovedSourceDir(dirname(oldPath))
+        if (keptInSource.length > 0) moveNotes.push(`源目录未能清理干净（残留 ${keptInSource.join('、')}），若后续移动报“duplicate”请手动清空该目录。`)
+      } catch (e) {
+        try { await unlink(stagedPath) } catch (_) {}
+        if (destinationInstalled) { try { await unlink(newPath) } catch (_) {} }
+        try { await rename(backupPath, oldPath) } catch (_) {}
+        if (e && e.code !== 'ENOENT') throw e
+        return false
+      }
+      return true
+    }
+
+    const locatePath = (header) => {
+      let fn = null
+      try { if (typeof sp.locate === 'function') fn = sp.locate.bind(sp) } catch (e) {}
+      if (!fn && sp.backend && typeof sp.backend.locate === 'function') fn = sp.backend.locate.bind(sp.backend)
+      if (!fn) return null
+      try {
+        const loc = fn(header)
+        if (loc && typeof loc.path === 'string') return loc.path
+        if (typeof loc === 'string') return loc
+      } catch (e) {}
+      return null
+    }
+
+    // 移动成功后的源目录收尾（legacy 路径）：**整体移除**。目标侧已写入校验通过的
+    // 权威日志，源目录只要还留着任何一代日志（legacy 旧代 session.jsonl.zstd 或
+    // session.vN.jsonl.zstd），就会让同 id 出现在两个项目目录，后端 list/create
+    // 立刻报 duplicate。返回未能清理时的残留文件名（供如实回报）。
+    const cleanupMovedSourceDir = async (dir) => {
+      let entries = null
+      try { entries = await readdir(dir) } catch (e) { return [] }
+      try { await rm(dir, { recursive: true, force: true }) } catch (e) { return entries }
+      return []
+    }
+
+    // Rewriting frame0's cwd now lives in src/zstd-frame.js so it can be
+    // regression-tested directly. See that module for why frame boundaries are
+    // validated by decompression and why a non-session frame0 is rejected
+    // instead of rewritten.
+
+    if (persistence.kind === 'session-handle') {
+      // 读事件之后的双 revision 校验：两次采样之间 revision 仍在变，说明日志
+      // 还在被写入，中止而不是复制出分叉副本（读取期间的写入由 ops 内的
+      // rename-aside + 官方写所有权探测兜底）。
+      const stat1 = await persistence.statSession(sid)
+      if (stat1 && stat1.revision) {
+        const stat2 = await persistence.statSession(sid)
+        if (stat2 && stat2.revision !== stat1.revision) {
+          throw new Error('该会话在移动准备期间发生了变化，请稍后重试。')
+        }
+      }
+      try {
+        const movedHandle = await moveSessionToCwd({ sp, sid, header: meta, canonical, events, inheritedEventCount: r.inheritedEventCount })
+        if (movedHandle && Array.isArray(movedHandle.reclaimedSiblings) && movedHandle.reclaimedSiblings.length > 0) {
+          moveNotes.push(`已顺带回收 ${movedHandle.reclaimedSiblings.length} 处被取代的旧代日志副本（历史移动残留），避免同一会话在多目录重复。`)
+        }
+        if (movedHandle && movedHandle.sourceCleanup && movedHandle.sourceCleanup.cleaned === false) {
+          moveNotes.push(`源目录未能清理干净（残留 ${movedHandle.sourceCleanup.leftover.join('、')}），若后续移动报“duplicate”请手动清空该目录。`)
+        }
+      } catch (e) {
+        if (e && e.status) throw e
+        throw new Error('移动会话日志失败：' + String((e && e.message) || e))
+      }
+    } else if (isOpen) {
+      // Live session: relocate the on-disk log (rewriting frame0's cwd to the
+      // new path) and redirect the live object + persistence state. We must
+      // rewrite frame0, not just rename: sp.list() reads frame0's cwd from
+      // disk, and WorkspaceEntity.sessionIds filters by that exact cwd. A bare
+      // rename would leave frame0 pointing at the old workspace, so reindex /
+      // restart would keep attributing the session to the wrong workspace.
+      if (!await relocateLog(meta, newHeader)) throw new Error('移动失败：无法确认会话日志已迁移到目标工作区')
+      // Redirect the persistence state's cwd so future appends land in newPath.
+      try {
+        const st = sp.states && sp.states.get && sp.states.get(sid)
+        if (st && st.meta) st.meta = Object.assign({}, st.meta, { cwd: canonical })
+      } catch (e) { /* best-effort */ }
+    } else {
+      // Closed session: try the fast create()+append() path first. But DSH
+      // instantiates *all* on-disk sessions (including archived ones) into its
+      // in-memory states at startup, so create() usually throws
+      // "already exists in this backend". On that collision we fall back to a
+      // physical relocate of the existing log (rewriting frame0's cwd), which
+      // is safe and needs no create().
+      let oldPath = null
+      try {
+        const loc = locatePath(meta)
+        if (loc && typeof loc === 'string') oldPath = loc
+        else if (loc && loc.path) oldPath = loc.path
+      } catch (e) { oldPath = null }
+
+      if (typeof sp.create !== 'function' || typeof sp.append !== 'function') {
+        // No create primitive: must relocate the existing log directly.
+        if (!await relocateLog(meta, newHeader)) throw new Error('移动失败：无法确认会话日志已迁移到目标工作区')
+      } else {
+        const backupPath = oldPath ? `${oldPath}.move-backup-${Date.now()}` : null
+        if (backupPath) { try { await rename(oldPath, backupPath) } catch (e) { if (e && e.code !== 'ENOENT') throw new Error('移动失败：无法备份旧的会话日志') } }
+        const restore = async () => { if (backupPath) { try { await rename(backupPath, oldPath) } catch (_) {} } }
+        try {
+          await sp.create(newHeader)
+          await sp.append(sid, events)
+          const check = await persistence.readSession(sid, 0)
+          if (!check || !check.meta || check.meta.cwd !== canonical) {
+            throw new Error('移动后校验失败：会话工作目录未正确更新')
+          }
+          if (backupPath) { try { await unlink(backupPath) } catch (e) {} }
+          if (oldPath) {
+            const keptInSource = await cleanupMovedSourceDir(dirname(oldPath))
+            if (keptInSource.length > 0) moveNotes.push(`源目录未能清理干净（残留 ${keptInSource.join('、')}），若后续移动报“duplicate”请手动清空该目录。`)
+          }
+        } catch (e) {
+          if (ALREADY_EXISTS_RE.test(String((e && e.message) || e))) {
+            // Collision: the session is already materialized in states (archived
+            // or previously opened). Fall back to physically relocating the log.
+            await restore()
+            if (!await relocateLog(meta, newHeader)) throw new Error('移动失败：无法确认会话日志已迁移到目标工作区')
+          } else {
+            await restore()
+            throw new Error('移动会话日志失败：' + String((e && e.message) || e))
+          }
+        }
+      }
+    }
+
+    // Keep the live (in-memory) session object consistent with the relocated
+    // log so the host doesn't keep appending to the old path. This MUST happen
+    // before attachSession(): WorkspaceEntity.attachSession() validates the
+    // session by reading live.header first, and if it still carries the old cwd
+    // the realpath check will fail on the old (now missing) directory.
+    try {
+      if (liveObj) {
+        if ('header' in liveObj) liveObj.header = newHeader
+        if ('cwd' in liveObj) liveObj.cwd = canonical
+        if ('meta' in liveObj) liveObj.meta = newHeader
+      }
+    } catch (e) { /* best-effort */ }
+
+    await assignWorkspace(sid, newHeader, target)
+
+    return {
+      ok: true,
+      moved: true,
+      workspaceId: target.id,
+      workspaceTitle: target.title,
+      workspacePath: canonical,
+      ...(moveNotes.length > 0 ? { notes: moveNotes } : {}),
+    }
+  }
+
+  async function assignWorkspace(sid, header, target) {
+    w.headers?.set(sid, header)
+    w.sessionPaths?.set(sid, target.path)
+    await target.attachSession(sid)
+    if (!target.sessionIds.includes(sid)) {
+      throw new Error('移动后校验失败：会话未出现在目标工作区，请重试或重启 DSH。')
+    }
+    for (const entity of w.list()) {
+      if (entity.id !== target.id) await entity.detachSession(sid)
+    }
+  }
+
+  // ---- 待移动队列（活跃 / 被占用的会话）-----------------------------------
+  // 0.1.5 的单写者锁由持有写句柄的进程掌控，插件既拿不到句柄也没有释放它的公共
+  // API；在占用期硬搬目录会让在写者继续写旧 inode 并在旧路径重建空壳。因此占用时
+  // 只登记排队，等宿主释放（session/disposed）或下次插件
+  // 启动时（会话尚未被打开）自动完成。
+  const QUEUE_NOTE = '已排队：该会话正被 DSH 打开（写所有权只在 DSH 退出时释放）。重启 DSH 时会自动完成，请先别打开它。'
+
+  function isBusyError(e) {
+    if (!e) return false
+    if (e.code === 'DSM_SESSION_BUSY') return true
+    const text = String((e && e.message) || e)
+    return /正被 DSH 打开|already owned/i.test(text)
+  }
+
+  // 移动入口：占用 → 排队；其它错误照旧抛出。返回成功结果或排队结果。
+  const moveOperations = new Map()
+  async function serializeMove(sid, task) {
+    const operation = (moveOperations.get(sid) ?? Promise.resolve()).then(task)
+    const tail = operation.catch(() => {})
+    moveOperations.set(sid, tail)
+    try {
+      return await operation
+    } finally {
+      if (moveOperations.get(sid) === tail) moveOperations.delete(sid)
+    }
+  }
+
+  function moveOrQueue(sid, targetPath, scope) {
+    return serializeMove(sid, async () => {
+      try {
+        const result = await moveOne(sid, targetPath, scope)
+        if (await pendingMoves.has(sid)) await pendingMoves.remove([sid])
+        return result
+      } catch (e) {
+        if (!isBusyError(e)) throw e
+        await pendingMoves.queue(sid, targetPath, scope)
+        return { ok: true, moved: false, queued: true, notes: [QUEUE_NOTE] }
+      }
+    })
+  }
+
+  // 启动后的「学步期」：这段时间内 moveOne 的非占用类失败只当环境未就绪，不计入
+  // 「多次失败即放弃」的计数（否则 boot 竞态会把用户的排队项白白丢掉）。
+  const BOOT_WARMUP_MS = 30000
+  const bootedAt = Date.now()
+
+  let queueRunning = false
+  async function runPendingMoves(reason) {
+    if (queueRunning) return { ran: false, moved: 0, kept: 0 }
+    queueRunning = true
+    let moved = 0
+    const notes = []
+    try {
+      const items = await pendingMoves.list()
+      for (const { sessionId } of items) {
+        await serializeMove(sessionId, async () => {
+          const item = await pendingMoves.get(sessionId)
+          if (!item) return
+          try {
+            await moveOne(item.sessionId, item.targetPath, item.scope)
+            await pendingMoves.remove([item.sessionId])
+            metaCache.invalidate(item.sessionId)
+            moved++
+            notes.push(`排队中的移动已完成：${String(item.sessionId).slice(0, 18)}…`)
+            // T2：通知落盘失败不吞掉移动结果本身（队列项已删，回滚代价不值——
+            // 保留 console.warn 作最后兜底，这是刻意接受的静默缺口）。
+            try { await moveNotices.append({ kind: 'moved', sessionId: item.sessionId, targetPath: item.targetPath, at: Date.now() }) } catch (e) { /* best-effort */ }
+          } catch (e) {
+            if (isBusyError(e)) return // 仍被占用：留在队列里，等下一次触发
+            if (Date.now() - bootedAt < BOOT_WARMUP_MS) return // boot 期未就绪：不记失败
+            const bumped = await pendingMoves.bumpAttempts(item.sessionId)
+            if (bumped && bumped.dropped) {
+              notes.push(`排队中的移动多次失败已放弃：${String(item.sessionId).slice(0, 18)}…（${String((e && e.message) || e)}）`)
+              try { await moveNotices.append({ kind: 'abandoned', sessionId: item.sessionId, targetPath: item.targetPath, at: Date.now(), attempts: bumped.attempts, reason: String((e && e.message) || e).split('\n')[0] }) } catch (err) { /* best-effort */ }
+            }
+          }
+        })
+      }
+      if (moved > 0) { try { await reindexRegistry() } catch (e) { /* best-effort */ } }
+    } finally {
+      queueRunning = false
+    }
+    if (notes.length > 0) {
+      try { for (const n of notes) console.warn('[dsh-sessions-manager] ' + n) } catch (e) { /* ignore */ }
+    }
+    void reason
+    return { ran: true, moved, kept: (await pendingMoves.list()).length }
+  }
+
+  // 排队项的补跑时机。**关键前提**：0.1.5 的单写者所有权一经 open 就持有到**进程退出**
+  // 为止——官方没有任何「关闭会话 / 释放所有权」的公开入口（`dsh-commands` 只有
+  // compact/feedback/goal；宿主无 unloadSession/closeSession/evict），而浏览器一连上就会
+  // 自动打开/新建会话，一旦被打开就再也搬不动。所以唯一可靠窗口是**宿主刚起来、浏览器
+  // 还没连上**的那一两秒 ⇒ 启动后立刻试，并在前 30s 内密集重试；之后每 120s 兜底；
+  // 会话真被释放（session/disposed）时 500ms 后再试一次。
+  const queueEffect = typeof ctx.effect === 'function' ? ctx.effect.bind(ctx) : ((fn) => { fn() })
+  if (typeof ctx.on === 'function') {
+    queueEffect(() => ctx.on('session/disposed', (session) => {
+      const id = session && session.id != null ? String(session.id) : null
+      if (!id) return
+      pendingMoves.has(id).then((queued) => {
+        if (!queued) return
+        const t = setTimeout(() => { runPendingMoves('session-disposed').catch(() => {}) }, 500)
+        if (t && typeof t.unref === 'function') t.unref()
+      }).catch(() => {})
+    }))
+  }
+  queueEffect(() => {
+    // 每个启动补跑定时器都要 unref：宿主自己不会闲下来无所谓，但测试里未 unref 的
+    // 30s 定时器会让 node:test 多等 30s 才退出（整套测试被无谓拖长，实测见报告）。
+    const timers = [0, 1000, 3000, 6000, 12000, 30000].map((ms) => {
+      const t = setTimeout(() => {
+        runPendingMoves(ms === 0 ? 'startup' : `startup+${ms}`).catch(() => {})
+      }, ms)
+      if (t && typeof t.unref === 'function') t.unref()
+      return t
+    })
+    // 轻量周期重试：只在队列非空时干活（队列空 = 一次本地 JSON 读取）。
+    const tickTimer = setInterval(() => {
+      pendingMoves.list().then((items) => { if (items.length > 0) return runPendingMoves('tick') }).catch(() => {})
+    }, 120000)
+    if (tickTimer && typeof tickTimer.unref === 'function') tickTimer.unref()
+    return () => { for (const t of timers) clearTimeout(t); clearInterval(tickTimer) }
+  })
+
+  // Force the host's WorkspaceRegistry to rebuild its in-memory sessionPath
+  // index from the durable persistence headers. DSH's WorkspaceEntity.sessionIds
+  // is a *getter* that filters record.sessionIds by `host.sessionPath(id) ===
+  // record.path`; that sessionPath Map is only repopulated at startup (bootstrap
+  // + indexHeaders). So even after a successful move writes the durable cwd,
+  // the running process keeps attributing the session to its OLD workspace until
+  // a restart — unless we reindex here. Calling this right after move makes the
+  // sidebar reflect the new grouping with NO restart required.
+  async function reindexRegistry() {
+    const reg = w
+    if (!reg || typeof reg.replaceHeaderIndex !== 'function') return false
+    let entries = null
+    try { entries = await persistence.listEntries() } catch (e) { entries = null }
+    if (!entries || !Array.isArray(entries)) return false
+    await reg.replaceHeaderIndex(entries.map((entry) => entry.header))
+    if (typeof reg.rebuildEntities === 'function') reg.rebuildEntities()
+    return true
+  }
+
+  async function listWorkspaces() {
+    const out = []
+    try {
+      for (const ent of w.list()) out.push({ workspaceId: ent.id, title: ent.title, path: ent.path })
+    } catch (e) { /* ignore */ }
+    return out
+  }
+
+  // Archive (hide) one session: adds its id to the durable archive set so it
+  // is dropped out of the sidebar. DSH requires the session to exist (live or
+  // persisted) — a genuine miss surfaces as an error.
+  async function archiveOne(sid) {
+    requireSessionId(sid)
+    return mutateArchived(async (list) => {
+      if (list.includes(sid)) return { next: null, value: { ok: true, archived: false } }
+      await w.archiveSession(sid)
+      // archiveSession owns the durable write; keep this operation serialized
+      // with restoreOne so two requests cannot overwrite each other's state.
+      return { next: null, value: { ok: true, archived: true } }
+    })
+  }
+
+  // 批量投影（v3.6.2 #1 三态版）。返回 Map<id, { resolved, snapshot|null }>：
+  //   resolved=true  —— fulfilled 快照（title 可能为 null：会话真的没标题，
+  //                     这是事实，可以缓存/落盘）；
+  //   resolved=false —— rejected / 批量异常 / 结果缺条 / 无投影 API。
+  // 调用方（runWarm）只缓存 resolved 的条目；失败的进退避重试，绝不落盘——
+  // 否则「一次失败」被固化为跨重启的永久占位（v3.6.1 审计 #1）。
+  const warmHasApi = typeof sq.readTitleSnapshots === 'function' || typeof sq.readTitleSnapshot === 'function'
+
+  async function projectTitlesStatus(ids) {
+    const out = new Map()
+    const markAll = (resolved) => { for (const id of ids) out.set(String(id), { resolved, snapshot: null }) }
+    if (!ids || !ids.length) return out
+    if (!warmHasApi) { markAll(false); return out }
+    if (typeof sq.readTitleSnapshots === 'function') {
+      let results = null
+      try { results = await sq.readTitleSnapshots(ids) } catch (e) { results = null }
+      if (Array.isArray(results)) {
+        results.forEach((result, index) => {
+          const id = String(ids[index])
+          if (result && result.status === 'fulfilled') out.set(id, { resolved: true, snapshot: unwrapSnapshot(result) })
+          else if (result && result.status === 'rejected') out.set(id, { resolved: false, snapshot: null })
+          else if (result) out.set(id, { resolved: true, snapshot: unwrapSnapshot(result) }) // 最老形态：直接是快照
+          else out.set(id, { resolved: false, snapshot: null })
+        })
+        // 结果数组短于请求（runtime 行为异常）→ 缺的条目按失败处理。
+        for (const id of ids) if (!out.has(String(id))) out.set(String(id), { resolved: false, snapshot: null })
+        return out
+      }
+      // 批量形态不认识：退回逐条。
+    }
+    if (typeof sq.readTitleSnapshot === 'function') {
+      for (const raw of ids) {
+        const id = String(raw)
+        try {
+          const r = await sq.readTitleSnapshot(id)
+          if (r && r.status === 'rejected') out.set(id, { resolved: false, snapshot: null })
+          else out.set(id, { resolved: true, snapshot: unwrapSnapshot(r) })
+        } catch (e) { out.set(id, { resolved: false, snapshot: null }) }
+      }
+      return out
+    }
+    markAll(false)
+    return out
+  }
+
+  // 兼容旧调用点（暂无）：保留名字不导出，避免误用回「失败即 null」的旧语义。
+
+  // opts.usage: expose sizeBytes + updatedAt on each item (storage analysis and
+  // the auto-archive sweep need them; the panel list does not).
+  //
+  // 性能要点（issue #1 + 0.1.3-alpha 适配）：
+  //   1. sp.list() 只调一次（原先列了两遍目录）
+  //   2. 变更令牌优先来自 list 快照：legacy 走 locate+stat，SessionHandle 世代
+  //      直接用 snapshot.revision（无 locate 可用，也绝不绕私有路径补 stat）
+  //   3. 缓存未命中的会话**绝不在请求路径上同步投影**（issue #8：runtime 的
+  //      readTitleSnapshots 每条都是整本解码）——入队后台预热，先以占位元数据返回
+  async function allSessionItemsDetailed(opts = {}) {
+    let entries = []
+    let headersOk = false
+    try {
+      entries = await persistence.listEntries()
+      headersOk = Array.isArray(entries)
+      if (!headersOk) entries = []
+    } catch (e) { entries = [] }
+    const entryById = new Map(entries.map((entry) => [entry.id, entry]))
+    let live = ctx.get('sessions')
+    const ids = entries.map((entry) => entry.id)
+    if (live) { try { live.list().forEach((s) => { const sid = String(s.id); if (!ids.includes(sid)) ids.push(sid) }) } catch (e) { /* ignore */ } }
+    // Exclude sessions already moved to the recycle bin (软删除): they live in
+    // 回收站, not in 会话管理, so the panel won't re-list them after a delete.
+    // purged tombstone 只对「当前不存在的 id」继续隐藏：若同 id 会话后来重新
+    // 出现（重建/换绑定），墓碑必须让位，不能永久压住新会话。
+    let hiddenIds = new Set()
+    try {
+      const store = await readTrashStore()
+      const present = new Set(ids)
+      hiddenIds = new Set([
+        ...store.items.map((t) => String(t.sessionId)),
+        ...store.purgedSessionIds.map(String).filter((id) => !present.has(id)),
+      ])
+    } catch (e) {}
+    const visibleIds = ids.filter((id) => !hiddenIds.has(id))
+    wsByPath = {}
+    try { for (const ent of w.list()) wsByPath[ent.path] = ent } catch (e) { wsByPath = {} }
+    const currentArchived = new Set((await archivedState().catch(() => ({ archivedSessionIds: [] }))).archivedSessionIds || [])
+    const usage = await collectUsage(entries)
+    // 先按指纹把「缓存命中」与「需要补齐」分开。
+    const statsById = new Map(visibleIds.map((id) => [
+      id,
+      (usage.statsById && usage.statsById.get(id)) || { mtimeMs: usage.mtimeById.get(id), size: usage.sizeById.get(id) },
+    ]))
+    const { cached, missing } = metaCache.partition(visibleIds, statsById)
+    // 命中顺序（3.8.1 换轨后）：零 I/O 的官方投影排在磁盘索引之前。
+    //   ① live 会话：注册表 cachedSnapshot（内存 cell，最新）
+    //   ② 冷会话：官方持久投影缓存 cachedSnapshot / cachedPredecessorTitle
+    //   ③ 本地持久标题索引（磁盘，await——只在①②都没命中时才付这个成本）
+    //   ④ 后台预热（整本解码，只兜最后一批）
+    // ①② 都是同步的，且命中即从「需要补齐」里摘掉：大库冷启动不再把每条历史
+    // 会话都推给 readTitleSnapshots（issue #8 的 90s CPU 来源）。
+    const projectionMeta = new Map()
+    const unresolved = []
+    for (const id of missing) {
+      const entry = entryById.get(id)
+      const header = entry && entry.header ? entry.header : null
+      const title = projectionTitleOf(live, id) || (isLiveSession(live, id) ? null : cachedTitleOfHeader(header))
+      // 只信非空字符串：null = 未知（cell 可能还没折叠），继续往下走。
+      if (title == null) { unresolved.push(id); continue }
+      const meta = {
+        title,
+        cwd: (header && typeof header.cwd === 'string' && header.cwd) ? header.cwd : null,
+        createdAt: (header && header.createdAt != null) ? header.createdAt : null,
+      }
+      projectionMeta.set(id, meta)
+      // metaCache.set 在指纹不可算时拒绝写入，所以命中结果另存 projectionMeta，
+      // 本请求的渲染链直接可用——缓存只是增益。
+      metaCache.set(id, statsById.get(id), meta)
+    }
+    // P4：仍缺的再查持久标题索引（冷启动跳过整本解码），命中的回填内存缓存。
+    // cwd/createdAt 回填时以最新 list header 为权威——持久条目里的 cwd 可能因
+    // 移动会话而陈旧（sz 指纹对 cwd 无感知），标题才是索引的产出物。
+    const persisted = await hydrateFromPersist(unresolved, statsById)
+    for (const [id, meta] of persisted) {
+      const entry = entryById.get(id)
+      const header = entry && entry.header ? entry.header : null
+      metaCache.set(id, statsById.get(id), {
+        title: meta.title,
+        cwd: (header && typeof header.cwd === 'string' && header.cwd) ? header.cwd : meta.cwd,
+        createdAt: (header && header.createdAt != null) ? header.createdAt : meta.createdAt,
+      })
+    }
+    const stillMissing = unresolved.filter((id) => !persisted.has(id))
+    // issue #8：仍然缺的才进后台预热（分批 + 让步），请求路径零投影、零日志解码。
+    if (stillMissing.length) enqueueWarm(stillMissing, statsById, entryById)
+    const items = []
+    for (const id of visibleIds) {
+      // metaCache 优先：persisted 命中已带 header 权威 cwd/createdAt 回填进
+      // metaCache（persisted.get 里的 cwd 可能因移动会话而陈旧）。
+      // 完全未命中的会话也不能丢 cwd/createdAt——它们来自 list header，零成本
+      // 且是工作区归属/创建时间的权威来源；只有标题允许占位等后台预热（issue #8）。
+      let meta = metaCache.get(id, statsById.get(id)) || persisted.get(id) || projectionMeta.get(id) || null
+      if (!meta) {
+        meta = { title: null, cwd: null, createdAt: null }
+        const entry = entryById.get(id)
+        const header = entry && entry.header ? entry.header : null
+        if (header) {
+          if (typeof header.cwd === 'string') meta.cwd = header.cwd
+          if (header.createdAt != null) meta.createdAt = header.createdAt
+        }
+      }
+      const it = buildItem(id, meta, usage, !!(opts && opts.usage))
+      items.push({ ...it, archived: currentArchived.has(it.sessionId) })
+    }
+    if (opts && opts.onlyArchived) {
+      // /archived-sessions/list 的语义：只返回归档集里仍然存在的会话，
+      // 且不带 archived 布尔注记（旧路由的输出形状）。
+      const archivedItems = []
+      for (const it of items) {
+        if (!it.archived) continue
+        const { archived: _drop, ...rest } = it
+        archivedItems.push(rest)
+      }
+      return { items: archivedItems, usage }
+    }
+    // Annotate stars & tags; GC only when we have a trustworthy id baseline, so a
+    // failing sp.list() can never wipe the whole index.
+    let starredSet = new Set()
+    let tagIdsBySession = new Map()
+    try {
+      starredSet = new Set((await stars.read()).starredSessionIds)
+      // Same one-shot read as stars: tag ids are plain metadata, no decoding.
+      // Filter dangling tagIds against the live definitions so a half-deleted
+      // tag can never leak into a rendered row.
+      const tagStore = await tags.read()
+      const knownTagIds = new Set(tagStore.tags.map((t) => t.id))
+      for (const [sid, list] of Object.entries(tagStore.assignments)) {
+        const kept = list.filter((id) => knownTagIds.has(id))
+        if (kept.length) tagIdsBySession.set(sid, kept)
+      }
+    } catch (e) {}
+    for (const it of items) {
+      it.starred = starredSet.has(String(it.sessionId))
+      it.tags = tagIdsBySession.get(String(it.sessionId)) || []
+    }
+    if (headersOk) await gcStars(ids)
+    if (headersOk) await gcTags(ids)
+    return { items, usage }
+  }
+
+  async function allSessionItems(opts = {}) {
+    return (await allSessionItemsDetailed(opts)).items
+  }
+
+  // ---- Storage usage + auto-archive ---------------------------------------
+
+  // Read-only rollup: per-workspace totals plus the largest sessions. The
+  // aggregation itself is a pure function (src/storage-stats.js).
+  async function buildStorage(opts = {}) {
+    const items = await allSessionItems({ usage: true })
+    const raw = Number(opts && opts.topN)
+    const topN = Number.isInteger(raw) && raw > 0 ? Math.min(raw, MAX_STORAGE_TOP) : 10
+    return aggregateStorage(items, { topN })
+  }
+
+  // Archive conversations that have been idle past the configured window.
+  //
+  // Deliberately lazy — there is no timer. The sweep runs when the panel reads
+  // its settings (and on demand), at most once a day: a background interval
+  // would keep the host process alive and would archive conversations while
+  // nobody is looking at the panel.
+  async function autoArchiveSweep(opts = {}) {
+    const store = await autoArchive.read()
+    const days = store.settings.inactiveDays
+    if (!days) return { ok: true, skipped: 'disabled', archived: 0 }
+    const now = Date.now()
+    if (!(opts && opts.force) && autoArchive.isFresh(store, now)) {
+      return { ok: true, skipped: 'throttled', archived: 0, lastRunAt: store.lastRunAt, lastArchivedCount: store.lastArchivedCount }
+    }
+    const { items, usage } = await allSessionItemsDetailed({ usage: true })
+    // SessionHandle 世代没有可靠的「最后活跃时间」（无 locate/mtime，快照也不
+    // 携带事件时间）。无法证明会话闲置 → 一律跳过，绝不猜测（宁可漏归档，
+    // 不能错归档）。UI 会如实展示该降级。
+    if (!usage.hasActivityData) {
+      return {
+        ok: true, skipped: 'no-activity-data', archived: 0,
+        note: '当前 DSH 版本未提供可靠的最后活跃时间，自动归档已跳过；不会基于猜测归档任何会话。',
+      }
+    }
+    const candidates = pickInactiveCandidates(items, {
+      inactiveDays: days,
+      skipStarred: store.settings.skipStarred,
+      activeSessionIds: [...getActiveSessionIds(ctx, activeTracker)],
+      now,
+    })
+    let archived = 0
+    const failed = []
+    for (const sid of candidates) {
+      try {
+        const result = await archiveOne(sid)
+        if (result && result.archived) archived++
+      } catch (e) {
+        failed.push({ sessionId: sid, error: String((e && e.message) || e) })
+      }
+    }
+    await autoArchive.recordRun(archived, now)
+    return { ok: true, archived, candidates: candidates.length, failed, lastRunAt: now }
+  }
+
+  // 侧栏权威数据：标题 + 回收站 id 集合。
+  //
+  // 标题原先「首次调用算一次就永久缓存」，日志之后再变也不会更新——标题会陈旧。
+  // 现在复用 metaCache：每次调用只 stat 一遍，日志没变直接取缓存，变了才重解码，
+  // 既不会陈旧也不会回到「每次全量解码」。
+  async function sidebarAuthority() {
+    const ids = []
+    let entries = []
+    try { entries = await persistence.listEntries() } catch (e) { entries = [] }
+    if (!Array.isArray(entries)) entries = []
+    for (const entry of entries) ids.push(entry.id)
+    const sessions = ctx.get('sessions')
+    try { if (sessions) sessions.list().forEach((session) => { const sid = String(session.id); if (!ids.includes(sid)) ids.push(sid) }) } catch (e) {}
+    const store = await readTrashStore()
+    // 墓碑只对「当前不存在」的 id 继续输出；同 id 会话重新出现时必须让位。
+    const present = new Set(ids)
+    const activeTombstones = store.purgedSessionIds.map(String).filter((id) => !present.has(id))
+    // 官方持久投影缓存的冷提示（同步、零 I/O）。标题与 blank 共用同一次读取——
+    // 每条会话只查一次表，别在下面的血缘循环里再查一遍。
+    // 必须声明在 if 之外：血缘循环对所有 entries 都要读它。
+    const hintsById = new Map()
+    for (const entry of entries) {
+      const hints = cachedHintsOf(entry.header)
+      if (hints) hintsById.set(String(entry.id), hints)
+    }
+    if (ids.length) {
+      const usage = await collectUsage(entries)
+      const entryById = new Map(entries.map((entry) => [entry.id, entry]))
+      const statsById = new Map(ids.map((id) => [
+        id,
+        (usage.statsById && usage.statsById.get(id)) || { mtimeMs: usage.mtimeById.get(id), size: usage.sizeById.get(id) },
+      ]))
+      const { cached, missing } = metaCache.partition(ids, statsById)
+      // 命中顺序与 /sessions 一致：live 注册表 → 官方持久投影缓存 → 本地索引 → 预热。
+      const projectionMeta = new Map()
+      const unresolved = []
+      for (const id of missing) {
+        const entry = entryById.get(id)
+        const header = entry && entry.header ? entry.header : null
+        const hints = hintsById.get(id) || null
+        const title = projectionTitleOf(sessions, id)
+          || (isLiveSession(sessions, id) ? null : (hints && hints.title ? hints.title : null))
+        if (title == null) { unresolved.push(id); continue }
+        const meta = {
+          title,
+          cwd: (header && typeof header.cwd === 'string' && header.cwd) ? header.cwd : null,
+          createdAt: (header && header.createdAt != null) ? header.createdAt : null,
+        }
+        projectionMeta.set(id, meta)
+        metaCache.set(id, statsById.get(id), meta)
+      }
+      // P4：与列表构建共用持久标题索引，冷启动零解码。
+      const persisted = await hydrateFromPersist(unresolved, statsById)
+      for (const [id, meta] of persisted) {
+        const entry = entryById.get(id)
+        const header = entry && entry.header ? entry.header : null
+        metaCache.set(id, statsById.get(id), {
+          title: meta.title,
+          cwd: (header && typeof header.cwd === 'string' && header.cwd) ? header.cwd : meta.cwd,
+          createdAt: (header && header.createdAt != null) ? header.createdAt : meta.createdAt,
+        })
+      }
+      const rest = unresolved.filter((id) => !persisted.has(id))
+      // issue #8：缺失标题不在请求路径上同步投影（runtime 投影 = 逐条整本解码），
+      // 交后台预热补齐；侧栏高频轮询会让补齐结果自然浮现。
+      if (rest.length) enqueueWarm(rest, statsById, entryById)
+      for (const id of ids) {
+        const meta = metaCache.get(id, statsById.get(id)) || persisted.get(id) || projectionMeta.get(id) || null
+        if (meta && meta.title) authorityTitleCache.set(id, String(meta.title))
+      }
+    }
+    // 血缘分类（issue #6 + T1/3.7.0 + 3.8.1）：结构分类（子代理 / fork 分支）来自
+    // list snapshot 的 header，零解码。空白（empty）是**三态**：null=未知（等后台
+    // refine 队列精判）、true/false=已判定（来自进程内缓存、empty-scan 持久层
+    // ——sz 指纹一致 + 14 天 TTL 内才可信——或官方投影的 blank 预筛）。
+    // 请求路径零解码承诺由此成立：超过解码上限的日志「必有内容」按事实直接给 false；
+    // legacy 无 sizeBytes 观测 → 永不候选、恒未知（与旧行为一致）。普通会话只在
+    // 真判空时建条目，「误隐藏」在结构上不可能来自体积法（该路径已整体退役）。
+    const lineage = {}
+    const refineWanted = []
+    let emptyStore = null
+    try { emptyStore = await emptyIndex.entries() } catch (e) { emptyStore = null }
+    const nowTs = Date.now()
+    for (const entry of entries) {
+      const id = String(entry.id)
+      const size = entry && Number.isFinite(entry.sizeBytes) ? entry.sizeBytes : null
+      const hints = hintsById.get(id) || null
+      const candidate = emptyScanCandidate(size)
+      let verdict = null
+      // 单向预筛：官方投影确认过 turn/start ⇒ 必有内容，这一次解码可以省掉。
+      // 反方向不成立（blank===true 仍要事件精判），理由见 projection-hints.js。
+      if (hints && hints.blank === false) {
+        verdict = false
+      } else if (!candidate) {
+        if (size !== null) verdict = false // 超出解码上限 = 必有内容（事实，不是猜测）
+      } else {
+        const mem = emptyScanCache.get(id)
+        if (mem && mem.sizeBytes === size) {
+          verdict = !!mem.empty
+        } else {
+          const rec = emptyStore && emptyStore[id]
+          if (rec && rec.fingerprint === `sz:${size}` && nowTs - (rec.updatedAt || 0) <= EMPTY_VERDICT_TTL_MS) {
+            verdict = rec.empty === 1
+            emptyScanCache.set(id, { sizeBytes: size, empty: verdict })
+          }
+        }
+        if (verdict === null && refineCapable() && !refineQueue.has(id)) refineWanted.push({ id, sizeBytes: size })
+      }
+      const info = classifyLineage(entry.header)
+      if (info) lineage[id] = { origin: info.origin, parentSession: info.parentSession, delegationDepth: info.delegationDepth, empty: verdict }
+      else if (verdict === true) lineage[id] = { origin: null, parentSession: null, delegationDepth: 0, empty: true }
+    }
+    enqueueRefine(refineWanted)
+    // 缓存只保留「本轮仍是候选」的会话，防止 Map 随历史会话无限增长。
+    for (const key of emptyScanCache.keys()) {
+      const rec = emptyScanCache.get(key)
+      if (!rec || !emptyScanCandidate(rec.sizeBytes)) emptyScanCache.delete(key)
+    }
+    const payload = {
+      titles: Object.fromEntries(authorityTitleCache),
+      trashedSessionIds: store.items.map((item) => String(item.sessionId)),
+      // issue #16：回收站按 cwd 的条数。折叠分组下上游把 group.sessions 收回成
+      // 空数组，client 拿不到成员 id，只能用「组内会话总数 − 本组回收站条数」
+      // 还原展开按钮该显示的数字；有了这份统计，那次扣减才是准确的而非估算。
+      trashedCountByCwd: (() => {
+        const acc = {}
+        for (const item of store.items) {
+          const cwd = typeof item.cwd === 'string' ? item.cwd : ''
+          if (!cwd) continue
+          acc[cwd] = (acc[cwd] || 0) + 1
+        }
+        return acc
+      })(),
+      purgedSessionIds: activeTombstones,
+      lineage,
+      // v3.6.2：还有预热/退避重试在途 → client 缩短轮询节拍，预热一完成就把
+      // 补齐的标题送回（含面板自动刷新）。无预热 API 时恒 false，绝不假忙。
+      warmPending: warmPendingNow(),
+      // T1：空白精判后台队列是否还有活。无精判能力（旧 runtime 无 inspect 通道）
+      // 时恒 false——永久 busy 会让 client 疯轮询，这是唯一现实的假忙陷阱。
+      refinePending: refinePendingNow(),
+    }
+    // T2：有未确认的排队移动终局才带出（空则省略字段——与「普通会话不产生条目」
+    // 同风格的载荷最小化；旧 client 对未知字段天然忽略）。
+    try {
+      const noticeRows = await moveNotices.list()
+      if (noticeRows.length) payload.moveNotices = noticeRows
+    } catch (e) { /* 通知通道坏了不影响侧栏主数据 */ }
+    return payload
+  }
+
+  // 空会话判定缓存（进程内）：id → { sizeBytes, empty }。日志没变（sizeBytes
+  // 相同）就不重复解码；T1 之后它只是 emptyIndex 持久层之上的热缓存。
+  const emptyScanCache = new Map()
+
+  // T1（3.7.0）：空白精判彻底移出请求路径。v3.6.2 的「预算+限流」只是过渡——
+  // 冷启动（缓存全空）时首拍仍要为精判解码，这正是「⑂ 分支」等零解码血缘被
+  // 挡在 return 之前的最后一块捆绑。现在：sidebar-state 先回三态数据，未判定
+  // 的候选进这条与 runWarm 同型的后台队列（REFINE_CHUNK=2、批间 setImmediate
+  // 让步、成功结论落盘、失败只在进程内按「非空」兜底且**不落盘**——宁可漏判
+  // 一个空白，不能把有内容的会话错标成空，也不能把失败固化成跨重启的结论）。
+  const REFINE_CHUNK = 2
+  const refineQueue = new Map()
+  let refineRunning = false
+  let refineKickTimer = null
+
+  function refineCapable() {
+    return !!persistence && typeof persistence.inspectSession === 'function'
+  }
+
+  function refinePendingNow() {
+    return !!(refineRunning || refineQueue.size)
+  }
+
+  function scheduleRefine() {
+    if (refineKickTimer || refineRunning || !refineQueue.size) return
+    refineKickTimer = setTimeout(() => { refineKickTimer = null; runRefine() }, 25)
+    if (typeof refineKickTimer.unref === 'function') refineKickTimer.unref()
+  }
+
+  function enqueueRefine(items) {
+    if (!items || !items.length || !refineCapable()) return
+    for (const { id, sizeBytes } of items) {
+      if (emptyScanCache.has(id) && emptyScanCache.get(id).sizeBytes === sizeBytes) continue
+      refineQueue.set(id, { sizeBytes })
+    }
+    scheduleRefine()
+  }
+
+  async function runRefine() {
+    if (refineRunning) return
+    refineRunning = true
+    try {
+      while (refineQueue.size) {
+        const batch = [...refineQueue.entries()].slice(0, REFINE_CHUNK)
+        for (const [id] of batch) refineQueue.delete(id)
+        const persistBatch = {}
+        for (const [id, desc] of batch) {
+          try {
+            // issue #18 第 5 条：只收事件类型会把「插件注入上下文」的会话误判成
+            // 有内容。`agent/inbox/spliced` 需要看插入项来源，这里只留判定所需的
+            // 最小信息（source 对象 + removedCount），绝不把消息正文带进内存。
+            const events = []
+            await persistence.inspectSession(id, { onEvents: (b) => {
+              for (const ev of b || []) {
+                if (events.length >= 64) break
+                if (!ev) { events.push(undefined); continue }
+                if (ev.type !== 'agent/inbox/spliced') { events.push({ type: ev.type }); continue }
+                const data = ev.data && typeof ev.data === 'object' ? ev.data : null
+                events.push({
+                  type: ev.type,
+                  data: data
+                    ? {
+                        removedCount: data.removedCount,
+                        inserted: Array.isArray(data.inserted)
+                          ? data.inserted.map((m) => ({ source: m && typeof m === 'object' ? m.source : null }))
+                          : null,
+                      }
+                    : null,
+                })
+              }
+            } })
+            const isEmpty = isEmptyEventTypes(events)
+            emptyScanCache.set(id, { sizeBytes: desc.sizeBytes, empty: isEmpty })
+            persistBatch[id] = { empty: isEmpty ? 1 : 0, fingerprint: `sz:${desc.sizeBytes}`, updatedAt: Date.now() }
+          } catch (e) {
+            // 失败兜底：非空（止 churn），但只进内存，不落盘。
+            emptyScanCache.set(id, { sizeBytes: desc.sizeBytes, empty: false })
+          }
+        }
+        if (Object.keys(persistBatch).length) {
+          try { await emptyIndex.merge(persistBatch) } catch (e) { /* 持久层只是加速器 */ }
+        }
+        // 批间让步：与 runWarm 同一纪律，绝不让后台精判独占宿主事件循环。
+        await new Promise((resolve) => setImmediate(resolve))
+      }
+    } finally {
+      refineRunning = false
+      if (refineQueue.size) scheduleRefine()
+    }
+  }
+
+  // 聚合一条会话的详情（磁盘占用 / 轮次·步数·消息数 / 工具统计 / fetch /
+  // write/edit 文件 / 血缘 parent/children/subagents）。live 与持久化会话都可读。
+  // 所有统计对未知事件类型容错；fetch 与 files 做上限截断，files 用 stat 过滤
+  // 磁盘上已不存在的路径，避免详情面板列出已删除文件。
+  // 持久化会话走 inspectSession 分块折叠：大日志不再整本驻留内存（0.1.3-alpha
+  // 已知历史会话加载性能回退，这里避免放大它）。
+  async function buildDetails(sid, signal) {
+    const sessions = ctx.get('sessions')
+    const live = sessions && sessions.get(sid)
+    let meta = null
+    let lastTime = 0
+    const fileSet = new Map()
+    const stats = {
+      turns: 0, steps: 0, userMessages: 0, assistantMessages: 0,
+      toolCalls: 0, attachments: 0, toolCounts: {}, fetches: [],
+    }
+    const turnSeen = new Set()
+    const stepSeen = new Set()
+
+    const absorb = (ev) => {
+      if (ev && typeof ev.time === 'number' && ev.time > lastTime) lastTime = ev.time
+      const d = (ev && ev.data && typeof ev.data === 'object') ? ev.data : {}
+      const type = ev && ev.type
+      switch (type) {
+        case 'turn/start':
+          if (typeof d.turn === 'number') turnSeen.add(d.turn)
+          break
+        case 'step/start':
+          if (typeof d.step === 'number') stepSeen.add(d.step)
+          break
+        case 'user/message':
+          stats.userMessages++
+          if (Array.isArray(d.content)) for (const b of d.content) if (b && b.type === 'image') stats.attachments++
+          break
+        case 'assistant/message':
+          stats.assistantMessages++
+          break
+        case 'tool/call': {
+          stats.toolCalls++
+          const tn = typeof d.name === 'string' && d.name ? d.name : 'tool'
+          stats.toolCounts[tn] = (stats.toolCounts[tn] || 0) + 1
+          if (FETCH_TOOL_RE.test(tn)) {
+            let query
+            try {
+              const a = typeof d.arguments === 'string' ? JSON.parse(d.arguments) : d.arguments
+              query = typeof a?.query === 'string' ? a.query : typeof a?.url === 'string' ? a.url : typeof a?.q === 'string' ? a.q : undefined
+            } catch (e) { query = undefined }
+            stats.fetches.push({ tool: tn, ...(query && query !== '' ? { query } : {}) })
+          }
+          if (tn === 'write' || tn === 'edit') {
+            let argsJ
+            try { argsJ = typeof d.arguments === 'string' ? JSON.parse(d.arguments) : d.arguments } catch (e) { break }
+            const fp = argsJ && typeof argsJ.file_path === 'string' && argsJ.file_path ? argsJ.file_path : undefined
+            if (fp !== undefined && !fileSet.has(fp)) fileSet.set(fp, tn)
+          }
+          break
+        }
+      }
+    }
+
+    if (live !== void 0) {
+      meta = (live && live.header) || null
+      try { (Array.isArray(live.events) ? [...live.events] : []).forEach(absorb) } catch (e) { /* empty */ }
+    } else {
+      const summary = await persistence.inspectSession(sid, { signal, onEvents: (batch) => { for (const ev of batch) absorb(ev) } })
+      if (!summary || !summary.meta) throw new Error('找不到该会话的记录（会话不存在）')
+      meta = summary.meta
+    }
+    stats.turns = turnSeen.size
+    stats.steps = stepSeen.size
+    let sizeBytes = null
+    if (live === void 0) {
+      // SessionHandle 世代：快照直接带 sizeBytes（官方 JSONL 后端廉价提供）；
+      // 拿不到再退回 locate + stat（legacy）。绝不伪造 0。
+      try {
+        const stat = await persistence.statSession(sid)
+        if (stat && Number.isFinite(stat.sizeBytes)) sizeBytes = stat.sizeBytes
+      } catch (e) { /* fall through */ }
+    }
+    if (sizeBytes === null) {
+      try {
+        // rc.8 的 sessionPersistence 后端没有 artifactInfo；用 locate(meta) 拿日志
+        // 文件真实路径后 stat 出字节数（磁盘占用）。
+        const loc = persistence.locate(meta)
+        if (loc && typeof loc.path === 'string' && loc.path) {
+          const st = await stat(loc.path)
+          if (st && typeof st.size === 'number') sizeBytes = st.size
+        }
+      } catch (e) { sizeBytes = null }
+    }
+    if (stats.fetches.length > MAX_FETCHES) stats.fetches = stats.fetches.slice(0, MAX_FETCHES)
+    const fileEntries = [...fileSet.entries()].slice(0, MAX_FILES * 2)
+    const exists = await Promise.all(fileEntries.map(([p]) => stat(p).then(() => true).catch(() => false)))
+    const files = fileEntries
+      .filter((_, i) => exists[i])
+      .map(([path, tool]) => ({ path, tool }))
+      .slice(0, MAX_FILES)
+    // lineage：分叉子会话（非 subagent）与子代理（origin==='subagent'），source 去重。
+    const lineage = {
+      parentSessionId: (meta && typeof meta.parentSession === 'string') ? meta.parentSession : null,
+      children: [],
+      subagents: [],
+    }
+    const childrenSet = new Set()
+    const subagentSet = new Set()
+    try {
+      if (typeof sp.list === 'function') {
+        for (const entry of await persistence.listEntries()) {
+          const h = entry.header
+          if (String(h.parentSession) !== String(sid)) continue
+          if (h.origin === 'subagent') subagentSet.add(h.id); else childrenSet.add(h.id)
+        }
+      }
+    } catch (e) { /* best-effort */ }
+    if (sessions) {
+      try {
+        sessions.list().forEach((s) => {
+          if (String(s.header.parentSession) !== String(sid)) return
+          if (s.header.origin === 'subagent') subagentSet.add(s.id); else childrenSet.add(s.id)
+        })
+      } catch (e) { /* best-effort */ }
+    }
+    lineage.children = [...childrenSet]
+    lineage.subagents = [...subagentSet]
+    return {
+      sessionId: sid,
+      sizeBytes,
+      createdAt: (meta && typeof meta.createdAt === 'number') ? meta.createdAt : null,
+      updatedAt: Math.max(lastTime || 0, (meta && typeof meta.createdAt === 'number' ? meta.createdAt : 0)) || null,
+      files,
+      stats,
+      lineage,
+    }
+  }
+
+  ctx.effect(() => {
+    const disposers = []
+
+    if (typeof ctx.on === 'function') disposers.push(ctx.on('session/event', (session, event) => {
+      if (event && event.type === 'session/title' && event.data && typeof event.data.title === 'string') {
+        authorityTitleCache.set(String(session.id), event.data.title)
+      }
+    }))
+
+    // 客户端会随能力探测上报它实际启用的「会话 ⋯ 菜单」通道。回显在这里，
+    // 排障时不必打开 devtools 就能判断「菜单三项没出来」到底是因为走了旧 DOM
+    // 路径、还是注册压根没发生（issue #28 的定位成本就花在这上面）。
+    let clientMenuProbe = null
+    // 界面自证：设置左导航图标数、侧栏行数、展开按钮数、关键令牌的解析值。
+    // 只收计数与短字符串，绝不接收标题/正文；字段全部白名单化，避免把任意
+    // JSON 回显出去。
+    let clientUiProbe = null
+    const uiProbeNumber = (probe, key) => {
+      const v = probe[key]
+      return typeof v === 'number' && Number.isFinite(v) && v >= 0 && v < 1e6 ? Math.round(v) : null
+    }
+    const uiProbeText = (probe, key) => (typeof probe[key] === 'string' ? probe[key].slice(0, 40) : null)
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/capabilities',
+      handler: async (req, res) => {
+        try {
+          const body = await readJsonBody(req)
+          const mode = body && typeof body.menuMode === 'string' ? body.menuMode : null
+          if (mode) clientMenuProbe = { mode, at: Date.now() }
+          const probe = body && body.uiProbe && typeof body.uiProbe === 'object' ? body.uiProbe : null
+          if (probe) {
+            clientUiProbe = {
+              navSection: uiProbeNumber(probe, 'navSection'),
+              navIcons: uiProbeNumber(probe, 'navIcons'),
+              navOwn: uiProbeNumber(probe, 'navOwn'),
+              navFallback: uiProbeNumber(probe, 'navFallback'),
+              navIconRenders: uiProbeNumber(probe, 'navIconRenders'),
+              sessionRows: uiProbeNumber(probe, 'sessionRows'),
+              workspaceRows: uiProbeNumber(probe, 'workspaceRows'),
+              overflowRows: uiProbeNumber(probe, 'overflowRows'),
+              stateDots: uiProbeNumber(probe, 'stateDots'),
+              tokenBgLayer2: uiProbeText(probe, 'tokenBgLayer2'),
+              tokenWarn: uiProbeText(probe, 'tokenWarn'),
+              at: Date.now(),
+            }
+          }
+        } catch (e) { /* 老客户端不带 body：保留上一次记录 */ }
+        json(res, { ...capabilities, buildStamp: BUILD_STAMP, clientMenu: clientMenuProbe, clientUi: clientUiProbe })
+      },
+    }))
+
+    // 活跃会话心跳（客户端 → host）。0.1.7+ 起 host 无从得知 UI 当前选中了哪个
+    // 会话（见 src/active-session.js），只能由客户端上报；host 只在心跳新鲜期内
+    // 采信，用它拦住「移动正在看的会话」和「自动归档正在看的会话」。
+    // body: { clientId, sessionId|null }。sessionId 为空 = 该客户端当前无活跃会话。
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/active-session',
+      handler: async (req, res) => {
+        const body = await readJsonBody(req)
+        const clientId = body && typeof body.clientId === 'string' ? body.clientId : 'default'
+        const sid = body && typeof body.sessionId === 'string' && body.sessionId ? body.sessionId : null
+        const accepted = activeTracker.report(clientId, sid)
+        json(res, {
+          ok: accepted,
+          activeSessionIds: [...activeTracker.activeIds()],
+        })
+      },
+    }))
+
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/list',
+      handler: async (req, res) => {
+        try {
+          const state = await archivedState()
+          const ids = state.archivedSessionIds || []
+          // Only surface archived ids that still exist (materialized log or live).
+          // Deleted sessions keep a hidden archive id but no log, so they drop out here.
+          let materialized = new Set()
+          let live = ctx.get('sessions')
+          try {
+            const entries = await persistence.listEntries()
+            materialized = new Set(entries.map((entry) => entry.id))
+          } catch (e) { /* best-effort */ }
+          const trashStore = await readTrashStore()
+          // 墓碑只对「当前不存在」的 id 生效；同 id 会话重新出现时让位。
+          const present = new Set([
+            ...materialized,
+            ...ids.map(String),
+            ...(live && typeof live.list === 'function' ? live.list().map((s) => String(s.id)) : []),
+          ])
+          const tombstones = trashStore.purgedSessionIds.map(String).filter((id) => !present.has(id))
+          const hidden = new Set([...trashStore.items.map((item) => String(item.sessionId)), ...tombstones])
+          const idStrs = ids.map(String).filter((id) => !hidden.has(id) && (materialized.has(id) || (live && live.get(id))))
+          wsByPath = {}
+          try { for (const ent of w.list()) wsByPath[ent.path] = ent } catch (e) { wsByPath = {} }
+          // issue #8：归档列表也复用「缓存直读 + 后台预热」的统一管线。
+          // 旧实现逐条 resolveOne(id)（无 header、无指纹）——冷启动对每条归档
+          // 会话整本解码，且连进程内缓存都永远命中不了。
+          const wanted = new Set(idStrs)
+          const detailed = await allSessionItemsDetailed()
+          const items = detailed.items.filter((it) => wanted.has(String(it.sessionId)) && it.archived)
+          for (const it of items) delete it.archived
+          json(res, { items })
+        } catch (e) {
+          json(res, { error: String((e && e.message) || e) }, 500)
+        }
+      },
+    }))
+
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/restore',
+      handler: async (req, res) => {
+        try {
+          const body = await readJsonBody(req)
+          const sid = body && typeof body.sessionId === 'string' ? body.sessionId : null
+          if (!sid) return json(res, { ok: false, error: 'missing sessionId' }, 400)
+          json(res, await restoreOne(sid))
+        } catch (e) {
+          json(res, { ok: false, error: String((e && e.message) || e) }, errorStatus(e))
+        }
+      },
+    }))
+
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/restore-many',
+      handler: async (req, res) => {
+        try {
+          const body = await readJsonBody(req)
+          const ids = parseIds(body)
+          if (!ids || ids.length === 0) return json(res, { ok: false, error: 'missing sessionIds' }, 400)
+          const results = []
+          for (const sid of ids) {
+            try { results.push({ sessionId: sid, ok: true, ...(await restoreOne(sid)) }) }
+            catch (e) { results.push({ sessionId: sid, ok: false, code: e && e.code, error: String((e && e.message) || e) }) }
+          }
+          json(res, { ok: true, restored: results.filter((r) => r.ok).length, results })
+        } catch (e) {
+          json(res, { ok: false, code: e && e.code, error: String((e && e.message) || e) }, errorStatus(e))
+        }
+      },
+    }))
+
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/delete',
+      handler: async (req, res) => {
+        try {
+          const body = await readJsonBody(req)
+          const sid = body && typeof body.sessionId === 'string' ? body.sessionId : null
+          if (!sid) return json(res, { ok: false, error: 'missing sessionId' }, 400)
+          // issue #18 第 4 条：默认连带子代理一起回收（cascadeSubagents:false 可保留
+          // 子代理——它们在面板里会落进「未归属子代理」卡片，仍可管理）。
+          const out = await deleteWithSubagents(sid, { cascade: body.cascadeSubagents !== false })
+          // 日志被搬进回收站（文件已不在原处）：丢弃缓存条目，避免下次 stat 失败
+          // 时残留旧元数据。
+          metaCache.invalidate(sid)
+          json(res, out)
+        } catch (e) {
+          json(res, { ok: false, error: String((e && e.message) || e) }, errorStatus(e))
+        }
+      },
+    }))
+
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/delete-many',
+      handler: async (req, res) => {
+        try {
+          const body = await readJsonBody(req)
+          const ids = parseIds(body)
+          if (!ids || ids.length === 0) return json(res, { ok: false, error: 'missing sessionIds' }, 400)
+          const results = []
+          // 级联与单删一致：一次快照，多个父会话的子代理不会互相重复回收。
+          let cascadeEntries = null
+          try { cascadeEntries = await persistence.listEntries() } catch (e) { cascadeEntries = null }
+          const cascade = body.cascadeSubagents !== false
+          const done = new Set()
+          for (const sid of ids) {
+            try {
+              if (done.has(sid)) { results.push({ sessionId: sid, ok: true, trashed: true, cascaded: 0 }); continue }
+              const out = cascade && cascadeEntries
+                ? await deleteWithSubagents(sid, { cascade: true, entries: cascadeEntries })
+                : await deleteOne(sid, { entries: cascadeEntries })
+              done.add(sid)
+              if (Array.isArray(out.cascadedIds)) for (const k of out.cascadedIds) done.add(k)
+              results.push({ sessionId: sid, ok: true, ...out })
+              metaCache.invalidate(sid)
+            } catch (e) { results.push({ sessionId: sid, ok: false, error: String((e && e.message) || e) }) }
+          }
+          json(res, { ok: true, deleted: results.filter((r) => r.ok).length, cascaded: results.reduce((n, r) => n + (Number(r.cascaded) || 0), 0), results })
+        } catch (e) {
+          json(res, { ok: false, code: e && e.code, error: String((e && e.message) || e) }, errorStatus(e))
+        }
+      },
+    }))
+
+    // ---- Recycle bin (回收站) routes ----------------------------------------
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/trash/list',
+      handler: async (req, res) => {
+        try {
+          await cleanupExpiredTrash()
+          const list = await readTrash()
+          list.sort((a, b) => (b.deletedAt || 0) - (a.deletedAt || 0))
+          const store = await readTrashStore()
+          json(res, { schemaVersion: store.schemaVersion, settings: store.settings, purgedSessionIds: store.purgedSessionIds, items: list })
+        } catch (e) {
+          json(res, { ok: false, error: String((e && e.message) || e) }, errorStatus(e))
+        }
+      },
+    }))
+
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/trash/settings',
+      handler: async (req, res) => {
+        try {
+          const body = await readJsonBody(req)
+          const settings = body && Object.prototype.hasOwnProperty.call(body, 'retentionDays')
+            ? await trashSettings({ retentionDays: body.retentionDays })
+            : await trashSettings()
+          json(res, { ok: true, settings })
+        } catch (e) {
+          json(res, { ok: false, error: String((e && e.message) || e) }, errorStatus(e))
+        }
+      },
+    }))
+
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/trash/verify',
+      handler: async (req, res) => {
+        try {
+          const items = await readTrash()
+          const results = await Promise.all(items.map(async (item) => {
+            if (typeof item.originalPath !== 'string' || !item.originalPath) {
+              return { sessionId: item.sessionId, status: 'unverified', originalPath: null }
+            }
+            const exists = await stat(item.originalPath).then(() => true).catch(() => false)
+            return { sessionId: item.sessionId, status: exists ? 'ok' : 'missing', originalPath: item.originalPath }
+          }))
+          json(res, {
+            ok: true,
+            healthy: results.filter((r) => r.status === 'ok').length,
+            missing: results.filter((r) => r.status === 'missing').length,
+            unverified: results.filter((r) => r.status === 'unverified').length,
+            results,
+          })
+        } catch (e) {
+          json(res, { ok: false, error: String((e && e.message) || e) }, errorStatus(e))
+        }
+      },
+    }))
+
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/trash/restore',
+      handler: async (req, res) => {
+        try {
+          const body = await readJsonBody(req)
+          const sid = body && typeof body.sessionId === 'string' ? body.sessionId : null
+          if (!sid) return json(res, { ok: false, error: 'missing sessionId' }, 400)
+          const out = await restoreFromTrash(sid)
+          metaCache.invalidate(sid)
+          // 连带回收的子代理一起回来，父子生命周期保持一致。
+          const cascaded = await cascadeTrashChildren(sid, (kid) => restoreFromTrash(kid))
+          json(res, { ...out, cascaded: cascaded.filter((r) => r.ok).length, cascadedResults: cascaded.length ? cascaded : undefined })
+        } catch (e) {
+          json(res, { ok: false, code: e && e.code, error: String((e && e.message) || e) }, errorStatus(e))
+        }
+      },
+    }))
+
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/trash/purge',
+      handler: async (req, res) => {
+        try {
+          const body = await readJsonBody(req)
+          const sid = body && typeof body.sessionId === 'string' ? body.sessionId : null
+          if (!sid) return json(res, { ok: false, error: 'missing sessionId' }, 400)
+          const out = await purgeTrashEntry(sid)
+          const cascadedResults = await cascadeTrashChildren(sid, purgeTrashEntry)
+          json(res, { ...out, cascaded: cascadedResults.filter((r) => r.ok).length, cascadedResults })
+        } catch (e) {
+          json(res, { ok: false, code: e && e.code, error: String((e && e.message) || e) }, errorStatus(e))
+        }
+      },
+    }))
+
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/trash/purge-many',
+      handler: async (req, res) => {
+        try {
+          const body = await readJsonBody(req)
+          const ids = parseIds(body)
+          if (!ids || ids.length === 0) return json(res, { ok: false, error: 'missing sessionIds' }, 400)
+          const outcomes = new Map()
+          for (const sid of ids) {
+            if (outcomes.get(sid)?.ok) continue
+            try {
+              outcomes.set(sid, { sessionId: sid, ok: true, ...(await purgeTrashEntry(sid)) })
+              for (const result of await cascadeTrashChildren(sid, purgeTrashEntry)) {
+                outcomes.set(result.sessionId, result)
+              }
+            } catch (e) {
+              outcomes.set(sid, { sessionId: sid, ok: false, error: String((e && e.message) || e) })
+            }
+          }
+          const results = [...outcomes.values()]
+          json(res, { ok: true, purged: results.filter((r) => r.ok).length, results })
+        } catch (e) {
+          json(res, { ok: false, code: e && e.code, error: String((e && e.message) || e) }, errorStatus(e))
+        }
+      },
+    }))
+
+    // All conversations (for the "移动会话" panel).
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/sessions',
+      handler: async (req, res) => {
+        try {
+          // usage:true：updatedAt(=日志文件 mtime) 随行带出——3.7.0 分支聚拢的
+          // createdAt 缺失回退键（logic.branchTimeKey）。collectUsage 本就在
+          // allSessionItemsDetailed 内无条件执行，成本≈纯 payload 增加。
+          json(res, { items: await allSessionItems({ usage: true }), warmPending: warmPendingNow() })
+        } catch (e) {
+          json(res, { error: String((e && e.message) || e) }, 500)
+        }
+      },
+    }))
+
+    // Star / unstar one or many sessions (收藏, schema v3).
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/star/set',
+      handler: async (req, res) => {
+        try {
+          const body = await readJsonBody(req)
+          const starred = !!(body && body.starred)
+          let ids = parseIds(body)
+          if ((!ids || ids.length === 0) && body && typeof body.sessionId === 'string') {
+            ids = isSafeSessionId(body.sessionId) ? [body.sessionId] : null
+          }
+          if (!ids || ids.length === 0) return json(res, { ok: false, code: 'DSM_STAR_SESSION_INVALID', error: 'missing sessionId' }, 400)
+          const starredSessionIds = await stars.setStarred(ids, starred)
+          json(res, { ok: true, starredSessionIds })
+        } catch (e) {
+          // 3.7.0：补 code 字段（响应形状向后兼容，只增字段）——新路由全部带 code，
+          // 星标不应是例外。
+          json(res, { ok: false, code: e && e.code, error: String((e && e.message) || e) }, errorStatus(e))
+        }
+      },
+    }))
+
+    // ---- Tags (标签, schema v4) — one route one action, same shape as star/set.
+    // Pure user metadata: these routes never create/modify/delete a session.
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/tags/list',
+      handler: async (req, res) => {
+        try {
+          const { tags: tagList, assignments } = await tags.list()
+          json(res, { ok: true, tags: tagList, assignments })
+        } catch (e) {
+          json(res, { ok: false, code: e && e.code, error: String((e && e.message) || e) }, errorStatus(e))
+        }
+      },
+    }))
+
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/tags/create',
+      handler: async (req, res) => {
+        try {
+          const body = await readJsonBody(req)
+          const tag = await tags.create(body && body.name)
+          json(res, { ok: true, tag })
+        } catch (e) {
+          json(res, { ok: false, code: e && e.code, error: String((e && e.message) || e) }, errorStatus(e))
+        }
+      },
+    }))
+
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/tags/rename',
+      handler: async (req, res) => {
+        try {
+          const body = await readJsonBody(req)
+          await tags.rename(body && body.id, body && body.name)
+          json(res, { ok: true })
+        } catch (e) {
+          json(res, { ok: false, code: e && e.code, error: String((e && e.message) || e) }, errorStatus(e))
+        }
+      },
+    }))
+
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/tags/merge',
+      handler: async (req, res) => {
+        try {
+          const body = await readJsonBody(req)
+          await tags.merge(body && body.fromId, body && body.toId)
+          json(res, { ok: true })
+        } catch (e) {
+          json(res, { ok: false, code: e && e.code, error: String((e && e.message) || e) }, errorStatus(e))
+        }
+      },
+    }))
+
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/tags/delete',
+      handler: async (req, res) => {
+        try {
+          const body = await readJsonBody(req)
+          await tags.removeTag(body && body.id)
+          json(res, { ok: true })
+        } catch (e) {
+          json(res, { ok: false, code: e && e.code, error: String((e && e.message) || e) }, errorStatus(e))
+        }
+      },
+    }))
+
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/tags/set',
+      handler: async (req, res) => {
+        try {
+          const body = await readJsonBody(req)
+          const sid = body && body.sessionId
+          if (!isSafeSessionId(sid)) {
+            return json(res, { ok: false, code: 'DSM_TAG_SESSION_INVALID', error: 'missing/invalid sessionId' }, 400)
+          }
+          const assignments = await tags.setTags(sid, body && body.tagIds)
+          json(res, { ok: true, assignments })
+        } catch (e) {
+          json(res, { ok: false, code: e && e.code, error: String((e && e.message) || e) }, errorStatus(e))
+        }
+      },
+    }))
+
+    // ---- Saved filters (保存筛选, schema v1) --------------------------------
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/filters/list',
+      handler: async (req, res) => {
+        try {
+          json(res, { ok: true, items: await savedFilters.list() })
+        } catch (e) {
+          json(res, { ok: false, code: e && e.code, error: String((e && e.message) || e) }, errorStatus(e))
+        }
+      },
+    }))
+
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/filters/save',
+      handler: async (req, res) => {
+        try {
+          const body = await readJsonBody(req)
+          const item = await savedFilters.save(body && body.name, body && body.filters)
+          json(res, { ok: true, item })
+        } catch (e) {
+          json(res, { ok: false, code: e && e.code, error: String((e && e.message) || e) }, errorStatus(e))
+        }
+      },
+    }))
+
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/filters/delete',
+      handler: async (req, res) => {
+        try {
+          const body = await readJsonBody(req)
+          const ids = body && Array.isArray(body.ids) ? body.ids : null
+          if (!ids || ids.length === 0) return json(res, { ok: false, code: 'DSM_FILTER_IDS_INVALID', error: 'missing ids' }, 400)
+          const removed = await savedFilters.remove(ids)
+          json(res, { ok: true, removed })
+        } catch (e) {
+          json(res, { ok: false, code: e && e.code, error: String((e && e.message) || e) }, errorStatus(e))
+        }
+      },
+    }))
+
+    // Human-readable Markdown export (one session). Raw-log ZIP export is
+    // dsh's own GET /api/session.export — we deliberately do not duplicate it
+    // (see reports/HANDOFF-dsh-sessions-manager-roadmap.md §2.4).
+    //
+    // 0.1.3 兼容：日志经 inspectSession 分块读取（SessionHandle.read 的
+    // offset/length 有界切片），流式渲染 Markdown，客户端断开即取消（signal），
+    // 并受全局并发闸约束——大日志不再一次性整本驻留内存。
+    const exportLimiter = createLimiter(2)
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/export-md',
+      handler: async (req, res) => {
+        try {
+          const url = new URL(req.url, 'http://localhost')
+          const sid = url.searchParams.get('sessionId')
+          requireSessionId(sid)
+          const ac = new AbortController()
+          res.on('close', () => { if (!res.writableEnded) ac.abort() })
+          const md = await exportLimiter(async () => {
+            const builder = createSessionMarkdownBuilder({ id: sid })
+            const summary = await persistence.inspectSession(sid, {
+              signal: ac.signal,
+              onEvents: (batch) => builder.addEvents(batch),
+            })
+            if (!summary || !summary.meta) {
+              const error = new Error('无法读取该会话的日志')
+              error.status = 404
+              throw error
+            }
+            // meta 在流结束后才权威（header 来自 open 回包）；finish 覆写 front matter。
+            return builder.finish({ ...summary.meta, id: sid })
+          })
+          res.writeHead(200, {
+            'content-type': 'text/markdown; charset=utf-8',
+            'content-disposition': `attachment; filename="dsh-session-${sid}.md"`,
+            'cache-control': 'no-store',
+          })
+          res.end(md)
+        } catch (e) {
+          json(res, { error: String((e && e.message) || e) }, errorStatus(e))
+        }
+      },
+    }))
+
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/sidebar-state',
+      handler: async (req, res) => {
+        try {
+          json(res, await sidebarAuthority())
+        } catch (e) {
+          json(res, { error: String((e && e.message) || e) }, errorStatus(e))
+        }
+      },
+    }))
+
+    // 子代理血缘树（管理视图数据面）：给定父会话，返回 origin==='subagent'
+    // 的递归子树。DSH 原生目录（ui-subagent）只读，这里补管理能力的数据来源。
+    // 只读官方 header 血缘字段（parentSession/origin/delegationDepth/createdAt），
+    // 标题走 v3.6.2 的纯缓存读取（metaCache/持久索引/权威缓存），未命中入后台
+    // 预热、本轮返回 null；请求路径零解码。
+    // live 标记 = 会话在内存里活着（正在运行或已打开）：批量清理必须跳过。
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/lineage-tree',
+      handler: async (req, res) => {
+        try {
+          const body = await readJsonBody(req)
+          const rootId = body && typeof body.sessionId === 'string' ? body.sessionId : ''
+          if (!rootId || !isSafeSessionId(rootId)) return json(res, { error: 'missing sessionId' }, 400)
+          const headerById = new Map()
+          const sizeById = new Map()
+          // 与会话列表同源的可见性判定：回收站项目一律不参与血缘树。
+          const trashedIds = new Set()
+          let purgedIds = []
+          const persistedIds = new Set()
+          try {
+            const store = await readTrashStore()
+            for (const item of store.items) trashedIds.add(String(item.sessionId))
+            purgedIds = store.purgedSessionIds.map(String)
+          } catch (e) { /* best-effort */ }
+          const addHeader = (h, sizeBytes) => {
+            if (!h || h.id == null) return
+            const id = String(h.id)
+            // 回收站里的会话（软删除后日志已搬走）不能出现在血缘树里，否则
+            // 会出现「删掉了侧栏还在」。彻底删除的墓碑在下面按「当前已不存在」
+            // 统一剔除，避免压住后来同 id 重建的会话。
+            if (headerById.has(id) || trashedIds.has(id)) return
+            headerById.set(id, {
+              parentSession: h.parentSession != null ? String(h.parentSession) : null,
+              subagent: h.origin === 'subagent',
+              delegationDepth: Number.isFinite(h.delegationDepth) ? h.delegationDepth : null,
+              createdAt: typeof h.createdAt === 'number' ? h.createdAt : null,
+            })
+            if (Number.isFinite(sizeBytes)) sizeById.set(id, sizeBytes)
+          }
+          // v3.6.2 #4：标题只读缓存（metaCache → 持久索引 → 权威缓存），未命中
+          // 入后台预热、本轮返回 null。旧实现在请求路径直调 projectTitles——
+          // 展开一个 N 子树的父会话 = N 次整本解码同步在请求路径上（issue #8
+          // 要消灭的形态在本路由的残留）。这里顺手记下指纹与原始 header，供
+          // 缓存读取与 enqueueWarm 使用。
+          const lineageStats = new Map()
+          const lineageHeaders = new Map()
+          try {
+            for (const entry of await persistence.listEntries()) {
+              addHeader(entry.header, entry.sizeBytes)
+              const eid = entry && entry.id != null ? String(entry.id) : null
+              if (eid) {
+                lineageHeaders.set(eid, { header: (entry && entry.header) || null })
+                // 只有 handle 世代（snapshot 带 revision）才建 stats；legacy 的列表快照
+                // 本就没有这些观测，其标题经 sidebarAuthority 的 authorityTitleCache
+                // 兜住。刻意不在这里合成 sz-only stat——会和列表构建的 mtime:size
+                // 指纹在同一索引里乒乓覆盖，引发交替重复解码。
+                if (entry && typeof entry.revision === 'string' && entry.revision) {
+                  lineageStats.set(eid, Number.isFinite(entry.sizeBytes)
+                    ? { revision: entry.revision, sizeBytes: Number(entry.sizeBytes) }
+                    : { revision: entry.revision })
+                }
+              }
+              if (entry && entry.id != null) persistedIds.add(String(entry.id))
+            }
+          } catch (e) { /* best-effort */ }
+          const liveIds = new Set()
+          const live = ctx.get('sessions')
+          try {
+            if (live && typeof live.list === 'function') {
+              live.list().forEach((s) => { liveIds.add(String(s.id)); addHeader(s.header, undefined) })
+            }
+          } catch (e) { /* best-effort */ }
+          // 墓碑只对「持久层里确实没了」的 id 生效：同 id 会话后来重新出现时
+          // 必须让位，不能永久压住新会话（与会话列表同一套规则）。
+          for (const id of purgedIds) {
+            if (!persistedIds.has(id)) headerById.delete(id)
+          }
+          // 子代理索引：parentSession → 直接子代理 id 列表（只收 origin==='subagent'）。
+          const kidsOf = new Map()
+          for (const [id, h] of headerById) {
+            if (!h.subagent || !h.parentSession) continue
+            if (!kidsOf.has(h.parentSession)) kidsOf.set(h.parentSession, [])
+            kidsOf.get(h.parentSession).push(id)
+          }
+          // 递归展开：visited 防环，节点总数封顶防病态数据。
+          const MAX_NODES = 500
+          let nodeCount = 0
+          const build = (id, depth, visited) => {
+            nodeCount++
+            const h = headerById.get(id) || {}
+            const childVisited = new Set(visited)
+            childVisited.add(id)
+            const kidIds = nodeCount >= MAX_NODES ? [] : (kidsOf.get(id) || []).filter((k) => !childVisited.has(k))
+            return {
+              sessionId: id,
+              parentSession: h.parentSession || null,
+              delegationDepth: h.delegationDepth,
+              depth,
+              createdAt: h.createdAt || null,
+              sizeBytes: sizeById.has(id) ? sizeById.get(id) : null,
+              live: liveIds.has(id),
+              title: null,
+              children: kidIds.map((k) => build(k, depth + 1, childVisited)),
+            }
+          }
+          const nodes = (kidsOf.get(rootId) || []).map((k) => build(k, 1, new Set([rootId])))
+          const allIds = [rootId]
+          const walk = (n) => { allIds.push(n.sessionId); n.children.forEach(walk) }
+          nodes.forEach(walk)
+          // v3.6.2 #4：缓存读取 + 预热入队，请求路径零解码。#12：标题按
+          // MAX_TITLE 截断，与列表输出口径一致。
+          const lineageIds = allIds.map(String)
+          const { cached: lineageCached, missing: lineageMissing } = metaCache.partition(lineageIds, lineageStats)
+          const lineagePersisted = await hydrateFromPersist(lineageMissing, lineageStats)
+          for (const [id, meta] of lineagePersisted) metaCache.set(id, lineageStats.get(id), meta)
+          const lineageRest = lineageMissing.filter((id) => !lineagePersisted.has(id))
+          if (lineageRest.length) enqueueWarm(lineageRest, lineageStats, lineageHeaders)
+          const truncateTitle = (t) => (t ? (t.length > MAX_TITLE ? t.slice(0, MAX_TITLE) + '…' : t) : null)
+          const titleOf = (id) => {
+            const key = String(id)
+            const m = lineageCached.get(key) || lineagePersisted.get(key)
+            return truncateTitle((m && m.title) || authorityTitleCache.get(key) || null)
+          }
+          const fill = (n) => { n.title = titleOf(n.sessionId); n.children.forEach(fill) }
+          nodes.forEach(fill)
+          json(res, { parent: { sessionId: rootId, title: titleOf(rootId) }, nodes })
+        } catch (e) {
+          json(res, { error: String((e && e.message) || e) }, errorStatus(e))
+        }
+      },
+    }))
+
+    // Available target workspaces (for the move picker).
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/workspaces',
+      handler: async (req, res) => {
+        try {
+          json(res, { items: await listWorkspaces() })
+        } catch (e) {
+          json(res, { error: String((e && e.message) || e) }, 500)
+        }
+      },
+    }))
+
+    // Move one conversation to a target workspace (existing path or a new one).
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/move',
+      handler: async (req, res) => {
+        try {
+          const body = await readJsonBody(req)
+          const sid = body && typeof body.sessionId === 'string' ? body.sessionId : null
+          const target = body && typeof body.targetPath === 'string' ? body.targetPath : null
+          if (!sid) return json(res, { ok: false, error: 'missing sessionId' }, 400)
+          if (!target) return json(res, { ok: false, error: 'missing targetPath' }, 400)
+          const moved = await moveOrQueue(sid, target)
+          if (moved.queued) return json(res, { sessionId: sid, ...moved })
+          // 移动会改写日志 frame0 的 cwd：元数据（cwd）已变，主动丢弃缓存条目，
+          // 不等 mtime 指纹自然失效（Windows 上 mtime 精度较粗，指纹可能不变）。
+          metaCache.invalidate(sid)
+          // Reindex the host's in-memory sessionPath index so the sidebar
+          // reflects the new grouping immediately (no DSH restart needed).
+          // Do this before replying: drag/drop and menu clients treat a 2xx
+          // response as the commit point and must never announce success while
+          // the sidebar still holds the old workspace index.
+          try { await reindexRegistry() } catch (e) { /* best-effort */ }
+          json(res, { sessionId: sid, ...moved })
+        } catch (e) {
+          json(res, { ok: false, code: e && e.code, error: String((e && e.message) || e) }, errorStatus(e))
+        }
+      },
+    }))
+
+    // Move many conversations to one target workspace (issue #7). Sequential
+    // on purpose: each move rewrites frame0 (file IO), and one bad session
+    // must not block the rest. Single reindex at the end covers all moves.
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/move-many',
+      handler: async (req, res) => {
+        try {
+          const body = await readJsonBody(req)
+          const ids = Array.isArray(body && body.sessionIds)
+            ? [...new Set(body.sessionIds.filter((x) => typeof x === 'string' && x))]
+            : []
+          const target = body && typeof body.targetPath === 'string' ? body.targetPath : null
+          if (!ids.length) return json(res, { ok: false, error: 'missing sessionIds' }, 400)
+          if (!target) return json(res, { ok: false, error: 'missing targetPath' }, 400)
+          let moved = 0
+          const failed = []
+          const queued = []
+          for (const sid of ids) {
+            try {
+              const r = await moveOrQueue(sid, target)
+              if (r && r.queued) { queued.push(sid); continue }
+              // frame0 的 cwd 被改写：与单移动同理由，主动丢缓存不等指纹失效。
+              metaCache.invalidate(sid)
+              moved++
+            } catch (e) {
+              const err = e && e.code ? { sessionId: sid, error: String((e && e.message) || e), code: e.code } : { sessionId: sid, error: String((e && e.message) || e) }
+              failed.push(err)
+            }
+          }
+          try { await reindexRegistry() } catch (e) { /* best-effort */ }
+          json(res, {
+            moved,
+            failed,
+            ...(queued.length > 0 ? { queued, notes: [`${queued.length} 个会话已排队（正被 DSH 打开），重启 DSH 后会自动完成；重启后请先别打开它们。`] } : {}),
+          })
+        } catch (e) {
+          json(res, { ok: false, code: e && e.code, error: String((e && e.message) || e) }, errorStatus(e))
+        }
+      },
+    }))
+
+    // 待移动队列：查看 / 取消（会话被占用时排队，释放后自动完成）。
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/pending-moves',
+      handler: async (req, res) => {
+        try {
+          const items = await pendingMoves.list()
+          json(res, { items: items.map((i) => ({ sessionId: i.sessionId, targetPath: i.targetPath, queuedAt: i.queuedAt, attempts: i.attempts })) })
+        } catch (e) {
+          json(res, { error: String((e && e.message) || e) }, 500)
+        }
+      },
+    }))
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/pending-moves/cancel',
+      handler: async (req, res) => {
+        try {
+          const body = await readJsonBody(req)
+          const ids = parseIds(body)
+          if (!ids || ids.length === 0) return json(res, { ok: false, error: 'missing sessionIds' }, 400)
+          const removed = await pendingMoves.remove(ids)
+          json(res, { ok: true, removed })
+        } catch (e) {
+          json(res, { ok: false, error: String((e && e.message) || e) }, errorStatus(e))
+        }
+      },
+    }))
+
+    // T2：ack 已展示的排队移动通知（尽力清理；失败无害，client 端 localStorage
+    // 已见集合负责多 tab 去重，7 天 TTL 兜底）。
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/pending-moves/notices/ack',
+      handler: async (req, res) => {
+        try {
+          const body = await readJsonBody(req)
+          const ids = body && Array.isArray(body.ids) ? body.ids : null
+          if (!ids || !ids.length) return json(res, { ok: false, error: 'missing ids' }, 400)
+          const removed = await moveNotices.ack(ids)
+          json(res, { ok: true, removed })
+        } catch (e) {
+          json(res, { ok: false, error: String((e && e.message) || e) }, errorStatus(e))
+        }
+      },
+    }))
+
+    // Archive (hide) one session.
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/archive',
+      handler: async (req, res) => {
+        try {
+          const body = await readJsonBody(req)
+          const sid = body && typeof body.sessionId === 'string' ? body.sessionId : null
+          if (!sid) return json(res, { ok: false, error: 'missing sessionId' }, 400)
+          json(res, { sessionId: sid, ...(await archiveOne(sid)) })
+        } catch (e) {
+          json(res, { ok: false, error: String((e && e.message) || e) }, 500)
+        }
+      },
+    }))
+
+    // Archive (hide) many sessions.
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/archive-many',
+      handler: async (req, res) => {
+        try {
+          const body = await readJsonBody(req)
+          const ids = parseIds(body)
+          if (!ids || ids.length === 0) return json(res, { ok: false, error: 'missing sessionIds' }, 400)
+          const results = []
+          for (const sid of ids) {
+            try { results.push({ sessionId: sid, ok: true, ...(await archiveOne(sid)) }) }
+            catch (e) { results.push({ sessionId: sid, ok: false, error: String((e && e.message) || e) }) }
+          }
+          json(res, { ok: true, archived: results.filter((r) => r.ok).length, results })
+        } catch (e) {
+          json(res, { ok: false, error: String((e && e.message) || e) }, 500)
+        }
+      },
+    }))
+
+    // Per-session details (v2.0): disk usage, turn/step/message counts, tool
+    // usage, fetch records, write/edit files, and lineage.
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/details',
+      handler: async (req, res) => {
+        try {
+          const body = await readJsonBody(req)
+          const sid = body && typeof body.sessionId === 'string' ? body.sessionId : null
+          if (!sid) return json(res, { ok: false, error: 'missing sessionId' }, 400)
+          // 客户端断开时取消分块读取，避免为已离开的请求继续解码整本日志。
+          const ac = new AbortController()
+          res.on('close', () => { if (!res.writableEnded) ac.abort() })
+          json(res, await buildDetails(sid, ac.signal))
+        } catch (e) {
+          json(res, { error: String((e && e.message) || e) }, (e && e.status) ? e.status : 500)
+        }
+      },
+    }))
+
+    // Storage usage rollup (read-only): per-workspace totals + largest sessions.
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/storage',
+      handler: async (req, res) => {
+        try {
+          const body = await readJsonBody(req)
+          json(res, await buildStorage({ topN: body && body.topN }))
+        } catch (e) {
+          json(res, { error: String((e && e.message) || e) }, 500)
+        }
+      },
+    }))
+
+    // Auto-archive settings. A plain read (no patch keys) doubles as the lazy
+    // sweep trigger — that is how the once-a-day cleanup gets a chance to run
+    // without a background timer. The sweep runs in the background so opening
+    // the panel never waits on it (P5, issue #1): the sweep itself already
+    // reuses the metadata caches, and this keeps the settings read latency
+    // independent of library size.
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/auto-archive/settings',
+      handler: async (req, res) => {
+        try {
+          const body = await readJsonBody(req)
+          const patch = {}
+          if (body && Object.prototype.hasOwnProperty.call(body, 'inactiveDays')) patch.inactiveDays = body.inactiveDays
+          if (body && Object.prototype.hasOwnProperty.call(body, 'skipStarred')) patch.skipStarred = body.skipStarred
+          const isPatch = Object.keys(patch).length > 0
+          const settings = isPatch
+            ? await autoArchive.update(patch)
+            : (await autoArchive.read()).settings
+          let sweep
+          if (isPatch) {
+            // 显式保存设置：保持「保存即生效」的同步 sweep（含刚启用时的首次归档）。
+            sweep = await autoArchiveSweep()
+          } else {
+            // 面板打开的纯读取：sweep 转后台执行，打开延迟与库大小解耦
+            //（P5，issue #1）。sweep 本身已复用元数据缓存 + 持久标题索引。
+            void autoArchiveSweep().catch(() => {})
+            sweep = { triggered: true }
+          }
+          const store = await autoArchive.read()
+          json(res, {
+            ok: true,
+            settings,
+            lastRunAt: store.lastRunAt,
+            lastArchivedCount: store.lastArchivedCount,
+            sweep,
+          })
+        } catch (e) {
+          json(res, { ok: false, error: String((e && e.message) || e) }, errorStatus(e))
+        }
+      },
+    }))
+
+    // Run the auto-archive sweep right now, ignoring the once-a-day throttle.
+    disposers.push(ctx.webServer.register({
+      kind: 'exact',
+      path: '/archived-sessions/auto-archive/run',
+      handler: async (req, res) => {
+        try {
+          const sweep = await autoArchiveSweep({ force: true })
+          const store = await autoArchive.read()
+          json(res, { ok: true, ...sweep, settings: store.settings, lastRunAt: store.lastRunAt, lastArchivedCount: store.lastArchivedCount })
+        } catch (e) {
+          json(res, { ok: false, error: String((e && e.message) || e) }, 500)
+        }
+      },
+    }))
+
+    return () => { for (const d of disposers) d() }
+  }, 'dsh-sessions-manager: routes')
+
+  return {
+    async moveSession(sid, target, { expectedCwd }) {
+      const result = await moveOrQueue(sid, target.path, { expectedCwd, targetWorkspaceId: target.id })
+      if (result.moved) {
+        metaCache.invalidate(sid)
+        await reindexRegistry()
+      }
+      return result
+    },
+    pendingMove: pendingMoves.get,
+  }
+}

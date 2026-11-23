@@ -1,0 +1,67 @@
+{
+  "name": "dsh-session-workbench",
+  "version": "1.2.0",
+  "description": "DeepSeek Harness 会话管理、全文搜索、Agent 项目管理与跨会话协作",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MindCastlePlayground/dsh-session-workbench.git"
+  },
+  "homepage": "https://github.com/MindCastlePlayground/dsh-session-workbench#readme",
+  "bugs": "https://github.com/MindCastlePlayground/dsh-session-workbench/issues",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./icon": "./assets/icon.png",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "lib",
+    "assets/icon.png",
+    "build.mjs",
+    "cordis.patch.yml"
+  ],
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "session-manager",
+    "full-text-search"
+  ],
+  "engines": {
+    "node": ">=22",
+    "dsh": ">=0.2.0-rc.1"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --test tests/*.test.js && node tests/search-host.mjs && node tests/search-client.mjs",
+    "prepack": "npm run build"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
+      ]
+    },
+    "compatibility": {
+      "dsh": ">=0.2.0-rc.1"
+    }
+  },
+  "meta": {
+    "title": "会话工作台",
+    "description": "管理会话和项目，全文搜索历史对话，支持 Agent 跨会话协作与迁移"
+  }
+}

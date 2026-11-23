@@ -1,0 +1,644 @@
+// dsh-sessions-manager — client 纯判定逻辑。
+//
+// 侧栏增强里最容易随 DSH 上游变化出回归的两块判定抽到这里：
+// 拖拽可放置校验、fiber node → 会话/工作区识别。
+// 本模块不碰 DOM，node --test 直接可测（tests/client-logic.test.js）。
+
+// 权威标题只修正新出现 DOM 行的冷态标题。行一旦完成首次 paint，后续文本
+// 变化属于 DSH Core 的实时更新（例如重命名），插件不得再用轮询快照覆盖。
+export function authoritativeTitleForFirstPaint({ firstPaint = false, rendered = '', authoritative = '' } = {}) {
+  if (!firstPaint || !authoritative || rendered === authoritative) return null
+  return authoritative
+}
+
+// v3.6.2 #2：占位/冷标题的行在权威标题**后到**时回填。返回 null 表示不动 DOM。
+// 所有权规则（与首绘一致，绝不覆盖 DSH Core 的实时更新）：
+//   - 首次见到该行 → 有权威就用权威（changed 仅在权威≠当前文本时为 true）；
+//   - 之后：当前文本仍等于我们上次记录/写入的值（baseline.text）且权威更新 →
+//     回填新权威；当前文本被官方改过 → 只重新记录所有权，绝不写。
+export function titleBackfillDecision({ rendered = '', baseline = null, authoritative = '' } = {}) {
+  const auth = authoritative || ''
+  if (!baseline) {
+    const next = auth || rendered
+    return { text: next, changed: !!auth && auth !== rendered, nextBaseline: { text: next, authoritative: auth || null } }
+  }
+  if (rendered !== baseline.text) {
+    // 文本已被（官方渲染或用户重命名）改动：所有权移交，仅重新记录。
+    return { changed: false, nextBaseline: { text: rendered, authoritative: baseline.authoritative || null } }
+  }
+  if (!auth || auth === baseline.authoritative) return null
+  return { text: auth, changed: true, nextBaseline: { text: auth, authoritative: auth } }
+}
+
+// v3.6.2 #6：列表搜索/标题排序的「有效标题」= 列表项标题，缺时回落到侧栏
+// 权威标题缓存（预热补齐后即使面板还没刷新，搜索/排序也按真标题工作）。
+export function effectiveTitleOf(item, authoritativeTitles) {
+  if (!item) return ''
+  if (item.title) return String(item.title)
+  const id = String(item.sessionId)
+  const auth = authoritativeTitles && authoritativeTitles.get(id)
+  return auth ? String(auth) : ''
+}
+
+// 拖拽迁移前置校验：同工作区拦截（workspacePath 相等即拒绝）。
+// 无 workspacePath 的会话（如侧栏 live 行尚未同步）放行，由 host 最终裁决。
+export function canDropOnWorkspace(item, target) {
+  if (!item || !target) return false
+  if (item.workspacePath && target.path === item.workspacePath) return false
+  return true
+}
+
+// 从 React fiber 链收集到的 node 数组识别会话行。knownSessions 是
+// host /archived-sessions/sessions 的权威表；live 行（还没同步到权威表）
+// 用启发式兜底：有 id、不是工作区分组（无 workspaceId）、且带标题/时间。
+export function sessionForNodes(nodes, knownSessions) {
+  for (const node of nodes || []) {
+    const id = node && node.id != null ? String(node.id) : ''
+    if (knownSessions.has(id)) return knownSessions.get(id)
+    // DSH 的行节点有 id；工作区分组用 workspaceId、从不用裸 id。
+    if (id && node.workspaceId == null && (node.title != null || node.updatedAt != null || node.blank != null)) {
+      return { sessionId: id, title: node.title || '', workspacePath: null }
+    }
+  }
+  return null
+}
+
+// 从 fiber node 数组识别可见的工作区标题行（可放置目标）。
+// 会话行的 fiber 链也会带出父工作区节点，调用方须先用 sessionForNodes 拦截。
+export function workspaceForNodes(nodes) {
+  for (const group of nodes || []) {
+    if (group && group.workspaceId != null && typeof group.cwd === 'string' && group.cwd) {
+      return { workspaceId: String(group.workspaceId), path: group.cwd, title: group.label || group.cwd }
+    }
+  }
+  return null
+}
+
+// 收藏过滤：返回已收藏子集。star 是用户标记，与 DSH 的活动/归档状态正交
+// （可叠加），所以这里不做任何状态联合判断，只认 starred 字段。
+export function starredOf(items) {
+  return (items || []).filter((item) => item && item.starred)
+}
+
+// 血缘折叠：把 origin === 'subagent' 的会话挂到父会话下，返回顶层列表 + 父子
+// 映射 + 折叠数量。
+//
+// 关键约束：从顶层移除的是「子代理自己」，父会话必须保留在顶层——折叠按钮就
+// 渲染在父会话卡片里，父一旦被一起过滤掉，界面上就只剩平铺的子代理，看起来
+// 像「折叠完全没生效」。
+// 父会话不在当前列表（被筛选掉 / 已删除）时子代理保持在顶层，保证搜得到就
+// 看得见。
+export function foldSubagents(items, lineage) {
+  const list = items || []
+  const table = lineage || {}
+  const kidsOf = new Map()
+  const foldedIds = new Set()
+  const byId = new Map()
+  for (const item of list) byId.set(String(item.sessionId), item)
+  for (const item of list) {
+    const id = String(item.sessionId)
+    const info = table[id]
+    const parentId = info && info.origin === 'subagent' && info.parentSession ? String(info.parentSession) : null
+    if (!parentId || parentId === id || !byId.has(parentId)) continue
+    if (!kidsOf.has(parentId)) kidsOf.set(parentId, [])
+    kidsOf.get(parentId).push(item)
+    foldedIds.add(id)
+  }
+  return {
+    topList: foldedIds.size ? list.filter((item) => !foldedIds.has(String(item.sessionId))) : list,
+    kidsOf,
+    foldedCount: foldedIds.size,
+  }
+}
+
+// 列表里只显示会话 ID 的短片段。完整 UUID 有 36 个字符，塞进 meta 行会把整
+// 行撑到换行、卡片高度跟着浮动——短 ID 是「列表定高」的前提之一。完整值保留
+// 在 title 属性与详情面板里，信息不丢。
+export function shortId(id) {
+  const raw = String(id == null ? '' : id)
+  const tail = raw.startsWith('session-') ? raw.slice(8) : raw
+  if (!tail) return ''
+  return tail.length <= 10 ? tail : tail.slice(0, 8) + '…'
+}
+
+// 打开子代理之后的提示文案。三种结果要传达三件不同的事，混成一句「打不开」
+// 会让人既不知道原因、也不知道下一步：
+//   ok         → 已经切过去了；在设置面板里会话区被挡着，得提醒关掉才看得到
+//   no-service → 这个 runtime 没开放会话切换接口，只能手动切
+//   failed     → 自动切换没成功，给出确定可走的替代路径（侧栏父会话头部的
+//                「/ N」官方子代理目录）
+// where: 'panel'（设置面板内）| 'sidebar'（侧栏注入行）
+export function openSubagentToast(result, name, where) {
+  const label = name || '子代理'
+  if (result === 'ok') {
+    return {
+      kind: 'ok',
+      text: where === 'sidebar' ? `已打开「${label}」` : `已打开「${label}」— 关掉设置即可看到`,
+    }
+  }
+  if (result === 'no-service') {
+    return { kind: 'err', text: '这个 DSH 版本没有开放会话切换接口，请在侧边栏手动切换' }
+  }
+  return {
+    kind: 'err',
+    text: where === 'sidebar'
+      ? '打不开这个子代理：请选中它的父会话，点标题栏的「/ N」子代理目录'
+      : '打不开：请在侧边栏选中它的父会话，点标题栏的「/ N」子代理目录',
+  }
+}
+
+// 提示（toast）停留时长：按**可读字数**给，而不是固定 2.4s / 2.6s。
+// 中文舒适阅读约 6 字/秒，留 40% 余量后夹在 [2.6s, 11s]；失败类再 ×1.25（同样受上限约束）。
+// 背景（2026-09-10 用户反馈）：排队/失败类文案动辄 40~100 字，"还没读完提示就不见了"。
+export const TOAST_MIN_MS = 2600
+export const TOAST_MAX_MS = 11000
+export function toastDurationFor(text, kind) {
+  const chars = String(text == null ? '' : text).length
+  const readingMs = Math.round((chars / 6) * 1000 * 1.4)
+  const scaled = kind === 'err' ? Math.round(readingMs * 1.25) : readingMs
+  return Math.min(TOAST_MAX_MS, Math.max(TOAST_MIN_MS, scaled))
+}
+
+// —— T2（3.7.0）：排队移动终局通知的文案与投递计划（纯函数，可 node --test）——
+// host 把每次后台终局（成功/放弃）落成通知经 sidebar-state 带出；client 用本地
+// 已见集合过滤后弹一次 toast，并 ack 已展示项。投递策略全部收敛在这里，
+// index.jsx 只做接线。
+
+export function pathTail(p) {
+  const parts = String(p == null ? '' : p).split(/[\\/]+/).filter(Boolean)
+  return parts.length ? parts[parts.length - 1] : ''
+}
+
+export function moveNoticeText(n) {
+  const id = shortId(n && n.sessionId)
+  if (n && n.kind === 'moved') {
+    const where = pathTail(n.targetPath)
+    return `排队中的移动已完成：${id}${where ? ` → 「${where}」` : ''}`
+  }
+  const reason = String((n && n.reason) || '').split('\n')[0].slice(0, 120)
+  return `排队中的移动多次失败已放弃：${id}${reason ? `（${reason}）` : ''}，可在 设置 → 会话管理 → 待移动队列 重新发起移动`
+}
+
+/**
+ * 一次侧栏拉取里的通知投递计划。
+ * @param raw      sidebar-state 的 moveNotices 数组（可能缺失/畸形——一律宽容）
+ * @param seenIds  本浏览器已展示过的通知 id 集合（多 tab 即时去重）
+ * @param max      单次最多展示几条真实通知，超出并入省略句
+ * @returns {{ text: string|null, kind: 'ok'|'err', ackIds: string[] }}
+ *          ackIds 只含**已展示**项——未展示的留在服务端，下一拍继续（TTL 兜底）。
+ */
+export function noticeToastPlan(raw, seenIds, max = 2) {
+  const list = (Array.isArray(raw) ? raw : [])
+    .filter((n) => n && typeof n.id === 'string' && typeof n.sessionId === 'string' && (n.kind === 'moved' || n.kind === 'abandoned') && !seenIds.has(String(n.id)))
+    .sort((a, b) => (a.at || 0) - (b.at || 0))
+  if (!list.length) return { text: null, kind: 'ok', ackIds: [] }
+  const shown = list.slice(Math.max(0, list.length - Math.max(1, max)))
+  const parts = shown.map(moveNoticeText)
+  if (list.length > shown.length) parts.push(`另有 ${list.length - shown.length} 条排队移动的结果，见 设置 → 会话管理 → 待移动队列`)
+  return {
+    text: parts.join('；'),
+    kind: shown.some((n) => n.kind === 'abandoned') ? 'err' : 'ok',
+    ackIds: shown.map((n) => String(n.id)),
+  }
+}
+
+// issue #18 第 1 条：把「父会话不在当前列表」的子代理从顶层行里摘出来。
+//
+// foldSubagents 只收「父在列表里」的子代理；其余子代理原先留在顶层平铺成
+// 一行行「(无标题)」，一个多代理工作日能攒出上百行。这里把它们分成一组，
+// 调用方渲染成一张可展开的卡片——不污染列表，也不丢会话。
+// 输入应为 foldBranches 之后的 topList（分支聚拢不会碰子代理）。
+export function foldOrphanSubagents(items, lineage) {
+  const list = Array.isArray(items) ? items : []
+  const table = lineage && typeof lineage === 'object' ? lineage : {}
+  const rows = []
+  const orphans = []
+  for (const it of list) {
+    const id = it && it.sessionId != null ? String(it.sessionId) : ''
+    const info = id ? table[id] : null
+    if (info && info.origin === 'subagent') orphans.push(it)
+    else rows.push(it)
+  }
+  return { rows, orphans }
+}
+
+// —— T3（3.7.0）：分支聚拢 ——
+// 把「同一父会话派生出的普通分支会话」归组，收拢到组锚（真实父行或合成头）
+// 之下。子代理已由 foldSubagents 先行摘除，本函数只处理非子代理的分支血缘。
+// 判定全部收敛为纯函数，供列表管线在 foldSubagents 之后调用；UI 接线不在此处。
+
+// 组内时间键：createdAt（>0）优先；缺失/非正回退 updatedAt——它是 host 后加的
+// 字段，老快照或尚未同步的行可能根本没有，必须宽容；两者都不可用按 0，交给
+// sessionId 决胜。
+export function branchTimeKey(item) {
+  const c = Number(item && item.createdAt)
+  if (Number.isFinite(c) && c > 0) return c
+  const u = Number(item && item.updatedAt)
+  if (Number.isFinite(u) && u > 0) return u
+  return 0
+}
+
+// 组内升序比较：时间差优先，决胜恒为 sessionId 字典序——即使宿主哪天给所有行
+// 都补上 createdAt，排序仍全序稳定、可复现。同毫秒/同零值也靠决胜定序。
+export function ascBranchTime(a, b) {
+  const ta = String((a && a.sessionId) ?? '')
+  const tb = String((b && b.sessionId) ?? '')
+  return branchTimeKey(a) - branchTimeKey(b) || ta.localeCompare(tb)
+}
+
+// 分支血缘边：lineage[id] 存在、origin 非 subagent、parentSession 非空且不
+// 自指，才返回父 id；否则 null（该行不是分支，不参与聚拢）。
+// 子代理即便漏进输入（上游本该是 foldSubagents 之后的 topList）也被 origin
+// 挡下——链上链下两层都锁，绝不入组。
+function branchParentOf(id, table) {
+  const info = table[id]
+  if (!info || typeof info !== 'object') return null
+  if (info.origin === 'subagent') return null
+  const p = info.parentSession ? String(info.parentSession) : null
+  if (!p || p === id) return null
+  return p
+}
+
+/**
+ * 分支聚拢：把普通分支会话（lineage 有 parentSession、非子代理、不自指）移入
+ * 组锚的分支组。
+ *
+ * 输入契约：items 应为 foldSubagents 之后的 topList（子代理已摘除）；lineage
+ * 形状 {id:{origin,parentSession,delegationDepth,empty}}。任何畸形输入（items
+ * 或 lineage 为 null、数组含洞/非对象行、lineage 非对象）都不得抛错——认不出
+ * 血缘的行一律原样留在顶层。
+ *
+ * 组锚解析（memo 化）：沿 parentSession 上溯，锚 = 链上第一个「在 items 中且
+ * 自身非分支」的行；父在 items 但也是分支 → 继续上溯（整条链拍平进同一组）；
+ * 父不在 items → 合成锚 = 链尾那个缺失父 id。visited Set + 步数上限防环；成
+ * 环的整条链不聚拢（行不丢，原地保 chip）；自指不算分支。
+ *
+ * 真实锚父行在 topList 中的位置纹丝不动；成员行从 topList 移出进 branchGroupsOf。
+ * 仅当锚是合成的（缺失父）才产出头行 {syntheticRoot:rootId, sessionId:'dsm-src:'+rootId}，
+ * 插入位置 = 组内最早成员（ascBranchTime 排序后的第一个）在原列表中的下标；
+ * 成员 ≥1 就出合成头（单孤儿与多孤儿统一规则）。组内恒按 ascBranchTime 升序
+ * （与调用方主排序方向无关）。
+ *
+ * 守恒不变量：topList 中非合成行数 + foldedCount === items.length（行不丢）。
+ *
+ * @param items 任意（应为 foldSubagents 之后的 topList 数组；畸形宽容）
+ * @param lineage 任意（血缘表 {id:{origin,parentSession,...}}；畸形宽容）
+ * @returns {{ topList: any[], branchGroupsOf: Map<string, any[]>, foldedCount: number, groupCount: number }}
+ *   topList 真实锚原位保留（或插入合成头行），branchGroupsOf 为 rootId → 升序
+ *   成员数组，foldedCount 为移出顶层的成员行数，groupCount 为组数。
+ */
+export function foldBranches(items, lineage) {
+  const list = Array.isArray(items) ? items : []
+  const table = lineage && typeof lineage === 'object' ? lineage : {}
+
+  const byId = new Map()
+  for (const it of list) {
+    if (it == null || it.sessionId == null) continue
+    byId.set(String(it.sessionId), it)
+  }
+
+  // 1) 组锚解析：向上走 parent 链。防环 = 访问集 + 步数上限（链上每个 id 至多
+  //    出现一次，上限只是兜底）；结果按起点 id memo。
+  const maxWalk = Object.keys(table).length + list.length + 2
+  const anchorMemo = new Map()
+  function resolveAnchor(id) {
+    if (anchorMemo.has(id)) return anchorMemo.get(id)
+    const seen = new Set([id])
+    let cur = id
+    let steps = 0
+    let anchor = null // null = 环 / 起点不是分支，整链不聚
+    while (true) {
+      const p = branchParentOf(cur, table)
+      if (!p) {
+        // cur 不是分支：起点若不是分支则不聚；否则停在祖先上，cur 即锚
+        // （循环不变量：除首轮外 cur 恒为分支，此分支只在起点命中）。
+        anchor = steps === 0 ? null : cur
+        break
+      }
+      if (seen.has(p)) break // 成环：anchor 保持 null
+      seen.add(p)
+      steps++
+      if (byId.has(p)) {
+        if (!branchParentOf(p, table)) {
+          anchor = p // p 在列表且自身非分支 → 真实锚
+          break
+        }
+        cur = p // p 在列表但也是分支 → 继续上溯（链拍平）
+        if (steps > maxWalk) break // 环：保持 null
+        continue
+      }
+      // p 不在列表：还是分支 → 继续上溯找更高祖先；否则合成锚 = p
+      if (!branchParentOf(p, table)) {
+        anchor = p
+        break
+      }
+      cur = p
+      if (steps > maxWalk) break // 环：保持 null
+    }
+    anchorMemo.set(id, anchor)
+    return anchor
+  }
+
+  // 2) 收集分组。anchorOfRow 按行对象记录锚（重复 id 的畸形行也各算各的），
+  //    foldedCount 按行计数——保证守恒律在含洞/重复 id 的输入下仍成立。
+  const groupsOf = new Map()
+  const anchorOfRow = new Map()
+  let foldedCount = 0
+  for (const it of list) {
+    if (it == null || it.sessionId == null) continue
+    const id = String(it.sessionId)
+    if (!branchParentOf(id, table)) continue // 非分支 / 子代理 / 自指 → 不动
+    const anchor = resolveAnchor(id)
+    if (!anchor || anchor === id) continue // 环 / 自锚异常 → 保持顶层可见
+    if (!groupsOf.has(anchor)) groupsOf.set(anchor, [])
+    groupsOf.get(anchor).push(it)
+    anchorOfRow.set(it, anchor)
+    foldedCount++
+  }
+
+  // 3) 组内升序（与主排序方向无关）；合成锚的组记下最早成员（升序第一个），
+  //    合成头将在它原来的位置插一次。
+  const earliest = new Set()
+  for (const [anchor, members] of groupsOf) {
+    members.sort(ascBranchTime)
+    if (!byId.has(anchor)) earliest.add(members[0])
+  }
+
+  // 4) topList 重建：非成员行（含畸形行）原样保序；成员行移出，合成组在最早
+  //    成员的原位置放一次合成头行。
+  const topList = []
+  const emitted = new Set()
+  for (const it of list) {
+    const anchor = it == null ? undefined : anchorOfRow.get(it)
+    if (anchor === undefined) {
+      topList.push(it)
+      continue
+    }
+    if (!byId.has(anchor) && !emitted.has(anchor) && earliest.has(it)) {
+      emitted.add(anchor)
+      topList.push({ syntheticRoot: anchor, sessionId: 'dsm-src:' + anchor })
+    }
+  }
+
+  // 空组防御（正常路径每组成员 ≥1，不产出空组）。
+  for (const [anchor, members] of groupsOf) {
+    if (!members.length) groupsOf.delete(anchor)
+  }
+  return { topList, branchGroupsOf: groupsOf, foldedCount, groupCount: groupsOf.size }
+}
+
+// —— T4（3.7.0）：标签筛选 + 已存筛选 ——
+// 标签与已存筛选是纯用户元数据：host 已把每会话的 tagId 列表挂到 /sessions 的
+// item.tags 上，筛选谓词只认这个字段。UI 接线全部在 index.jsx；这里收敛可测的
+// 判定与文案。
+
+/**
+ * 标签筛选（v1 单选）：tagId 为空串 / null / undefined 时原样返回输入列表
+ * （同一数组，不做拷贝）；否则返回 tags 数组含该 id 的子集。
+ * 为什么只做单选：多标签 AND 需要「已选标签集」这份额外界面状态，收益不抵
+ * 复杂度和与已存筛选快照格式的纠缠；v1 明确不追多选 AND，管理页的「合并」
+ * 已能覆盖主要的归并诉求。
+ * 宽容性：list 非数组按空表；条目缺 tags / tags 非数组 / id 是数字都不得抛错，
+ * 统一按「不匹配」处理（id 比较走字符串化，防 host 与本地 id 类型漂移）。
+ * @param list any（应为 /sessions 返回的条目数组，条目带 tags:[tagId]）
+ * @param tagId string|null|undefined ''/null 表示不按标签筛选
+ * @returns any[]
+ */
+export function applyTagFilter(list, tagId) {
+  const items = Array.isArray(list) ? list : []
+  if (!tagId) return items
+  const want = String(tagId)
+  return items.filter((item) => {
+    const tags = item && item.tags
+    return Array.isArray(tags) && tags.some((t) => String(t) === want)
+  })
+}
+
+// 删除标签的确认文案。红线：必须明说「只删标签，不会删除会话」——本插件一切
+// 标签操作都是纯元数据，但用户在「删除」字样上默认会联想到丢会话，含糊一次
+// 就再也骗不回来（见 star/标签路由注释的同一纪律）。单测锁关键词（copy-guard
+// 的替身：文案生成收敛为纯函数，防回归锁在 client-logic 测试里）。
+export function tagDeleteConfirm(name) {
+  return `删除标签「${String(name == null ? '' : name) || '(未命名)'}」？只删标签，不会删除会话；打过这个标签的会话只是失去它。`
+}
+
+// issue #29：工作区筛选除了「全部」和真实路径，还要能表达两类「没有可用工作区」
+// 的会话。工作区路径一定是绝对路径，所以这两个哨兵不会和真实工作区撞车；它们
+// 是非空字符串，因此能原样进「保存筛选」的 workspace 字段（口径见下方注释）。
+//   · 未分组     = 完全没有工作区路径 → 面板 chip 显示「未分组」
+//   · 工作区已删 = 有路径、但该路径已不在工作区注册表里 → chip 显示「工作区已删 · X」
+// DSH 侧栏把这两类都归进「未分组」组；但面板自己的 chip 是分开的，筛选也拆成
+// 两项——否则选「未分组」却列出一整屏「工作区已删 · X」的卡片，自相矛盾。
+export const WS_UNGROUPED = '__ungrouped__'
+export const WS_GONE = '__workspace_gone__'
+
+/**
+ * 工作区筛选谓词：把「全部 / 未分组 / 工作区已删 / 具体路径」四种口径收敛到
+ * 一处，client 侧只管调用（口径可单测，别在渲染管线里散落条件）。
+ *
+ * `hasWorkspace` / `workspaceGone` 由 host 侧 buildItem 给出（src/index.js:
+ * `workspaceGone: !!(cwd && !ws)`、`hasWorkspace: !!cwd`）；字段缺失时按
+ * workspacePath 兜底，保证旧数据/手造数据也能筛。
+ *
+ * @param {object|null|undefined} item /archived-sessions/sessions 的一行
+ * @param {string} [workspaceFilter='all']
+ * @returns {boolean}
+ */
+export function matchWorkspaceFilter(item, workspaceFilter = 'all') {
+  const sel = typeof workspaceFilter === 'string' && workspaceFilter ? workspaceFilter : 'all'
+  if (sel === 'all') return true
+  const it = item && typeof item === 'object' ? item : {}
+  const path = typeof it.workspacePath === 'string' ? it.workspacePath : ''
+  const hasPath = typeof it.hasWorkspace === 'boolean' ? it.hasWorkspace : !!path
+  if (sel === WS_UNGROUPED) return !hasPath
+  if (sel === WS_GONE) return hasPath && !!it.workspaceGone
+  return path === sel
+}
+
+// 已存筛选快照的字段域：视图与排序必须落在已知枚举里，否则应用一个不存在的
+// 视图会把面板带进没有 tab 的状态。workspace 只验「非空字符串」——工作区可能
+// 已删，删了也允许恢复（筛选结果为 0 行，用户可理解）；#29 的两个哨兵同样
+// 是非空字符串，因此保存/还原天然支持，无需额外枚举；tag 允许 ''（=全部）。
+const SAVED_VIEWS = ['all', 'active', 'archived', 'starred', 'empty', 'trash']
+const SAVED_SORTS = ['newest', 'oldest', 'title']
+
+/**
+ * 把面板当前筛选态抓成可持久化的快照（/filters/save 的 filters 载荷）。
+ * 载荷字段名固定 {view, workspace, sort, tag}；host 侧对本体不透明（opaque
+ * payload），跨版本兼容全靠这里 + filterShapeFromSaved 两端夹逼。
+ * 入参任何字段非法都先回落默认再落盘，保存的永远是干净快照。
+ */
+export function filterSnapshotOf({ filter = 'all', workspaceFilter = 'all', sortBy = 'newest', tagFilter = '' } = {}) {
+  return {
+    view: SAVED_VIEWS.includes(filter) ? filter : 'all',
+    workspace: typeof workspaceFilter === 'string' && workspaceFilter ? workspaceFilter : 'all',
+    sort: SAVED_SORTS.includes(sortBy) ? sortBy : 'newest',
+    tag: typeof tagFilter === 'string' ? tagFilter : '',
+  }
+}
+
+/**
+ * 把一条已存筛选（/filters/list 的 item）还原成面板筛选形状；任何非法字段
+ * 回落默认，并在 degraded 数组里标注该字段名——UI 据此提示「部分条件已失效，
+ * 已按默认处理」，绝不静默吞掉。脏数据宽容：item/filters 缺失、为数组、字段
+ * 类型不对，统统不抛错。
+ * @returns {{view:string, workspace:string, sort:string, tag:string, degraded:string[]}}
+ */
+export function filterShapeFromSaved(item) {
+  const f = item && item.filters && typeof item.filters === 'object' && !Array.isArray(item.filters) ? item.filters : {}
+  const degraded = []
+  let view = typeof f.view === 'string' && SAVED_VIEWS.includes(f.view) ? f.view : 'all'
+  if (view === 'all' && f.view !== 'all') degraded.push('view')
+  let workspace = typeof f.workspace === 'string' && f.workspace ? f.workspace : 'all'
+  if (workspace === 'all' && f.workspace !== 'all') degraded.push('workspace')
+  let sort = typeof f.sort === 'string' && SAVED_SORTS.includes(f.sort) ? f.sort : 'newest'
+  if (sort === 'newest' && f.sort !== 'newest') degraded.push('sort')
+  let tag = typeof f.tag === 'string' ? f.tag : ''
+  if (tag === '' && f.tag !== '') degraded.push('tag')
+  return { view, workspace, sort, tag, degraded }
+}
+
+// issue #16：侧栏「展开其余 N 个会话」的 N 由上游按**数据层**计算
+// （0.2.0-rc.2 `collapsedSessionRows` → 0.2.1-rc.2 `watermarkRows`），
+// 看不到插件用 display:none 隐藏的回收站/空白行，于是数字虚高；点展开只是
+// 把更多已隐藏行塞进 DOM，可见行数不变——按钮在动、画面不动，容易被误读成
+// 「会话丢了」。
+//
+// 注意**不能**用「N − 本组被插件隐藏的条数」：上游的 N 数是「水位线之外
+// 还没渲染的行」，隐藏数数的是「整组被藏起来的行」，两个口径不重叠——被藏的
+// 行可能就在已渲染窗口内，减它属重复扣减，点开一次就翻负，进而把仍有可见行
+// 的按钮藏掉（上游只有这一个展开入口 → 会话不可达）。
+//
+// 正确口径由 `remainingRows` 给出：还能出现几行 = 本组可见总数 − 已渲染的
+// 可见行数；`overflowPlan` 只负责把它写进文案、并决定是否藏按钮。
+export function remainingRows(visibleTotal, renderedVisible) {
+  // Number(null) === 0：null / undefined 必须当作「不知道」，不能当成 0。
+  if (visibleTotal == null || visibleTotal === '') return null
+  const total = Number(visibleTotal)
+  if (!Number.isFinite(total)) return null
+  const shown = Number(renderedVisible)
+  const shownCount = Number.isFinite(shown) ? Math.max(0, Math.floor(shown)) : 0
+  return Math.max(0, Math.max(0, Math.floor(total)) - shownCount)
+}
+
+// 折叠分组的「还能出现几行」（issue #16 的第二个分支）。
+//
+// 上游 `group.sessions` 只在展开时才有内容（`expanded ? [...].map(...) : []`），
+// 而展开按钮恰恰只在折叠时出现 —— 也就是说「拿不到成员 id」与「需要校准计数」
+// 同时发生。折叠态改用两条与展开无关的信息：
+//   groupCount  上游 `group.sessionCount`，组内会话总数（已过 sessionVisible）
+//   trashInGroup 本工作区的回收站条数（host 按 cwd 统计后下发）
+// 展开后实际会出现的行数 = groupCount − trashInGroup；折叠时 DOM 里没有会话行，
+// 已渲染可见数按 0 计。
+//
+// 任一输入拿不到（老 host 没有该字段 / group 没有 cwd）就返回 null —— 调用方
+// 据此保持上游原文案，绝不猜一个可能错位的数字。
+export function collapsedVisibleTotal(groupCount, trashInGroup) {
+  if (groupCount == null || trashInGroup == null) return null
+  const total = Number(groupCount)
+  const trash = Number(trashInGroup)
+  if (!Number.isFinite(total) || !Number.isFinite(trash)) return null
+  return Math.max(0, Math.floor(total) - Math.max(0, Math.floor(trash)))
+}
+
+// 本组已渲染的可见会话行数。`rows` 是直接子节点里会话行的描述
+// （{ id, pluginHidden }），`visibleIds` 是「上游会列出且插件不会藏」的 id 集合。
+// 插件隐藏的行（回收站 / 墓碑 / 空白）与不在集合里的行（空白会话 / 上游过滤
+// 口径差异）都不计入 —— 与 `remainingRows` 的「可见总数」保持同一口径。
+// 3.8.1 起空白行的例外只有「当前会话」：它不藏也不扣（见 paint 里的说明）。
+export function countRenderedVisible(rows, visibleIds) {
+  if (!Array.isArray(rows) || !visibleIds || typeof visibleIds.has !== 'function') return 0
+  let n = 0
+  for (const row of rows) {
+    if (!row || row.pluginHidden) continue
+    if (row.id && visibleIds.has(row.id)) n++
+  }
+  return n
+}
+
+// 空分组判定：`group.sessions` 里「还会出现在侧栏」的条数。
+// - 空白会话不计：上游 `watermarkRows` 里 `if (session.blank) return true`，
+//   空白行从不计入可展开数；插件这层同样藏掉空白行（当前会话除外，见 paint）。
+// - `hiddenIds` = 回收站 / 墓碑 / 被插件藏起来的空白行 id（与展开计数同一口径）。
+// - 返回 null 表示**不知道**（拿不到数据层，或该组还没加载出会话）：调用方
+//   必须按「非空」处理——宁可留一个空标题，也不能把仍有会话的组藏掉。
+export function aliveSessionCount(sessions, hiddenIds) {
+  if (!Array.isArray(sessions) || !sessions.length) return null
+  let alive = 0
+  let seen = 0
+  for (const node of sessions) {
+    if (!node || node.id == null) continue
+    const id = String(node.id)
+    if (!id) continue
+    seen++
+    if (node.blank) continue
+    if (hiddenIds && typeof hiddenIds.has === 'function' && hiddenIds.has(id)) continue
+    alive++
+  }
+  // 一条带 id 的都没有 = 结构不认识（不是「组空」），照未知处理。
+  return seen === 0 ? null : alive
+}
+
+// 空分组隐藏的最终裁决：`containsCurrent` 是上游分组节点上的既有字段
+// （`containsCurrent: g.key === currentGroup`，0.1.5 起各代都在），表示当前会话
+// 是否就住在这个分组里。
+// - 当前会话在本组 → 绝不藏。藏掉它等于同时藏掉用户此刻的位置与「+ 新建对话」
+//   入口；3.8.1 起连当前会话那一条 blank 行也不再被插件隐藏（与上游同口径），
+//   但 `aliveCount` 依旧按「非 blank」统计，所以这层否决必须保留。
+// - `aliveCount` 沿用 aliveSessionCount 的三态纪律：null=不知道 → 不藏。
+export function shouldHideEmptyGroup(aliveCount, containsCurrent) {
+  if (containsCurrent === true) return false
+  return aliveCount === 0
+}
+
+// 拖拽自动滚动：光标进入滚动容器上/下感应带时每帧该滚多少（负=向上，正=向下，0=不动）。
+// 纯数学，DOM 侧只负责取 rect 与 scrollTop，测试见 tests/client-logic.test.js。
+// - 感应带 = min(edge, max(minZone, height*0.25))：长列表用固定的 edge，矮容器按比例
+//   收窄，但不小于 minZone（否则列表只有几行时整块都是感应带，根本放不准）；
+// - 感应带再夹到 `height/2 - 1` 以内，保证任何容器都留得住中间的死区
+//   （否则 40px 高的列表悬停在正中也会滚）；
+// - 步长按「深入感应带的比例」线性加速，maxStep 封顶；光标在容器外直接取满速。
+export function dragAutoScrollStep({ y, top, bottom, edge = 64, maxStep = 20, minZone = 24 } = {}) {
+  const nums = [y, top, bottom, edge, maxStep, minZone].map(Number)
+  if (!nums.every((n) => Number.isFinite(n))) return 0
+  const height = bottom - top
+  if (!(height > 0) || !(maxStep > 0)) return 0
+  const zone = Math.min(edge, Math.max(minZone, height * 0.25), Math.max(0, height / 2 - 1))
+  if (!(zone > 0)) return 0
+  if (y < top + zone) return -Math.ceil(maxStep * Math.min(1, (top + zone - y) / zone))
+  if (y > bottom - zone) return Math.ceil(maxStep * Math.min(1, (y - (bottom - zone)) / zone))
+  return 0
+}
+
+// 把「还能出现几行」落到展开按钮上：
+// - `more` 未知（拿不到数据层）→ 一律不动作。DOM 兜底在数学上不成立
+//   （窗口内/外的隐藏数口径不同），宁可不改也不写一个看起来合理却会算错的数；
+// - 文案没有数字（展开态的「收起」、或上游改成纯图标）→ 不改也不藏。无法确认
+//   是不是计数文案时保持沉默；
+// - 只替换第一个数字（各语言文案都把计数放在数字位，如「展开其余 12 个会话」
+//   /「Show 12 more」），支持千分位写法；
+// - `more === 0` 才藏按钮：此时确实一行都不会再出现，留着只会让人反复点。
+export function overflowPlan(text, more) {
+  const raw = typeof text === 'string' ? text : ''
+  const unknown = more == null || !Number.isFinite(Number(more))
+  const remaining = unknown ? 0 : Math.max(0, Math.floor(Number(more)))
+  const m = raw.match(/(\d[\d,]*)/)
+  const base = m ? Number(m[1].replace(/,/g, '')) : null
+  if (base === null || unknown) {
+    return { text: raw, hide: false, base, more: unknown ? null : remaining, changed: false }
+  }
+  if (remaining === 0) {
+    // base<=0 是上游没给出可信计数（理论上不会出现）：不据此隐藏，避免误判。
+    return { text: raw, hide: base > 0, base, more: 0, changed: false }
+  }
+  if (remaining === base) {
+    return { text: raw, hide: false, base, more: remaining, changed: false }
+  }
+  return {
+    text: raw.slice(0, m.index) + String(remaining) + raw.slice(m.index + m[1].length),
+    hide: false,
+    base,
+    more: remaining,
+    changed: true,
+  }
+}
