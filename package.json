@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-workbench",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "description": "DeepSeek Harness 会话管理、全文搜索、Agent 项目管理与跨会话协作",
   "type": "module",
   "license": "MIT",
