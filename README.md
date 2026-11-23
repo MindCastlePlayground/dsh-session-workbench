@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/icon.png" width="112" height="112" alt="DSH 会话工作台图标">
+  <img src="assets/icon.png" width="112" height="112" alt="鲸鱼娘探出双对话框的 DSH 会话工作台图标">
 </p>
 
 <h1 align="center">DSH 会话工作台</h1>
@@ -22,14 +22,14 @@
 
 ## 安装
 
-下载 [`dsh-session-workbench-1.2.0.tgz`](https://github.com/MindCastlePlayground/dsh-session-workbench/releases/download/v1.2.0/dsh-session-workbench-1.2.0.tgz)，进入下载目录并执行与你使用方式对应的一条命令。
+下载 [`dsh-session-workbench-1.2.1.tgz`](https://github.com/MindCastlePlayground/dsh-session-workbench/releases/download/v1.2.1/dsh-session-workbench-1.2.1.tgz)，进入下载目录并执行与你使用方式对应的一条命令。
 
 ```sh
 # DSH Desktop
-dsh plugin --profile desktop add ./dsh-session-workbench-1.2.0.tgz
+dsh plugin --profile desktop add ./dsh-session-workbench-1.2.1.tgz
 
 # DSH Web
-dsh plugin --profile web add ./dsh-session-workbench-1.2.0.tgz
+dsh plugin --profile web add ./dsh-session-workbench-1.2.1.tgz
 ```
 
 安装后完全退出并重新启动对应的 DSH 宿主。如果同一 profile 已启用 `dsh-sessions-manager` 或 `dsh-chat-search`，先停用旧插件以避免路由、菜单或快捷键重复。工作台沿用原有的管理数据和搜索设置目录，无需复制会话文件。
@@ -47,7 +47,7 @@ $dshCli = Join-Path $dshApp 'resources/app.asar/dsh/node_modules/@deepseek-ai/ds
 $previousElectronMode = $env:ELECTRON_RUN_AS_NODE
 $env:ELECTRON_RUN_AS_NODE = '1'
 try {
-    & (Join-Path $dshApp 'DeepSeek Harness.exe') --expose-internals $dshCli plugin --profile desktop add ./dsh-session-workbench-1.2.0.tgz | Out-Host
+    & (Join-Path $dshApp 'DeepSeek Harness.exe') --expose-internals $dshCli plugin --profile desktop add ./dsh-session-workbench-1.2.1.tgz | Out-Host
 } finally {
     $env:ELECTRON_RUN_AS_NODE = $previousElectronMode
 }
