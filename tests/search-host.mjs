@@ -11,7 +11,7 @@ import { apply, inject } from '../src/search/host.js'
 
 /* History lives under the profile; point the plugin at a throwaway one for this run. */
 const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cs-recent-'))
-process.env.DSH_PROFILE_DIR = profileDir
+process.env.DSH_PROFILE_DIR = path.join(profileDir, 'wrong-profile')
 
 const failures = []
 const check = (label, condition, detail) => {
@@ -148,6 +148,7 @@ const ctx = {
     return typeof dispose === 'function' ? dispose : () => {}
   },
   get(name) {
+    if (name === 'profileContext') return { dir: profileDir }
     if (name === 'sessionQuery') {
       return {
         async listSessions() {

@@ -52,9 +52,10 @@ export const inject = ['webServer', 'sessionQuery']
  * @param ctx - Host plugin context carrying the webserver and the session query service.
  */
 export function apply(ctx, { deletedSessionIds } = {}) {
-  const index = createIndex(ctx, deletedSessionIds)
-  const recent = createRecentStore()
-  const filters = createFilterStore()
+  const directory = dataDir(ctx)
+  const index = createIndex(ctx, directory, deletedSessionIds)
+  const recent = createRecentStore(directory)
+  const filters = createFilterStore(directory)
   /** Identical search results, keyed by query/scope/filters/index version. */
   const responseCache = new Map()
   ctx.effect(
@@ -290,15 +291,11 @@ function messageOf(error) {
 // #region Recent queries ------------------------------------------------------
 
 /** The directory this plugin keeps its small state files in. */
-function dataDir() {
-  const profile = process.env.DSH_PROFILE_DIR
+function dataDir(ctx) {
+  const profile = ctx.get('profileContext')?.dir ?? process.env.DSH_PROFILE_DIR
   if (typeof profile === 'string' && profile !== '') return path.join(profile, 'plugin-data', 'conversation-search')
-  return path.join(os.homedir(), '.dsh', 'conversation-search')
-}
-
-/** The file this plugin's search history lives in. */
-function recentPath() {
-  return path.join(dataDir(), RECENT_FILE)
+  const home = process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
+  return path.join(home, 'conversation-search')
 }
 
 /**
@@ -307,7 +304,8 @@ function recentPath() {
  * The file is a cache of what the reader typed: an unreadable or read-only location degrades
  * to in-memory history instead of failing a search.
  */
-function createRecentStore() {
+function createRecentStore(directory) {
+  const filename = path.join(directory, RECENT_FILE)
   let loaded = null
   let loading = null
   let writing = Promise.resolve()
@@ -317,7 +315,7 @@ function createRecentStore() {
     if (loading !== null) return loading
     loading = (async () => {
       try {
-        const text = await fsPromises.readFile(recentPath(), 'utf8')
+        const text = await fsPromises.readFile(filename, 'utf8')
         const parsed = JSON.parse(text)
         loaded = Array.isArray(parsed)
           ? parsed.filter((item) => typeof item === 'string' && item.trim() !== '').slice(0, MAX_RECENT)
@@ -337,7 +335,7 @@ function createRecentStore() {
     await read()
     const next = [trimmed, ...loaded.filter((item) => item !== trimmed)].slice(0, MAX_RECENT)
     loaded = next
-    const target = recentPath()
+    const target = filename
     writing = writing.then(async () => {
       try {
         await fsPromises.mkdir(path.dirname(target), { recursive: true })
@@ -485,7 +483,7 @@ function inWindow(time, since, until) {
 }
 
 /** The saved filter window, written through so the next launch starts from it. */
-function createFilterStore() {
+function createFilterStore(directory) {
   let loaded = null
   let loading = null
   let writing = Promise.resolve()
@@ -496,7 +494,7 @@ function createFilterStore() {
     if (loading !== null) return loading
     loading = (async () => {
       try {
-        const text = await fsPromises.readFile(path.join(dataDir(), FILTER_FILE), 'utf8')
+        const text = await fsPromises.readFile(path.join(directory, FILTER_FILE), 'utf8')
         loaded = normalizeFilters(JSON.parse(text))
       } catch (error) {
         loaded = defaultFilters()
@@ -513,7 +511,7 @@ function createFilterStore() {
     loaded = next
     if (key === lastWritten) return next
     lastWritten = key
-    const target = path.join(dataDir(), FILTER_FILE)
+    const target = path.join(directory, FILTER_FILE)
     writing = writing.then(async () => {
       try {
         await fsPromises.mkdir(path.dirname(target), { recursive: true })
@@ -535,9 +533,9 @@ function createFilterStore() {
 
 // #region Corpus index --------------------------------------------------------
 
-function createIndex(ctx, deletedSessionIds) {
+function createIndex(ctx, directory, deletedSessionIds) {
   return createDiskIndex({
-    filename: path.join(dataDir(), 'sessions-v1.sqlite'),
+    filename: path.join(directory, 'sessions-v1.sqlite'),
     async catalog() {
       const persistence = ctx.get('sessionPersistence')
       const query = ctx.get('sessionQuery')
