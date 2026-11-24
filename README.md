@@ -14,6 +14,7 @@
 
 ## 功能
 
+- **项目状态** — 左侧栏的工作区折叠后仍会标记运行中、等待处理和完成未读。子 Agent 的运行状态计入所属项目。
 - **会话整理** — 在「设置 → 会话管理」和侧栏菜单中归档、恢复、迁移会话，管理星标、标签和回收站。
 - **全文搜索** — 在左侧栏搜索标题、用户消息、助手回复和文件名，点结果回到原文。全局搜索默认是 `Ctrl/Cmd+Alt+Q`，会话内搜索默认是 `Ctrl/Cmd+F`。
 - **项目管理** — Agent 可以创建和重命名项目，在指定项目或默认聊天工作区开会话，并投递初始任务。
@@ -108,6 +109,8 @@ npm pack
 遇到问题时，可在 [GitHub Issues](https://github.com/MindCastlePlayground/dsh-session-workbench/issues) 提交 DSH 版本、profile、复现步骤及去除敏感内容的错误信息。
 
 ## 许可与致谢
+
+项目状态标记改编自 [Stijnus/dsh-workspace-status 0.3.2](https://github.com/Stijnus/dsh-workspace-status/tree/c3ca1a0fc99a4b315c7911703f0ba970038ea312)，保留[上游 MIT 许可](src/workspace-status/LICENSE)。
 
 项目按 [MIT 许可](LICENSE) 发布。会话管理和搜索分别来自 [TOBYCAI/dsh-sessions-manager 3.8.1](https://github.com/TOBYCAI/dsh-sessions-manager/tree/cf9a5bbfe39a95bee7f3bb68c212d774533c356b) 和 [timefarer/dsh-chat-search 1.2.7](https://github.com/timefarer/dsh-chat-search/tree/37c65228f7c8d26f5e212a477d23ba63dd14788f)。
 
