@@ -286,6 +286,7 @@ const zh = {
   'opening.title': '正在打开会话…',
   'opening.tip': '历史较长时需要一点时间',
   'file.only': '文件',
+  'global.includeDeleted': '包含已删除会话',
   'global.refresh': '刷新索引',
   'global.widen': '在全部范围中搜索',
   'global.recent': '最近搜索',
