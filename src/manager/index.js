@@ -29,7 +29,7 @@ import { createPersistenceAdapter } from './compat/persistence.js'
 import { detectCapabilities, requireCapability } from './compat/capabilities.js'
 import { pathOwnsSession } from './path-guard.js'
 import { purgeSessionArtifacts, moveSessionToCwd } from './handle-era-ops.js'
-import { classifyLineage, emptyScanCandidate, isEmptyEventTypes, subagentDescendantsOf, EMPTY_DECODE_LIMIT } from './lineage.js'
+import { classifyLineage, groupBranchPoints, emptyScanCandidate, isEmptyEventTypes, subagentDescendantsOf, EMPTY_DECODE_LIMIT } from './lineage.js'
 import { cachedTitleOf, readCachedHints } from './projection-hints.js'
 
 // 构建指纹：build.mjs 以 define 在编译期注入；直接以源码运行（测试）时为 'dev'。
@@ -659,8 +659,7 @@ export function apply(ctx) {
   // 保存的筛选（schema v1，saved-filters.json）：filters 为不透明 JSON，host
   // 只限条数/名称/序列化体积，绝不解析其内容。
   const savedFilters = createSavedFilters()
-  // 待移动队列：会话被占用（DSH 打开中）时登记，等它释放后自动完成移动。
-  // 见 src/pending-moves.js 的模块注释（0.1.5 单写者锁没有公共释放 API）。
+  // Existing queued requests are retained for manual retry or cancellation.
   const pendingMoves = createPendingMoveStore()
   // T2：排队移动的后台终局（完成/放弃）落成持久通知，sidebar-state 带出、
   // client 弹出后 ack 清除。独立于队列文件（终局与队列项同生死，挂条目上观察不到）。
@@ -1175,7 +1174,11 @@ export function apply(ctx) {
     return { canonical, entity: await w.create(canonical, basename(canonical) || 'workspace') }
   }
 
-  async function moveOne(sid, targetPath, scope) {
+  function moveConflict(code, message) {
+    return Object.assign(new Error(message), { status: 409, code })
+  }
+
+  async function moveOne(sid, targetPath, scope, { stopRunning, callerId }) {
     requireCapability(capabilities, 'move')
     requireSessionId(sid)
     const registered = scope && w.get(scope.targetWorkspaceId)
@@ -1183,24 +1186,9 @@ export function apply(ctx) {
     if (registered?.path === scope?.expectedCwd && registered?.sessionIds.includes(sid)) {
       return { ok: true, already: true, workspaceId: registered.id, workspaceTitle: registered.title }
     }
-    // Only block the *active* conversation. ctx.sessions keeps instantiated
-    // sessions alive after you switch away, so the old check (sessions.get(sid))
-    // wrongly rejected every opened session — you could never move one you'd
-    // merely looked at. When the host exposes no active-session accessor we
-    // can't prove activeness, so we allow the move; the relocation below is
-    // crash-safe (backup + rollback) and re-syncs the live object.
-    const activeIds = getActiveSessionIds(ctx, activeTracker)
-    const activeId = activeIds.values().next().value != null ? activeIds.values().next().value : null
-    if (activeIds.has(String(sid)) || (activeId != null && String(activeId) === String(sid))) {
-      const error = new Error('会话正被 DSH 打开，暂时无法移动；请重启 DSH 后再试。')
-      error.status = 409
-      error.code = 'DSM_SESSION_BUSY'
-      throw error
-    }
     const r = await persistence.readSession(sid, 0)
     if (!r || !r.meta) throw new Error('无法读取该会话的日志')
     const meta = r.meta
-    const events = r.events
     const oldCwd = meta.cwd || null
 
     const { canonical, entity: target } = registered
@@ -1219,6 +1207,33 @@ export function apply(ctx) {
       }
     }
 
+    const agentRegistry = ctx.get('agents')
+    const agent = agentRegistry?.get?.(sid)
+    const withRelocation = agentRegistry?.withSessionRelocation
+    const relocate = async () => {
+      // Closing a live owner drains the final turn to storage.
+      const current = agent ? await persistence.readSession(sid, 0) : r
+      if (!current?.meta || current.meta.cwd !== meta.cwd) {
+        throw moveConflict('DSM_MOVE_IN_PROGRESS', '会话工作目录已变更，请重新选择。')
+      }
+      return commitMove(sid, current.meta, current.events, current.inheritedEventCount, canonical, target)
+    }
+    if (callerId === sid && agent) {
+      throw moveConflict('DSM_SESSION_SELF_MOVE', '请从另一会话或界面发起移动。')
+    }
+    if (agent && typeof withRelocation !== 'function') {
+      throw moveConflict('DSM_SESSION_BUSY', '当前宿主仍持有此会话。请关闭该会话后重试。')
+    }
+    if (typeof withRelocation === 'function') {
+      return withRelocation.call(agentRegistry, sid, { stopRunning }, relocate)
+    }
+    if (persistence.kind === 'legacy' && getActiveSessionIds(ctx, activeTracker).has(sid)) {
+      throw moveConflict('DSM_SESSION_BUSY', '请先关闭当前会话，再重新移动。')
+    }
+    return relocate()
+  }
+
+  async function commitMove(sid, meta, events, inheritedEventCount, canonical, target) {
     const newHeader = Object.assign({}, meta, { cwd: canonical })
 
   // 移动过程的非致命提示（如源目录仍有旧代日志未能清理），随成功结果一并
@@ -1319,18 +1334,16 @@ export function apply(ctx) {
     // instead of rewritten.
 
     if (persistence.kind === 'session-handle') {
-      // 读事件之后的双 revision 校验：两次采样之间 revision 仍在变，说明日志
-      // 还在被写入，中止而不是复制出分叉副本（读取期间的写入由 ops 内的
-      // rename-aside + 官方写所有权探测兜底）。
-      const stat1 = await persistence.statSession(sid)
-      if (stat1 && stat1.revision) {
-        const stat2 = await persistence.statSession(sid)
-        if (stat2 && stat2.revision !== stat1.revision) {
-          throw new Error('该会话在移动准备期间发生了变化，请稍后重试。')
-        }
-      }
+      const previousWorkspaces = w.list().filter(entity => entity.sessionIds.includes(sid))
+      let assigning = false
       try {
-        const movedHandle = await moveSessionToCwd({ sp, sid, header: meta, canonical, events, inheritedEventCount: r.inheritedEventCount })
+        const movedHandle = await moveSessionToCwd({
+          sp, sid, header: meta, canonical, events, inheritedEventCount,
+          async onRelocated(header) {
+            assigning = true
+            await assignWorkspace(sid, header, target)
+          },
+        })
         if (movedHandle && Array.isArray(movedHandle.reclaimedSiblings) && movedHandle.reclaimedSiblings.length > 0) {
           moveNotes.push(`已顺带回收 ${movedHandle.reclaimedSiblings.length} 处被取代的旧代日志副本（历史移动残留），避免同一会话在多目录重复。`)
         }
@@ -1338,6 +1351,16 @@ export function apply(ctx) {
           moveNotes.push(`源目录未能清理干净（残留 ${movedHandle.sourceCleanup.leftover.join('、')}），若后续移动报“duplicate”请手动清空该目录。`)
         }
       } catch (e) {
+        if (assigning) {
+          w.headers?.set(sid, meta)
+          w.sessionPaths?.set(sid, meta.cwd)
+          try {
+            if (!previousWorkspaces.includes(target)) await target.detachSession(sid)
+            for (const workspace of previousWorkspaces) await workspace.attachSession(sid)
+          } catch (rollbackError) {
+            ctx.logger?.warn?.('Could not restore workspace membership for ' + sid + ': ' + rollbackError)
+          }
+        }
         if (e && e.status) throw e
         throw new Error('移动会话日志失败：' + String((e && e.message) || e))
       }
@@ -1414,7 +1437,7 @@ export function apply(ctx) {
       }
     } catch (e) { /* best-effort */ }
 
-    await assignWorkspace(sid, newHeader, target)
+    if (persistence.kind !== 'session-handle') await assignWorkspace(sid, newHeader, target)
 
     return {
       ok: true,
@@ -1431,137 +1454,33 @@ export function apply(ctx) {
     w.sessionPaths?.set(sid, target.path)
     await target.attachSession(sid)
     if (!target.sessionIds.includes(sid)) {
-      throw new Error('移动后校验失败：会话未出现在目标工作区，请重试或重启 DSH。')
+      throw new Error('移动后校验失败：会话未出现在目标工作区。')
     }
     for (const entity of w.list()) {
       if (entity.id !== target.id) await entity.detachSession(sid)
     }
   }
 
-  // ---- 待移动队列（活跃 / 被占用的会话）-----------------------------------
-  // 0.1.5 的单写者锁由持有写句柄的进程掌控，插件既拿不到句柄也没有释放它的公共
-  // API；在占用期硬搬目录会让在写者继续写旧 inode 并在旧路径重建空壳。因此占用时
-  // 只登记排队，等宿主释放（session/disposed）或下次插件
-  // 启动时（会话尚未被打开）自动完成。
-  const QUEUE_NOTE = '已排队：该会话正被 DSH 打开（写所有权只在 DSH 退出时释放）。重启 DSH 时会自动完成，请先别打开它。'
-
-  function isBusyError(e) {
-    if (!e) return false
-    if (e.code === 'DSM_SESSION_BUSY') return true
-    const text = String((e && e.message) || e)
-    return /正被 DSH 打开|already owned/i.test(text)
-  }
-
-  // 移动入口：占用 → 排队；其它错误照旧抛出。返回成功结果或排队结果。
-  const moveOperations = new Map()
-  async function serializeMove(sid, task) {
-    const operation = (moveOperations.get(sid) ?? Promise.resolve()).then(task)
-    const tail = operation.catch(() => {})
-    moveOperations.set(sid, tail)
-    try {
-      return await operation
-    } finally {
-      if (moveOperations.get(sid) === tail) moveOperations.delete(sid)
+  const moveOperations = new Set()
+  async function moveNow(sid, targetPath, { scope, stopRunning = false, callerId } = {}) {
+    requireSessionId(sid)
+    if (moveOperations.has(sid)) {
+      throw moveConflict('DSM_MOVE_IN_PROGRESS', '该会话已有一项移动正在进行。')
     }
-  }
-
-  function moveOrQueue(sid, targetPath, scope) {
-    return serializeMove(sid, async () => {
+    moveOperations.add(sid)
+    try {
+      const result = await moveOne(sid, targetPath, scope, { stopRunning, callerId })
+      metaCache.invalidate(sid)
       try {
-        const result = await moveOne(sid, targetPath, scope)
         if (await pendingMoves.has(sid)) await pendingMoves.remove([sid])
-        return result
-      } catch (e) {
-        if (!isBusyError(e)) throw e
-        await pendingMoves.queue(sid, targetPath, scope)
-        return { ok: true, moved: false, queued: true, notes: [QUEUE_NOTE] }
+      } catch (error) {
+        ctx.logger?.warn?.('Could not remove historical move for ' + sid + ': ' + error)
       }
-    })
-  }
-
-  // 启动后的「学步期」：这段时间内 moveOne 的非占用类失败只当环境未就绪，不计入
-  // 「多次失败即放弃」的计数（否则 boot 竞态会把用户的排队项白白丢掉）。
-  const BOOT_WARMUP_MS = 30000
-  const bootedAt = Date.now()
-
-  let queueRunning = false
-  async function runPendingMoves(reason) {
-    if (queueRunning) return { ran: false, moved: 0, kept: 0 }
-    queueRunning = true
-    let moved = 0
-    const notes = []
-    try {
-      const items = await pendingMoves.list()
-      for (const { sessionId } of items) {
-        await serializeMove(sessionId, async () => {
-          const item = await pendingMoves.get(sessionId)
-          if (!item) return
-          try {
-            await moveOne(item.sessionId, item.targetPath, item.scope)
-            await pendingMoves.remove([item.sessionId])
-            metaCache.invalidate(item.sessionId)
-            moved++
-            notes.push(`排队中的移动已完成：${String(item.sessionId).slice(0, 18)}…`)
-            // T2：通知落盘失败不吞掉移动结果本身（队列项已删，回滚代价不值——
-            // 保留 console.warn 作最后兜底，这是刻意接受的静默缺口）。
-            try { await moveNotices.append({ kind: 'moved', sessionId: item.sessionId, targetPath: item.targetPath, at: Date.now() }) } catch (e) { /* best-effort */ }
-          } catch (e) {
-            if (isBusyError(e)) return // 仍被占用：留在队列里，等下一次触发
-            if (Date.now() - bootedAt < BOOT_WARMUP_MS) return // boot 期未就绪：不记失败
-            const bumped = await pendingMoves.bumpAttempts(item.sessionId)
-            if (bumped && bumped.dropped) {
-              notes.push(`排队中的移动多次失败已放弃：${String(item.sessionId).slice(0, 18)}…（${String((e && e.message) || e)}）`)
-              try { await moveNotices.append({ kind: 'abandoned', sessionId: item.sessionId, targetPath: item.targetPath, at: Date.now(), attempts: bumped.attempts, reason: String((e && e.message) || e).split('\n')[0] }) } catch (err) { /* best-effort */ }
-            }
-          }
-        })
-      }
-      if (moved > 0) { try { await reindexRegistry() } catch (e) { /* best-effort */ } }
+      return result
     } finally {
-      queueRunning = false
+      moveOperations.delete(sid)
     }
-    if (notes.length > 0) {
-      try { for (const n of notes) console.warn('[dsh-sessions-manager] ' + n) } catch (e) { /* ignore */ }
-    }
-    void reason
-    return { ran: true, moved, kept: (await pendingMoves.list()).length }
   }
-
-  // 排队项的补跑时机。**关键前提**：0.1.5 的单写者所有权一经 open 就持有到**进程退出**
-  // 为止——官方没有任何「关闭会话 / 释放所有权」的公开入口（`dsh-commands` 只有
-  // compact/feedback/goal；宿主无 unloadSession/closeSession/evict），而浏览器一连上就会
-  // 自动打开/新建会话，一旦被打开就再也搬不动。所以唯一可靠窗口是**宿主刚起来、浏览器
-  // 还没连上**的那一两秒 ⇒ 启动后立刻试，并在前 30s 内密集重试；之后每 120s 兜底；
-  // 会话真被释放（session/disposed）时 500ms 后再试一次。
-  const queueEffect = typeof ctx.effect === 'function' ? ctx.effect.bind(ctx) : ((fn) => { fn() })
-  if (typeof ctx.on === 'function') {
-    queueEffect(() => ctx.on('session/disposed', (session) => {
-      const id = session && session.id != null ? String(session.id) : null
-      if (!id) return
-      pendingMoves.has(id).then((queued) => {
-        if (!queued) return
-        const t = setTimeout(() => { runPendingMoves('session-disposed').catch(() => {}) }, 500)
-        if (t && typeof t.unref === 'function') t.unref()
-      }).catch(() => {})
-    }))
-  }
-  queueEffect(() => {
-    // 每个启动补跑定时器都要 unref：宿主自己不会闲下来无所谓，但测试里未 unref 的
-    // 30s 定时器会让 node:test 多等 30s 才退出（整套测试被无谓拖长，实测见报告）。
-    const timers = [0, 1000, 3000, 6000, 12000, 30000].map((ms) => {
-      const t = setTimeout(() => {
-        runPendingMoves(ms === 0 ? 'startup' : `startup+${ms}`).catch(() => {})
-      }, ms)
-      if (t && typeof t.unref === 'function') t.unref()
-      return t
-    })
-    // 轻量周期重试：只在队列非空时干活（队列空 = 一次本地 JSON 读取）。
-    const tickTimer = setInterval(() => {
-      pendingMoves.list().then((items) => { if (items.length > 0) return runPendingMoves('tick') }).catch(() => {})
-    }, 120000)
-    if (tickTimer && typeof tickTimer.unref === 'function') tickTimer.unref()
-    return () => { for (const t of timers) clearTimeout(t); clearInterval(tickTimer) }
-  })
 
   // Force the host's WorkspaceRegistry to rebuild its in-memory sessionPath
   // index from the durable persistence headers. DSH's WorkspaceEntity.sessionIds
@@ -2228,6 +2147,56 @@ export function apply(ctx) {
     }
   }
 
+  async function sessionBranchPoints(sid) {
+    const live = ctx.get('sessions')
+    const query = ctx.get('sessionQuery')
+    const trash = await readTrashStore()
+    const hidden = new Set([...(trash.purgedSessionIds ?? []), ...(trash.items ?? []).map(item => item.sessionId)])
+    const children = new Map()
+    const collect = (header, session) => {
+      if (header?.parentSession === sid && header.origin !== 'subagent' && !hidden.has(header.id)) {
+        children.set(header.id, { header, session })
+      }
+    }
+    for (const entry of await persistence.listEntries()) collect(entry.header)
+    for (const session of live?.list?.() ?? []) collect(session.header, session)
+    if (!children.size) return { points: [], unanchored: [] }
+
+    const workspaces = new Map(w.list().map(entity => [entity.path, entity.id]))
+    const read = (id) => query?.readSession ? query.readSession(id) : persistence.readSession(id, 0)
+    const branches = []
+    const rows = [...children.values()]
+    for (let offset = 0; offset < rows.length; offset += 8) {
+      const batch = await Promise.all(rows.slice(offset, offset + 8).map(async ({ header, session }) => {
+        const cwd = header.cwd ?? null
+        const meta = metaCache.peek?.(header.id)
+        const title = authorityTitleCache.get(header.id) ?? meta?.title ?? header.title ?? ''
+        const child = { id: header.id, title, cwd, workspaceId: workspaces.get(cwd) ?? null }
+        try {
+          const count = session?.inheritedEventCount
+          if (Number.isSafeInteger(count) && title) return { child, inheritedEventCount: count }
+          const log = await read(header.id)
+          if (!title) {
+            const titleEvent = log.events.findLast(event => event.type === 'session/title')
+            child.title = titleEvent?.data?.title ?? ''
+          }
+          return { child, inheritedEventCount: count ?? log.inheritedEventCount }
+        } catch {
+          return { child }
+        }
+      }))
+      branches.push(...batch)
+    }
+    const source = await read(sid)
+    return groupBranchPoints(source.events, branches)
+  }
+
+  const routeHandlers = new Map()
+  function registerRoute(route) {
+    routeHandlers.set(route.path, route.handler)
+    return ctx.webServer.register(route)
+  }
+
   ctx.effect(() => {
     const disposers = []
 
@@ -2250,7 +2219,7 @@ export function apply(ctx) {
       return typeof v === 'number' && Number.isFinite(v) && v >= 0 && v < 1e6 ? Math.round(v) : null
     }
     const uiProbeText = (probe, key) => (typeof probe[key] === 'string' ? probe[key].slice(0, 40) : null)
-    disposers.push(ctx.webServer.register({
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/capabilities',
       handler: async (req, res) => {
@@ -2284,7 +2253,7 @@ export function apply(ctx) {
     // 会话（见 src/active-session.js），只能由客户端上报；host 只在心跳新鲜期内
     // 采信，用它拦住「移动正在看的会话」和「自动归档正在看的会话」。
     // body: { clientId, sessionId|null }。sessionId 为空 = 该客户端当前无活跃会话。
-    disposers.push(ctx.webServer.register({
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/active-session',
       handler: async (req, res) => {
@@ -2299,7 +2268,7 @@ export function apply(ctx) {
       },
     }))
 
-    disposers.push(ctx.webServer.register({
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/list',
       handler: async (req, res) => {
@@ -2340,7 +2309,7 @@ export function apply(ctx) {
       },
     }))
 
-    disposers.push(ctx.webServer.register({
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/restore',
       handler: async (req, res) => {
@@ -2355,7 +2324,7 @@ export function apply(ctx) {
       },
     }))
 
-    disposers.push(ctx.webServer.register({
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/restore-many',
       handler: async (req, res) => {
@@ -2375,7 +2344,7 @@ export function apply(ctx) {
       },
     }))
 
-    disposers.push(ctx.webServer.register({
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/delete',
       handler: async (req, res) => {
@@ -2396,7 +2365,7 @@ export function apply(ctx) {
       },
     }))
 
-    disposers.push(ctx.webServer.register({
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/delete-many',
       handler: async (req, res) => {
@@ -2430,7 +2399,7 @@ export function apply(ctx) {
     }))
 
     // ---- Recycle bin (回收站) routes ----------------------------------------
-    disposers.push(ctx.webServer.register({
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/trash/list',
       handler: async (req, res) => {
@@ -2446,7 +2415,7 @@ export function apply(ctx) {
       },
     }))
 
-    disposers.push(ctx.webServer.register({
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/trash/settings',
       handler: async (req, res) => {
@@ -2462,7 +2431,7 @@ export function apply(ctx) {
       },
     }))
 
-    disposers.push(ctx.webServer.register({
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/trash/verify',
       handler: async (req, res) => {
@@ -2488,7 +2457,7 @@ export function apply(ctx) {
       },
     }))
 
-    disposers.push(ctx.webServer.register({
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/trash/restore',
       handler: async (req, res) => {
@@ -2507,7 +2476,7 @@ export function apply(ctx) {
       },
     }))
 
-    disposers.push(ctx.webServer.register({
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/trash/purge',
       handler: async (req, res) => {
@@ -2524,7 +2493,7 @@ export function apply(ctx) {
       },
     }))
 
-    disposers.push(ctx.webServer.register({
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/trash/purge-many',
       handler: async (req, res) => {
@@ -2553,7 +2522,7 @@ export function apply(ctx) {
     }))
 
     // All conversations (for the "移动会话" panel).
-    disposers.push(ctx.webServer.register({
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/sessions',
       handler: async (req, res) => {
@@ -2569,7 +2538,7 @@ export function apply(ctx) {
     }))
 
     // Star / unstar one or many sessions (收藏, schema v3).
-    disposers.push(ctx.webServer.register({
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/star/set',
       handler: async (req, res) => {
@@ -2593,7 +2562,7 @@ export function apply(ctx) {
 
     // ---- Tags (标签, schema v4) — one route one action, same shape as star/set.
     // Pure user metadata: these routes never create/modify/delete a session.
-    disposers.push(ctx.webServer.register({
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/tags/list',
       handler: async (req, res) => {
@@ -2606,7 +2575,7 @@ export function apply(ctx) {
       },
     }))
 
-    disposers.push(ctx.webServer.register({
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/tags/create',
       handler: async (req, res) => {
@@ -2620,7 +2589,7 @@ export function apply(ctx) {
       },
     }))
 
-    disposers.push(ctx.webServer.register({
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/tags/rename',
       handler: async (req, res) => {
@@ -2634,7 +2603,7 @@ export function apply(ctx) {
       },
     }))
 
-    disposers.push(ctx.webServer.register({
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/tags/merge',
       handler: async (req, res) => {
@@ -2648,7 +2617,7 @@ export function apply(ctx) {
       },
     }))
 
-    disposers.push(ctx.webServer.register({
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/tags/delete',
       handler: async (req, res) => {
@@ -2662,7 +2631,7 @@ export function apply(ctx) {
       },
     }))
 
-    disposers.push(ctx.webServer.register({
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/tags/set',
       handler: async (req, res) => {
@@ -2681,7 +2650,7 @@ export function apply(ctx) {
     }))
 
     // ---- Saved filters (保存筛选, schema v1) --------------------------------
-    disposers.push(ctx.webServer.register({
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/filters/list',
       handler: async (req, res) => {
@@ -2693,7 +2662,7 @@ export function apply(ctx) {
       },
     }))
 
-    disposers.push(ctx.webServer.register({
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/filters/save',
       handler: async (req, res) => {
@@ -2707,7 +2676,7 @@ export function apply(ctx) {
       },
     }))
 
-    disposers.push(ctx.webServer.register({
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/filters/delete',
       handler: async (req, res) => {
@@ -2731,7 +2700,7 @@ export function apply(ctx) {
     // offset/length 有界切片），流式渲染 Markdown，客户端断开即取消（signal），
     // 并受全局并发闸约束——大日志不再一次性整本驻留内存。
     const exportLimiter = createLimiter(2)
-    disposers.push(ctx.webServer.register({
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/export-md',
       handler: async (req, res) => {
@@ -2767,7 +2736,7 @@ export function apply(ctx) {
       },
     }))
 
-    disposers.push(ctx.webServer.register({
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/sidebar-state',
       handler: async (req, res) => {
@@ -2785,7 +2754,7 @@ export function apply(ctx) {
     // 标题走 v3.6.2 的纯缓存读取（metaCache/持久索引/权威缓存），未命中入后台
     // 预热、本轮返回 null；请求路径零解码。
     // live 标记 = 会话在内存里活着（正在运行或已打开）：批量清理必须跳过。
-    disposers.push(ctx.webServer.register({
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/lineage-tree',
       handler: async (req, res) => {
@@ -2913,7 +2882,7 @@ export function apply(ctx) {
     }))
 
     // Available target workspaces (for the move picker).
-    disposers.push(ctx.webServer.register({
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/workspaces',
       handler: async (req, res) => {
@@ -2925,8 +2894,21 @@ export function apply(ctx) {
       },
     }))
 
+    disposers.push(registerRoute({
+      kind: 'exact',
+      path: '/archived-sessions/branch-points',
+      handler: async (req, res) => {
+        try {
+          const body = await readJsonBody(req)
+          json(res, await sessionBranchPoints(requireSessionId(body?.sessionId)))
+        } catch (error) {
+          json(res, { error: String(error.message || error) }, errorStatus(error))
+        }
+      },
+    }))
+
     // Move one conversation to a target workspace (existing path or a new one).
-    disposers.push(ctx.webServer.register({
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/move',
       handler: async (req, res) => {
@@ -2936,11 +2918,7 @@ export function apply(ctx) {
           const target = body && typeof body.targetPath === 'string' ? body.targetPath : null
           if (!sid) return json(res, { ok: false, error: 'missing sessionId' }, 400)
           if (!target) return json(res, { ok: false, error: 'missing targetPath' }, 400)
-          const moved = await moveOrQueue(sid, target)
-          if (moved.queued) return json(res, { sessionId: sid, ...moved })
-          // 移动会改写日志 frame0 的 cwd：元数据（cwd）已变，主动丢弃缓存条目，
-          // 不等 mtime 指纹自然失效（Windows 上 mtime 精度较粗，指纹可能不变）。
-          metaCache.invalidate(sid)
+          const moved = await moveNow(sid, target, { stopRunning: body.stopRunning === true })
           // Reindex the host's in-memory sessionPath index so the sidebar
           // reflects the new grouping immediately (no DSH restart needed).
           // Do this before replying: drag/drop and menu clients treat a 2xx
@@ -2957,7 +2935,7 @@ export function apply(ctx) {
     // Move many conversations to one target workspace (issue #7). Sequential
     // on purpose: each move rewrites frame0 (file IO), and one bad session
     // must not block the rest. Single reindex at the end covers all moves.
-    disposers.push(ctx.webServer.register({
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/move-many',
       handler: async (req, res) => {
@@ -2970,15 +2948,13 @@ export function apply(ctx) {
           if (!ids.length) return json(res, { ok: false, error: 'missing sessionIds' }, 400)
           if (!target) return json(res, { ok: false, error: 'missing targetPath' }, 400)
           let moved = 0
+          let already = 0
           const failed = []
-          const queued = []
           for (const sid of ids) {
             try {
-              const r = await moveOrQueue(sid, target)
-              if (r && r.queued) { queued.push(sid); continue }
-              // frame0 的 cwd 被改写：与单移动同理由，主动丢缓存不等指纹失效。
-              metaCache.invalidate(sid)
+              const r = await moveNow(sid, target, { stopRunning: body.stopRunning === true })
               moved++
+              if (r.already) already++
             } catch (e) {
               const err = e && e.code ? { sessionId: sid, error: String((e && e.message) || e), code: e.code } : { sessionId: sid, error: String((e && e.message) || e) }
               failed.push(err)
@@ -2986,9 +2962,10 @@ export function apply(ctx) {
           }
           try { await reindexRegistry() } catch (e) { /* best-effort */ }
           json(res, {
+            // moved historically includes sessions already at the destination.
             moved,
+            already,
             failed,
-            ...(queued.length > 0 ? { queued, notes: [`${queued.length} 个会话已排队（正被 DSH 打开），重启 DSH 后会自动完成；重启后请先别打开它们。`] } : {}),
           })
         } catch (e) {
           json(res, { ok: false, code: e && e.code, error: String((e && e.message) || e) }, errorStatus(e))
@@ -2996,8 +2973,8 @@ export function apply(ctx) {
       },
     }))
 
-    // 待移动队列：查看 / 取消（会话被占用时排队，释放后自动完成）。
-    disposers.push(ctx.webServer.register({
+    // Historical moves: list, retry and cancel.
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/pending-moves',
       handler: async (req, res) => {
@@ -3009,7 +2986,7 @@ export function apply(ctx) {
         }
       },
     }))
-    disposers.push(ctx.webServer.register({
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/pending-moves/cancel',
       handler: async (req, res) => {
@@ -3025,9 +3002,30 @@ export function apply(ctx) {
       },
     }))
 
+    disposers.push(registerRoute({
+      kind: 'exact',
+      path: '/archived-sessions/pending-moves/retry',
+      handler: async (req, res) => {
+        try {
+          const body = await readJsonBody(req)
+          const sid = requireSessionId(body?.sessionId)
+          const item = await pendingMoves.get(sid)
+          if (!item) return json(res, { ok: false, error: '找不到这条历史移动记录' }, 404)
+          const result = await moveNow(sid, item.targetPath, {
+            scope: item.scope,
+            stopRunning: body.stopRunning === true,
+          })
+          await reindexRegistry()
+          json(res, { sessionId: sid, ...result })
+        } catch (e) {
+          json(res, { ok: false, code: e && e.code, error: String((e && e.message) || e) }, errorStatus(e))
+        }
+      },
+    }))
+
     // T2：ack 已展示的排队移动通知（尽力清理；失败无害，client 端 localStorage
     // 已见集合负责多 tab 去重，7 天 TTL 兜底）。
-    disposers.push(ctx.webServer.register({
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/pending-moves/notices/ack',
       handler: async (req, res) => {
@@ -3044,7 +3042,7 @@ export function apply(ctx) {
     }))
 
     // Archive (hide) one session.
-    disposers.push(ctx.webServer.register({
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/archive',
       handler: async (req, res) => {
@@ -3060,7 +3058,7 @@ export function apply(ctx) {
     }))
 
     // Archive (hide) many sessions.
-    disposers.push(ctx.webServer.register({
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/archive-many',
       handler: async (req, res) => {
@@ -3082,7 +3080,7 @@ export function apply(ctx) {
 
     // Per-session details (v2.0): disk usage, turn/step/message counts, tool
     // usage, fetch records, write/edit files, and lineage.
-    disposers.push(ctx.webServer.register({
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/details',
       handler: async (req, res) => {
@@ -3101,7 +3099,7 @@ export function apply(ctx) {
     }))
 
     // Storage usage rollup (read-only): per-workspace totals + largest sessions.
-    disposers.push(ctx.webServer.register({
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/storage',
       handler: async (req, res) => {
@@ -3120,7 +3118,7 @@ export function apply(ctx) {
     // the panel never waits on it (P5, issue #1): the sweep itself already
     // reuses the metadata caches, and this keeps the settings read latency
     // independent of library size.
-    disposers.push(ctx.webServer.register({
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/auto-archive/settings',
       handler: async (req, res) => {
@@ -3158,7 +3156,7 @@ export function apply(ctx) {
     }))
 
     // Run the auto-archive sweep right now, ignoring the once-a-day throttle.
-    disposers.push(ctx.webServer.register({
+    disposers.push(registerRoute({
       kind: 'exact',
       path: '/archived-sessions/auto-archive/run',
       handler: async (req, res) => {
@@ -3176,14 +3174,20 @@ export function apply(ctx) {
   }, 'dsh-sessions-manager: routes')
 
   return {
-    async moveSession(sid, target, { expectedCwd }) {
-      const result = await moveOrQueue(sid, target.path, { expectedCwd, targetWorkspaceId: target.id })
-      if (result.moved) {
-        metaCache.invalidate(sid)
-        await reindexRegistry()
-      }
+    async moveSession(sid, target, { expectedCwd, stopRunning, callerId }) {
+      const result = await moveNow(sid, target.path, {
+        scope: { expectedCwd, targetWorkspaceId: target.id },
+        stopRunning,
+        callerId,
+      })
+      if (result.moved) await reindexRegistry()
       return result
     },
     pendingMove: pendingMoves.get,
+    routeHandlers,
+    async deletedSessionIds() {
+      const trash = await readTrashStore()
+      return new Set(trash.items.map(item => String(item.sessionId)))
+    },
   }
 }

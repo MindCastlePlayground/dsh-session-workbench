@@ -200,6 +200,7 @@ test('move-many moves every listed session to one target in one call', async () 
   const { status, body } = await call('/archived-sessions/move-many', { sessionIds: ['mv-2'], targetPath: join(root, 'ws-new') })
   assert.equal(status, 200, `move-many must succeed, got ${status}: ${body.error}`)
   assert.equal(body.moved, 1)
+  assert.equal(body.already, 0)
   assert.deepEqual(body.failed, [])
   // 成员迁移 + 内存索引重定向到目标工作区。
   assert.ok(ctxRefs.newEntity.sessionIds.includes('mv-2'), 'session must join the target workspace')
@@ -213,6 +214,7 @@ test('move-many reports per-id failures without blocking the rest', async () => 
   assert.equal(status, 200)
   assert.equal(body.moved, 1)
   assert.equal(body.failed.length, 1)
+  assert.equal(body.already, 1)
   assert.equal(body.failed[0].sessionId, 'ghost-404')
   assert.ok(body.failed[0].error)
 })
@@ -278,37 +280,28 @@ test('move reclaims a superseded (older-generation) copy in another dir and repo
   assert.ok(Array.isArray(body.notes) && body.notes.some((n) => /回收/.test(n)), `expected reclaim note, got ${JSON.stringify(body.notes)}`)
 })
 
-test('a session held by another writer is queued instead of failing, and can be cancelled', async () => {
-  // 0.1.5 单写者：DSH 打开会话时持有 flock，插件无法释放 → 排队等它关闭
-  // （session/disposed 或下次启动时自动完成）。这里用「写所有权探测抛
-  // SessionAlreadyOwnedError」模拟占用。
+test('a held session returns a conflict and only moves on an explicit retry', async () => {
   const owned = new Error('Session "mv-2" is already owned by an active write handle')
   owned.name = 'SessionAlreadyOwnedError'
   const spRef = ctxRefs.sp
   const originalOpen = spRef.open
+  const request = { sessionId: 'mv-2', targetPath: join(root, 'ws-new') }
   spRef.open = async (id, access) => {
     if (String(id) === 'mv-2' && access === 'write') throw owned
     return originalOpen(id, access)
   }
   try {
-    const { status, body } = await call('/archived-sessions/move', { sessionId: 'mv-2', targetPath: join(root, 'ws-new') })
-    assert.equal(status, 200, `expected soft-success, got ${status}: ${JSON.stringify(body)}`)
-    assert.equal(body.queued, true)
-    assert.equal(body.moved, false)
-    // 断言语义而非逐字文案：排队提示必须说明「已排队」并给出可操作的自救路径（重启 DSH）。
-    assert.ok(body.notes.some((n) => /已排队/.test(n) && /重启/.test(n)), `expected queue note, got ${JSON.stringify(body.notes)}`)
-
+    const { status, body } = await call('/archived-sessions/move', request)
+    assert.equal(status, 409)
+    assert.equal(body.code, 'DSM_SESSION_BUSY')
+    assert.match(body.error, /关闭会话/)
     const listed = await call('/archived-sessions/pending-moves', {})
     assert.equal(listed.status, 200)
-    assert.ok(listed.body.items.some((i) => i.sessionId === 'mv-2'), JSON.stringify(listed.body))
-
-    const cancelled = await call('/archived-sessions/pending-moves/cancel', { sessionIds: ['mv-2'] })
-    assert.equal(cancelled.status, 200)
-    assert.equal(cancelled.body.removed, 1)
-
-    const after = await call('/archived-sessions/pending-moves', {})
-    assert.equal(after.body.items.length, 0)
+    assert.equal(listed.body.items.length, 0)
   } finally {
     spRef.open = originalOpen
   }
+  const retried = await call('/archived-sessions/move', request)
+  assert.equal(retried.status, 200, JSON.stringify(retried.body))
+  assert.equal(retried.body.moved, true)
 })

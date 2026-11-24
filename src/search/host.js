@@ -1,15 +1,5 @@
-/**
- * Host half of the conversation-search bundle.
- *
- * The in-conversation panel searches what the browser has loaded; this half answers the
- * global search, which must cover EVERY stored Session. It reads the whole logical corpus
- * through `ctx.sessionQuery` (live history preferred, persisted logs otherwise), folds each
- * log into Session → question → paragraph, and serves one POST route for the Web page.
- *
- * The route is browser-only and loopback-bound like the rest of the GUI: it carries no
- * mutation, so a local reader gains nothing it could not read from the session logs.
- */
-
+import { createDiskIndex } from './disk-index.js'
+import { register } from '../tools.js'
 import { promises as fsPromises } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -18,23 +8,13 @@ import path from 'node:path'
 const ROUTE_PATH = '/conversation-search/api'
 /** The request is a small JSON document; anything larger is a wiring mistake. */
 const MAX_BODY_BYTES = 128 * 1024
-/** Corpus refreshes reuse parsed Sessions for this long. */
-const INDEX_TTL_MS = 30_000
-/** A hard floor between rebuilds, so a streaming reply cannot rebuild on every keystroke. */
-const INDEX_MIN_AGE_MS = 2_500
-/** A stored log has no cheap revision: its parsed entry is reused for this long between rebuilds.
-    Kept equal to the index TTL so a finished Turn cannot stay invisible for minutes. */
-const STORED_REUSE_MS = 30_000
-/** Identical searches reuse their serialized result for this long. */
+/** Reuse ranked session IDs across pages for this long. */
 const RESPONSE_TTL_MS = 60_000
-const MAX_RESPONSE_CACHE = 32
-/** Sessions indexed at most (newest first), and the text budget across all of them. */
-const MAX_SESSIONS = 400
-const MAX_TOTAL_CHARS = 8_000_000
+const MAX_RESPONSE_CACHE = 16
 /** Guard against one pathological log monopolizing a rebuild. */
-const MAX_EVENTS_PER_SESSION = 30_000
 /** Caps on one response, so a broad query stays readable and cheap to render. */
 const MAX_RESULT_SESSIONS = 30
+const DEFAULT_RESULT_SESSIONS = 20
 const MAX_RESULT_QUESTIONS = 12
 const MAX_RESULT_PARAGRAPHS = 8
 const SNIPPET_CHARS = 150
@@ -71,8 +51,8 @@ export const inject = ['webServer', 'sessionQuery']
  * Register the one route and keep the index in this plugin's own effect scope.
  * @param ctx - Host plugin context carrying the webserver and the session query service.
  */
-export function apply(ctx) {
-  const index = createIndex(ctx)
+export function apply(ctx, { deletedSessionIds } = {}) {
+  const index = createIndex(ctx, deletedSessionIds)
   const recent = createRecentStore()
   const filters = createFilterStore()
   /** Identical search results, keyed by query/scope/filters/index version. */
@@ -86,7 +66,20 @@ export function apply(ctx) {
       }),
     'conversation-search: api route',
   )
+  return {
+    search: (payload) => executeSearch(index, recent, filters, responseCache, payload),
+    preferences: async (update) => {
+      const current = await filters.read()
+      return {
+        filters: update === undefined ? current : await filters.write({ ...current, ...update }),
+        recent: await recent.read(),
+      }
+    },
+    warm: index.warm,
+    status: index.status,
+  }
 }
+
 
 // #region HTTP plumbing -------------------------------------------------------
 
@@ -131,21 +124,12 @@ async function handleRequest(ctx, index, recent, filters, responseCache, req, re
   const started = Date.now()
   try {
     if (payload.action === 'status') {
-      /* Non-blocking on purpose: the page polls this while the first build runs, so it must answer
-         with the live progress instead of waiting for `ensure()` to finish. */
-      const snapshot = index.peek()
-      sendJson(res, 200, {
-        ok: true,
-        value: { sessions: snapshot.sessions, builtAt: snapshot.builtAt, buildMs: snapshot.buildMs, progress: snapshot.progress },
-      })
+      sendJson(res, 200, { ok: true, value: index.status() })
       return
     }
     if (payload.action === 'warm') {
-      const corpus = await index.ensure(payload.refresh === true)
-      sendJson(res, 200, {
-        ok: true,
-        value: { sessions: corpus.size, builtAt: index.builtAt(), buildMs: index.buildMs(), progress: index.progress() },
-      })
+      await index.warm()
+      sendJson(res, 200, { ok: true, value: index.status() })
       return
     }
     if (payload.action === 'recent') {
@@ -157,47 +141,8 @@ async function handleRequest(ctx, index, recent, filters, responseCache, req, re
       sendJson(res, 200, { ok: true, value: { filters: saved } })
       return
     }
-    const query = typeof payload.query === 'string' ? payload.query : ''
-    const scope = typeof payload.scope === 'string' && Object.hasOwn(SCOPES, payload.scope) ? payload.scope : 'all'
-    const active = normalizeFilters(payload.filters)
-    if (query.trim() === '') {
-      const value = emptyResult(query, scope, started)
-      value.recent = await recent.read()
-      value.filters = active
-      sendJson(res, 200, { ok: true, value })
-      return
-    }
-    const corpus = await index.ensure(payload.refresh === true)
-    /* An identical search inside the TTL reuses the folded result; the index version keys it. */
-    const cacheKey = `${index.builtAt()}|${query}|${scope}|${active.since}|${active.until}|${active.turns}`
-    const cached = responseCache.get(cacheKey)
-    const fresh = cached === undefined || Date.now() - cached.at >= RESPONSE_TTL_MS
-    if (fresh) {
-      const computed = searchCorpus(corpus, query, scope, started, active)
-      responseCache.set(cacheKey, { at: Date.now(), value: computed })
-      if (responseCache.size > MAX_RESPONSE_CACHE) {
-        const oldest = responseCache.keys().next().value
-        if (oldest !== undefined) responseCache.delete(oldest)
-      }
-    }
-    const base = fresh ? responseCache.get(cacheKey).value : cached.value
-    const value = {
-      query,
-      scope,
-      sessions: base.sessions,
-      stats: {
-        ...base.stats,
-        tookMs: Date.now() - started,
-        cached: !fresh,
-        /* Index timing travels with every reply, cached or not: that is the number to optimise. */
-        buildMs: index.buildMs(),
-        indexAgeMs: Date.now() - index.builtAt(),
-      },
-    }
-    /* Recorded only after the search succeeded, so a failed request never enters history. */
-    value.recent = await recent.remember(query)
-    value.filters = await filters.write(active)
-    sendJson(res, 200, { ok: true, value })
+    const value = await executeSearch(index, recent, filters, responseCache, payload, started)
+    if (!res.destroyed) sendJson(res, 200, { ok: true, value })
   } catch (error) {
     ctx.logger?.warn?.(`conversation-search: ${messageOf(error)}`)
     sendJson(res, 500, { ok: false, error: { code: 'search-failed', message: messageOf(error) } })
@@ -205,6 +150,109 @@ async function handleRequest(ctx, index, recent, filters, responseCache, req, re
 }
 
 /** Write one JSON envelope. */
+async function executeSearch(index, recent, filters, responseCache, payload, started = Date.now()) {
+  const query = typeof payload.query === 'string' ? payload.query : ''
+  const scope = typeof payload.scope === 'string' && Object.hasOwn(SCOPES, payload.scope) ? payload.scope : 'all'
+  const active = normalizeFilters(payload.filters)
+  if (query.trim() === '') {
+    const value = emptyResult(query, scope, started)
+    value.recent = await recent.read()
+    value.filters = active
+    return value
+  }
+  const offset = Number.isSafeInteger(payload.offset) && payload.offset > 0 ? payload.offset : 0
+  const pageSize = Number.isSafeInteger(payload.pageSize) && payload.pageSize > 0
+    ? Math.min(payload.pageSize, MAX_RESULT_SESSIONS)
+    : DEFAULT_RESULT_SESSIONS
+  const snapshot = await index.snapshot()
+  const { revision, buildMs } = snapshot
+  /* An identical search inside the TTL reuses the folded result; the index version keys it. */
+  const cacheKey = JSON.stringify([revision, query, scope, active.since, active.until, active.turns, active.includeDeleted, pageSize])
+  let cached = responseCache.get(cacheKey)
+  const fresh = cached === undefined || Date.now() - cached.at >= RESPONSE_TTL_MS
+  if (fresh) {
+    cached = { at: Date.now(), snapshot, pending: searchCorpus(snapshot.scan(normalizeWords(query), active.includeDeleted), query, scope, started, active, pageSize) }
+    responseCache.set(cacheKey, cached)
+    if (responseCache.size > MAX_RESPONSE_CACHE) {
+      responseCache.delete(responseCache.keys().next().value)
+    }
+  }
+  let base
+  try {
+    base = await cached.pending
+  } catch (error) {
+    if (responseCache.get(cacheKey) === cached) responseCache.delete(cacheKey)
+    throw error
+  }
+  const totalMatches = base.ids.length
+  let sessions = base.sessions
+  if (offset > 0) {
+    const pageIds = base.ids.slice(offset, offset + pageSize)
+    const page = await searchCorpus(cached.snapshot.scan([], active.includeDeleted, pageIds), query, scope, started, active, pageSize)
+    sessions = page.sessions
+  }
+  const value = {
+    query,
+    scope,
+    sessions,
+    totalMatches,
+    nextOffset: offset + pageSize < totalMatches ? offset + pageSize : null,
+    offset,
+    pageSize,
+    revision,
+    coverage: { ...base.coverage, indexed: snapshot.indexed, total: snapshot.indexed + snapshot.unreadable, unreadable: snapshot.unreadable },
+    stats: {
+      ...base.stats,
+      tookMs: Date.now() - started,
+      cached: !fresh,
+      /* Index timing travels with every reply, cached or not: that is the number to optimise. */
+      buildMs,
+      indexAgeMs: Date.now() - revision,
+    },
+  }
+  /* Recorded only after the search succeeded, so a failed request never enters history. */
+  if (!payload.agent) value.recent = offset === 0 ? await recent.remember(query) : await recent.read()
+  value.filters = offset === 0 && !payload.agent ? await filters.write(active) : active
+  return value
+}
+
+const SEARCH_QUERY = { type: 'string', minLength: 1, maxLength: 512 }
+const DATE = { type: 'string', minLength: 1, maxLength: 10 }
+
+export function registerSearchTools(ctx, search) {
+  register(ctx, 'session_search',
+    'Search titles, user messages and assistant replies. Opens the local search index on demand. Set include_deleted to search retained snapshots of deleted sessions.',
+    { query: SEARCH_QUERY, scope: { type: 'string', minLength: 1, maxLength: 32 },
+      since: DATE, until: DATE, last_turns: { type: 'integer', minimum: 0, maximum: 5000 },
+      offset: { type: 'integer', minimum: 0 }, page_size: { type: 'integer', minimum: 1, maximum: 30 },
+      include_deleted: { type: 'boolean' }, revision: { type: 'integer', minimum: 1 },
+    }, ['query'], async (args, _caller, signal) => {
+      if (!args.offset && !args.revision) await search.warm()
+      signal.throwIfAborted()
+      return search.search({
+        agent: true, query: args.query, scope: args.scope, offset: args.offset,
+        pageSize: args.page_size, revision: args.revision,
+        filters: { since: args.since, until: args.until, turns: args.last_turns ?? 0, includeDeleted: args.include_deleted },
+      })
+    })
+  register(ctx, 'search_preferences', 'Read the Web search history and saved filters. Supply filters to update the Web search defaults.',
+    { since: { ...DATE, minLength: 0 }, until: { ...DATE, minLength: 0 },
+      last_turns: { type: 'integer', minimum: 0, maximum: 5000 }, rolling: { type: 'boolean' },
+      include_deleted: { type: 'boolean' },
+    }, [], (args) => {
+      const update = {}
+      if (args.since !== undefined) update.since = args.since
+      if (args.until !== undefined) update.until = args.until
+      if (args.last_turns !== undefined) update.turns = args.last_turns
+      if (args.rolling !== undefined) update.rolling = args.rolling
+      if (args.include_deleted !== undefined) update.includeDeleted = args.include_deleted
+      return search.preferences(Object.keys(update).length ? update : undefined)
+    })
+  register(ctx, 'search_index_status', 'Read search-index status without opening it.', {}, [], () => search.status())
+  register(ctx, 'search_index_update', 'Update the local search index from changed sessions and mark deleted snapshots.', {}, [],
+    async () => { await search.warm(); return search.status() })
+}
+
 function sendJson(res, status, body) {
   const text = JSON.stringify(body)
   res.statusCode = status
@@ -410,7 +458,7 @@ function normalizeFilters(input) {
       savedOn = until
     }
   }
-  return rollFilters({ since, until, turns: turnCount(input.turns), rolling, savedOn })
+  return rollFilters({ since, until, turns: input.turns === 0 ? 0 : turnCount(input.turns), rolling, savedOn, includeDeleted: input.includeDeleted === true })
 }
 
 function dayStartMs(value) {
@@ -487,126 +535,39 @@ function createFilterStore() {
 
 // #region Corpus index --------------------------------------------------------
 
-/**
- * Create the lazily built, TTL-refreshed corpus index.
- *
- * A live Session is re-parsed only when its event count moved; a stored one is re-read on
- * each rebuild, because the persistence layer exposes no cheap revision here. Rebuilds are
- * serialized, so two searches arriving together do one pass.
- */
-function createIndex(ctx) {
-  const cache = new Map()
-  /* Stored logs have no cheap revision, so their parsed entry is reused for a bounded while. */
-  const stored = new Map()
-  let builtAt = 0
-  let buildMs = 0
-  let building = null
-  /* Session counts for the first build, so the page can show a real progress bar instead of a
-     spinner. `done` counts records handed to a batch, not records that parsed successfully. */
-  let progress = { active: false, done: 0, total: 0 }
-
-  async function rebuild(force) {
-    const buildStarted = Date.now()
-    const query = ctx.get('sessionQuery')
-    if (query === undefined) throw new Error('sessionQuery is unavailable')
-    const liveSessions = ctx.get('sessions')
-    const records = await query.listSessions()
-    /* A conversation that just started may not be on disk yet, so `listSessions()` misses it while
-       its events are already live. Add those sessions so searching during a fresh chat works. */
-    const liveList =
-      liveSessions !== undefined && liveSessions !== null && typeof liveSessions.list === 'function' ? liveSessions.list() : []
-    const knownIds = new Set(records.map((record) => record.header.id))
-    for (const session of liveList) {
-      if (knownIds.has(session.id)) continue
-      if (typeof session.snapshotEvents !== 'function') continue
-      records.push({ header: { id: session.id, title: '' } })
-      knownIds.add(session.id)
-    }
-    progress = { active: true, done: 0, total: Math.min(records.length, MAX_SESSIONS) }
-    const next = new Map()
-    let budget = MAX_TOTAL_CHARS
-    if (force) stored.clear()
-
-    for (let offset = 0; offset < records.length && offset < MAX_SESSIONS && budget > 0; offset += 8) {
-      const batch = records.slice(offset, offset + 8)
-      const parsed = await Promise.all(
-        batch.map(async (record) => {
-          const id = record.header.id
-          try {
-            const live = liveSessions === undefined ? undefined : liveSessions.get(id)
-            const events = live === undefined ? undefined : live.snapshotEvents()
-            const signature = events === undefined ? 'stored' : `live:${events.length}`
-            const hit = cache.get(id)
-            if (!force && events !== undefined && hit?.signature === signature) return hit
-            const kept = stored.get(id)
-            if (events === undefined && kept !== undefined && Date.now() - kept.at < STORED_REUSE_MS) {
-              return kept.entry
-            }
-            const log = events === undefined ? (await query.readSession(id)).events : events
-            const entry = parseSession(id, record.header, log, signature)
-            if (events === undefined) stored.set(id, { entry, at: Date.now() })
-            return entry
-          } catch (error) {
-            return undefined
-          } finally {
-            /* Count each Session as it finishes, not each batch of 8: the page polls this. */
-            progress.done += 1
-          }
-        }),
-      )
-      for (const entry of parsed) {
-        if (entry === undefined) continue
-        next.set(entry.id, entry)
-        budget -= entry.chars
+function createIndex(ctx, deletedSessionIds) {
+  return createDiskIndex({
+    filename: path.join(dataDir(), 'sessions-v1.sqlite'),
+    async catalog() {
+      const persistence = ctx.get('sessionPersistence')
+      const query = ctx.get('sessionQuery')
+      const stored = persistence?.list ? await persistence.list() : await query.listSessions()
+      const deleted = new Set(await deletedSessionIds?.() ?? [])
+      const records = new Map()
+      for (const record of stored) {
+        if (!record.header?.id) continue
+        records.set(record.header.id, { ...record, deleted: deleted.has(record.header.id) })
       }
-    }
-
-    progress = { active: false, done: progress.total, total: progress.total }
-    cache.clear()
-    for (const [id, entry] of next) cache.set(id, entry)
-    for (const id of stored.keys()) {
-      if (next.get(id)?.signature !== 'stored') stored.delete(id)
-    }
-    builtAt = Date.now()
-    buildMs = builtAt - buildStarted
-    return cache
-  }
-
-  return {
-    async ensure(force) {
-      const now = Date.now()
-      const age = now - builtAt
-      if (!force) {
-        if (cache.size > 0 && age < INDEX_MIN_AGE_MS) return cache
-        /* A live Session that grew must be visible at once; stored logs can wait for the TTL. */
-        if (cache.size > 0 && age < INDEX_TTL_MS && !liveMoved(ctx, cache)) return cache
+      for (const session of ctx.get('sessions')?.list?.() ?? []) {
+        if (!records.has(session.id) && session.header && !deleted.has(session.id)) {
+          records.set(session.id, { header: session.header })
+        }
       }
-      if (building !== null) return building
-      building = rebuild(force).finally(() => {
-        building = null
-      })
-      return building
+      return [...records.values()]
     },
-    builtAt: () => builtAt,
-    buildMs: () => buildMs,
-    progress: () => progress,
-    /** Read the current corpus state without triggering a build. */
-    peek: () => ({ sessions: cache.size, builtAt, buildMs, progress }),
-  }
-}
-
-/** Whether any live Session's log has moved since the cached parse. */
-function liveMoved(ctx, cache) {
-  const sessions = ctx.get('sessions')
-  if (sessions === undefined || typeof sessions.list !== 'function') return false
-  for (const session of sessions.list()) {
-    const entry = cache.get(session.id)
-    if (entry === undefined) return true
-    if (typeof session.snapshotEvents !== 'function') continue
-    const events = session.snapshotEvents()
-    if (entry.signature !== `live:${events.length}`) return true
-  }
-  return false
+    readLive(id) {
+      return ctx.get('sessions')?.get?.(id)?.snapshotEvents?.()
+    },
+    async read(record, events) {
+      const query = ctx.get('sessionQuery')
+      const { header } = record
+      const log = events ?? (await query.readSession(header.id)).events
+      return parseSession(header.id, header, log)
+    },
+    reportError(id, error) {
+      ctx.logger?.warn?.('conversation-search: session ' + id + ': ' + messageOf(error))
+    },
+  })
 }
 
 /**
@@ -619,7 +580,7 @@ function liveMoved(ctx, cache) {
  * Logs that predate Turn boundaries fall back to one question per user message, numbered in
  * order — the behaviour older releases had.
  */
-function parseSession(id, header, events, signature) {
+function parseSession(id, header, events) {
   let title = ''
   let chars = 0
   const questions = []
@@ -630,7 +591,6 @@ function parseSession(id, header, events, signature) {
   let currentTurn = null
   let current = null
   let ordinal = 0
-  const limit = Math.min(events.length, MAX_EVENTS_PER_SESSION)
 
   /** The one question row of a Turn (created on first sight, keyed by its real number). */
   const questionFor = (turn) => {
@@ -647,8 +607,7 @@ function parseSession(id, header, events, signature) {
     if (question.time === 0 && typeof event.time === 'number') question.time = event.time
   }
 
-  for (let index = 0; index < limit; index += 1) {
-    const event = events[index]
+  for (const event of events) {
     if (event === null || typeof event !== 'object') continue
 
     if (event.type === 'session/title') {
@@ -737,7 +696,7 @@ function parseSession(id, header, events, signature) {
     createdAt: header !== null && header !== undefined && typeof header.createdAt === 'number' ? header.createdAt : 0,
     title,
     displayTitle,
-    signature,
+    limited: false,
     chars,
     questions: kept,
   }
@@ -988,20 +947,29 @@ function emptyResult(query, scope, started) {
  * Every returned Session keeps only the questions and paragraphs that matched (plus the
  * containers needed to place them), each flagged with which layer actually hit the keywords.
  */
-function searchCorpus(corpus, query, scope, started, filters) {
+async function searchCorpus(corpus, query, scope, started, filters, pageSize) {
   const matchStarted = Date.now()
   const words = normalizeWords(query)
   const spec = SCOPES[scope]
   const sinceMs = dayStartMs(filters.since)
   const untilMs = dayEndMs(filters.until)
   const turnLimit = filters.turns > 0 ? filters.turns : 0
-  const sessions = []
+  const contentPage = []
+  const titlePage = []
+  const contentIds = []
+  const titleIds = []
   let questionCount = 0
   let paragraphCount = 0
+  let indexed = 0
+  let unreadable = 0
+  let limited = 0
   let truncated = false
 
   if (words.length > 0) {
-    for (const entry of corpus.values()) {
+    for await (const entry of corpus) {
+      if (!entry) { unreadable++; continue }
+      indexed++
+      if (entry.limited) limited++
       const sessionMatched = spec.session && containsAll(entry.title, words)
       const questions = []
       /* Only the last N Turns of each Session are candidates; the date window narrows further.
@@ -1065,6 +1033,7 @@ function searchCorpus(corpus, query, scope, started, filters) {
           })
         }
         if (!questionMatched && paragraphs.length === 0) continue
+        if (paragraphs.length > MAX_RESULT_PARAGRAPHS) truncated = true
         questions.push({
           seq: questionSeq,
           number: questionNumber,
@@ -1080,8 +1049,15 @@ function searchCorpus(corpus, query, scope, started, filters) {
         questionCount += 1
       }
       if (!sessionMatched && questions.length === 0) continue
-      sessions.push({
+      const hasContent = questions.length > 0
+      const ids = hasContent ? contentIds : titleIds
+      const page = hasContent ? contentPage : titlePage
+      ids.push(entry.id)
+      if (questions.length > MAX_RESULT_QUESTIONS) truncated = true
+      if (page.length >= pageSize) continue
+      page.push({
         id: entry.id,
+        deleted: entry.deleted,
         title: entry.title,
         displayTitle: entry.displayTitle === '' ? entry.title : entry.displayTitle,
         cwd: entry.cwd,
@@ -1091,22 +1067,21 @@ function searchCorpus(corpus, query, scope, started, filters) {
         paragraphTotal: entry.questions.reduce((sum, question) => sum + question.paragraphs.length, 0),
         questions: questions.slice(0, MAX_RESULT_QUESTIONS),
       })
-      if (sessions.length >= MAX_RESULT_SESSIONS) {
-        truncated = true
-        break
-      }
     }
   }
 
+  const ids = [...contentIds, ...titleIds]
   return {
     query,
     scope,
-    sessions,
+    ids,
+    sessions: [...contentPage, ...titlePage.slice(0, pageSize - contentPage.length)],
+    coverage: { indexed, total: indexed + unreadable, unreadable, limited },
     stats: {
-      sessions: sessions.length,
+      sessions: ids.length,
       questions: questionCount,
       paragraphs: paragraphCount,
-      indexed: corpus.size,
+      indexed,
       truncated,
       /* matchMs is the pure matching cost; tookMs also carries index build and response shaping. */
       matchMs: Date.now() - matchStarted,

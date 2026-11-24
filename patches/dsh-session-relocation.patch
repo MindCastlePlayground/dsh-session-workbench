@@ -1,0 +1,174 @@
+diff --git a/packages/api/session-controller/src/agent.ts b/packages/api/session-controller/src/agent.ts
+index 57288f5e..6fee88a7 100644
+--- a/packages/api/session-controller/src/agent.ts
++++ b/packages/api/session-controller/src/agent.ts
+@@ -313,6 +313,7 @@ export class ApiSessionAgentController {
+     }
+     return (await this.ctx.agents.resume({
+       resumeSessionId: sessionId,
++      allowSessionRelocation: true,
+       agentOptions: this.agentOptions(),
+       setup: composition.setup,
+     })).agent
+@@ -367,6 +368,7 @@ export class ApiSessionAgentController {
+     try {
+       return (await this.ctx.agents.resume({
+         resumeSessionId: sessionId,
++        allowSessionRelocation: true,
+         agentOptions: this.agentOptions(),
+         setup: this.reuseSetup(composition),
+       })).agent
+@@ -442,6 +444,7 @@ export class ApiSessionAgentController {
+     }
+     return (await this.ctx.agents.create({
+       sessionId,
++      allowSessionRelocation: true,
+       agentOptions: this.agentOptions(),
+       meta: {
+         cwd: await this.canonical(cwd),
+diff --git a/packages/api/session-controller/src/commands.ts b/packages/api/session-controller/src/commands.ts
+index d97ffc85..8ec2e862 100644
+--- a/packages/api/session-controller/src/commands.ts
++++ b/packages/api/session-controller/src/commands.ts
+@@ -279,12 +279,14 @@ export class SessionCommandController {
+       const { provider, model } = this.ctx.agentDefaultModel.currentSelection()
+       await this.ctx.agents.create({
+         sessionId: childId,
++        allowSessionRelocation: true,
+         seed,
+         parentSource: { sessionId: request.sessionId, endSeq },
+         inheritedEventCount: SessionLogOffset(boundary + 1),
+         meta: {
+           ...(source.header.cwd === undefined ? {} : { cwd: source.header.cwd }),
+           isSeeded: true,
++          parentSession: request.sessionId,
+           ...(composition.agentPreset === undefined
+             ? {}
+             : { agentPreset: composition.agentPreset }),
+diff --git a/packages/core/agent/src/index.ts b/packages/core/agent/src/index.ts
+index 433ee9b1..739b64cf 100644
+--- a/packages/core/agent/src/index.ts
++++ b/packages/core/agent/src/index.ts
+@@ -64,6 +64,8 @@ export type AgentSetup = (
+  * lineage); the factory creates the session and agent under that identity.
+  */
+ export interface CreateAgentOptions {
++  /** Permit the host to close this Agent before moving its persisted Session. */
++  readonly allowSessionRelocation?: boolean
+   /** The live agent/session identity. */
+   readonly sessionId: SessionId
+   /**
+@@ -136,6 +138,8 @@ export interface CreateAgentOptions {
+  * ({@link AgentRegistry.resume}).
+  */
+ export interface ResumeAgentOptions {
++  /** Permit the host to close this Agent before moving its persisted Session. */
++  readonly allowSessionRelocation?: boolean
+   /** The persisted session id to load and use as the live agent/session identity. */
+   readonly resumeSessionId: SessionId
+   /** Route fallback and output controls; see {@link AgentOptions} for live accessor semantics. */
+@@ -238,6 +242,10 @@ interface InitiatorRun {
+ }
+ 
+ /** Plain holder prevents Cordis from tracing the factory field before the caller context is known. */
++function relocationConflict(code: string, message: string): Error & { status: number, code: string } {
++  return Object.assign(new Error(message), { status: 409, code })
++}
++
+ interface FactorySlot {
+   readonly target: AgentFactory
+ }
+@@ -259,6 +267,9 @@ export class AgentRegistry extends Service {
+ 
+   private turnBoundaryProjectionHandle!: ProjectionHandle<TurnBoundaryProjection>
+   private store = new Map<SessionId, AgentEntry>()
++  private readonly openings = new Map<SessionId, number>()
++  private readonly relocating = new Set<SessionId>()
++  private readonly relocationHandles = new Map<SessionId, AgentHandle>()
+   private factory: FactorySlot | undefined
+   private readonly initiators = new AsyncLocalStorage<Agent | undefined>()
+   private readonly initiatorRuns = new AsyncLocalStorage<InitiatorRun>()
+@@ -426,8 +437,9 @@ export class AgentRegistry extends Service {
+     // capability and need no Cordis tracker magic.
+     const { target } = this.requireFactory()
+     const receiver = getTraceable(ownerCtx, target)
+-    // oxlint-disable-next-line typescript/unbound-method -- Reflect.apply intentionally supplies the caller-traced receiver
+-    return Reflect.apply(target.createAgent, receiver, [ownerCtx, options])
++    return this.openForSession(options.sessionId, options.allowSessionRelocation, () =>
++      // oxlint-disable-next-line typescript/unbound-method -- Reflect.apply supplies the caller-traced receiver
++      Reflect.apply(target.createAgent, receiver, [ownerCtx, options]))
+   }
+ 
+   /**
+@@ -441,8 +453,53 @@ export class AgentRegistry extends Service {
+     const ownerCtx = this.ctx
+     const { target } = this.requireFactory()
+     const receiver = getTraceable(ownerCtx, target)
+-    // oxlint-disable-next-line typescript/unbound-method -- Reflect.apply intentionally supplies the caller-traced receiver
+-    return Reflect.apply(target.resume, receiver, [ownerCtx, options])
++    return this.openForSession(options.resumeSessionId, options.allowSessionRelocation, () =>
++      // oxlint-disable-next-line typescript/unbound-method -- Reflect.apply supplies the caller-traced receiver
++      Reflect.apply(target.resume, receiver, [ownerCtx, options]))
++  }
++
++  /** Keep reopening outside the persistence transaction and retain only opted-in owners. */
++  private async openForSession(
++    id: SessionId,
++    relocatable: boolean | undefined,
++    open: () => Promise<AgentHandle>,
++  ): Promise<AgentHandle> {
++    if (this.relocating.has(id)) throw relocationConflict('DSM_MOVE_IN_PROGRESS', '该会话正在移动。')
++    this.openings.set(id, (this.openings.get(id) ?? 0) + 1)
++    try {
++      const handle = await open()
++      if (relocatable === true && this.store.get(id)?.agent === handle.agent) {
++        this.relocationHandles.set(id, handle)
++      }
++      return handle
++    } finally {
++      const count = (this.openings.get(id) ?? 1) - 1
++      if (count > 0) this.openings.set(id, count)
++      else this.openings.delete(id)
++    }
++  }
++
++  /** Release one opted-in Agent, then hold its local reopen gate until the relocation settles. */
++  async withSessionRelocation<T>(id: SessionId, options: { readonly stopRunning?: boolean }, relocate: () => Promise<T>): Promise<T> {
++    if (this.relocating.has(id)) throw relocationConflict('DSM_MOVE_IN_PROGRESS', '该会话正在移动。')
++    if (this.openings.has(id)) throw relocationConflict('DSM_SESSION_BUSY', '此会话正在打开，请稍后重试。')
++    const entry = this.store.get(id)
++    const handle = this.relocationHandles.get(id)
++    if (entry !== undefined) {
++      if (handle?.agent !== entry.agent) {
++        throw relocationConflict('DSM_SESSION_BUSY', '请在持有它的宿主关闭该会话，再重试。')
++      }
++      if (entry.agent.status !== 'idle' && options.stopRunning !== true) {
++        throw relocationConflict('DSM_SESSION_RUNNING', '会话正在运行。可以停止这一条会话后移动。')
++      }
++    }
++    this.relocating.add(id)
++    try {
++      await handle?.dispose()
++      return await relocate()
++    } finally {
++      this.relocating.delete(id)
++    }
+   }
+ 
+   /**
+@@ -490,6 +547,7 @@ export class AgentRegistry extends Service {
+     const carrier = scopeTarget(agent, agent)
+     // This is the authoritative collision boundary. Concurrent create/resume
+     // operations may both prepare, but only one exact entry can publish.
++    if (this.relocating.has(id)) throw relocationConflict('DSM_MOVE_IN_PROGRESS', '该会话正在移动。')
+     if (this.store.has(id)) throw new Error(`agent "${id}" is already registered`)
+     const entry: AgentEntry = {
+       id,
+@@ -526,6 +584,7 @@ export class AgentRegistry extends Service {
+     /* v8 ignore next -- enter() rejects replacement while this single-shot detach capability is live. */
+     if (this.store.get(entry.id) !== entry) return
+     this.store.delete(entry.id)
++    this.relocationHandles.delete(entry.id)
+     // An insertion rolled back before announce was never externally created,
+     // so emitting disposed would invent an impossible lifecycle edge. Marking
+     // happens before the created emit: if a later created listener throws,

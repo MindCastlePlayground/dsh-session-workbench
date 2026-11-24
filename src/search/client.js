@@ -104,6 +104,8 @@ export function createSearchClient(React) {
   const PANEL_ID = 'global-search'
   /** The Host route the global page posts to. */
   const GLOBAL_ROUTE = 'conversation-search/api'
+  /** Default server-paged global search page size (bounded by Host MAX_RESULT_SESSIONS). */
+  const DEFAULT_PAGE_SIZE = 20
   /** How long typing waits before a global request goes out. */
   const GLOBAL_DEBOUNCE_MS = 320
   /** The jump indicator never outlives a stalled jump. */
@@ -153,7 +155,9 @@ export function createSearchClient(React) {
     'global.railLabel': '全局搜索 · 所有会话',
     'global.placeholder': '支持模糊搜索，多个关键词用空格分隔',
     'global.subtitle': '支持检索全部会话的标题、问题、段落与文件；结果按“会话 → 问题 → 段落”展开，点击即可打开会话并定位到对应位置。',
-    'global.building': '正在建立索引…',
+    'global.building': '正在同步搜索索引…',
+    'global.includeDeleted': '包含已删除会话',
+    'global.deleted': '已删除',
     'global.ready': '索引已就绪 · 共 {count} 个会话',
     'global.scope.label': '检索范围',
     'global.scope.all': '会话 + 问题 + 段落',
@@ -224,6 +228,21 @@ export function createSearchClient(React) {
     'filters.summary.range': '{since} ~ {until}',
     'filters.summary.turns': '最近 {count} 轮',
     'filters.summary.all': '全部范围',
+    'global.coverage.ratio': '已索引 {indexed}/{total} 个会话',
+    'global.coverage.unreadable': '{count} 未读取',
+    'global.coverage.limited': '{count} 已截断',
+    'global.coverage.title': '索引覆盖范围：已索引 {indexed} / 共 {total} 个会话（未读取 {unreadable}，日志截断 {limited}）',
+    'global.section.content': '对话内容命中',
+    'global.section.titleOnly': '仅标题命中',
+    'global.badge.content': '正文命中',
+    'global.badge.titleOnly': '仅标题',
+    'global.matchSummary': '{turns} 轮 · {snippets} 条片段',
+    'global.pager.label': '搜索结果分页',
+    'global.pager.range': '第 {from}–{to} 个，共 {total} 个会话',
+    'global.pager.page': '第 {page} / {pages} 页',
+    'global.pager.prev': '上一页',
+    'global.pager.next': '下一页',
+    'global.revisionChanged': '索引已更新',
   }
 
   const en = {
@@ -260,7 +279,9 @@ export function createSearchClient(React) {
     'global.railLabel': 'Global search · all sessions',
     'global.placeholder': 'Fuzzy search; separate keywords with spaces',
     'global.subtitle': 'Search titles, questions, paragraphs, and file names across every session. Results expand as session → question → paragraph; a click opens the session at that spot.',
-    'global.building': 'Building the index…',
+    'global.building': 'Updating the search index…',
+    'global.includeDeleted': 'Include deleted sessions',
+    'global.deleted': 'Deleted',
     'global.ready': 'Index ready · {count} sessions',
     'global.scope.label': 'Scope',
     'global.scope.all': 'Session + question + paragraph',
@@ -331,6 +352,21 @@ export function createSearchClient(React) {
     'filters.summary.range': '{since} ~ {until}',
     'filters.summary.turns': 'last {count} turns',
     'filters.summary.all': 'All',
+    'global.coverage.ratio': '{indexed}/{total} sessions indexed',
+    'global.coverage.unreadable': '{count} unreadable',
+    'global.coverage.limited': '{count} truncated',
+    'global.coverage.title': 'Index coverage: {indexed} of {total} sessions indexed ({unreadable} unreadable, {limited} truncated logs)',
+    'global.section.content': 'Conversation matches',
+    'global.section.titleOnly': 'Title-only matches',
+    'global.badge.content': 'Content',
+    'global.badge.titleOnly': 'Title only',
+    'global.matchSummary': '{turns} turns · {snippets} snippets',
+    'global.pager.label': 'Search result pagination',
+    'global.pager.range': 'Showing {from}–{to} of {total} sessions',
+    'global.pager.page': 'Page {page} of {pages}',
+    'global.pager.prev': 'Previous',
+    'global.pager.next': 'Next',
+    'global.revisionChanged': 'Index updated',
   }
 
   const CSS = [
@@ -464,8 +500,28 @@ export function createSearchClient(React) {
 
   /** Result-tree rules, loaded after the base sheet so they refine the older boxes. */
   const CSS_RESULTS = [
-    '.dsh-cg-stats{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 2px 10px;color:var(--dsw-alias-label-secondary);font-size:12px}',
+    '.dsh-cg-stats{display:flex;align-items:center;gap:8px 12px;flex-wrap:wrap;padding:12px 2px 8px;color:var(--dsw-alias-label-secondary);font-size:12px;font-variant-numeric:tabular-nums}',
     '.dsh-cg-stats-text{white-space:nowrap}',
+    '.dsh-cg-coverage{display:inline-flex;align-items:center;flex-wrap:wrap;gap:6px;padding:2px 9px;border:.5px solid var(--dsw-alias-border-l2);border-radius:999px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);font-size:11.5px;line-height:1.45;font-variant-numeric:tabular-nums}',
+    '.dsh-cg-coverage--warn{border-color:color-mix(in srgb,var(--dsw-alias-state-warn-primary,#EAB308) 50%,transparent);background:color-mix(in srgb,var(--dsw-alias-state-warn-primary,#EAB308) 9%,var(--dsw-alias-bg-layer-1))}',
+    '.dsh-cg-coverage-dot{width:6px;height:6px;border-radius:50%;flex:none;background:var(--dsw-alias-state-success-primary,#2f8f4e)}',
+    '.dsh-cg-coverage--warn .dsh-cg-coverage-dot{background:var(--dsw-alias-state-warn-primary,#EAB308)}',
+    '.dsh-cg-coverage-flag{padding:0 6px;border-radius:999px;background:color-mix(in srgb,var(--dsw-alias-state-warn-primary,#EAB308) 16%,transparent);color:var(--dsw-alias-label-primary);font-size:10.5px;font-weight:500}',
+    '.dsh-cg-inline-err{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:8px 0 4px;padding:8px 12px;border:.5px solid color-mix(in srgb,var(--dsw-alias-state-error-primary) 45%,transparent);border-radius:10px;background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 8%,var(--dsw-alias-bg-layer-1));color:var(--dsw-alias-state-error-primary);font-size:12px}',
+    '.dsh-cg-inline-err button{flex:none;height:26px;padding:0 10px;border:.5px solid color-mix(in srgb,var(--dsw-alias-state-error-primary) 45%,transparent);border-radius:7px;background:transparent;color:inherit;font:inherit;font-size:11.5px;cursor:pointer}',
+    '.dsh-cg-inline-err button:hover{background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 12%,transparent)}',
+    '.dsh-cg-section-sep{display:flex;align-items:center;gap:10px;margin:6px 2px 2px;color:var(--dsw-alias-label-tertiary,var(--dsw-alias-label-secondary));font-size:11px;font-weight:600;letter-spacing:.02em}',
+    '.dsh-cg-section-sep::after{content:"";flex:1;height:.5px;background:var(--dsw-alias-border-l1)}',
+    '.dsh-cg-kind-pill{flex:none;padding:1px 7px;border-radius:999px;font-size:10.5px;font-weight:500;line-height:1.5;white-space:nowrap}',
+    '.dsh-cg-kind-pill--content{background:color-mix(in srgb,var(--dsw-alias-brand-primary) 11%,transparent);color:var(--dsw-alias-brand-primary)}',
+    '.dsh-cg-kind-pill--title{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);border:.5px solid var(--dsw-alias-border-l1)}',
+    '.dsh-cg-pager{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-top:14px;padding:10px 12px;border:.5px solid var(--dsw-alias-border-l1);border-radius:12px;background:var(--dsw-alias-bg-layer-1);font-size:12px;color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums}',
+    '.dsh-cg-pager-meta{display:flex;align-items:center;gap:10px;flex-wrap:wrap}',
+    '.dsh-cg-pager-btns{display:flex;align-items:center;gap:6px;margin-left:auto}',
+    '.dsh-cg-page-btn{display:inline-flex;align-items:center;gap:5px;height:30px;padding:0 12px;border:.5px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:inherit;font-size:12px;font-weight:500;cursor:pointer;transition:border-color .14s ease,color .14s ease,background-color .14s ease}',
+    '.dsh-cg-page-btn:hover:not(:disabled){border-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-brand-primary);background:color-mix(in srgb,var(--dsw-alias-brand-primary) 6%,var(--dsw-alias-bg-base))}',
+    '.dsh-cg-page-btn:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}',
+    '.dsh-cg-page-btn:disabled{opacity:.42;cursor:default}',
     '.dsh-filters{display:flex;align-items:center;gap:8px;flex-wrap:wrap}',
     '.dsh-filter-title{color:var(--dsw-alias-label-secondary);font-size:12px}',
     '.dsh-filter-body{display:flex;align-items:center;gap:6px;flex-wrap:wrap}',
@@ -507,38 +563,40 @@ export function createSearchClient(React) {
     */
     '.dsh-cg-refresh-btn{display:inline-flex;align-items:center;gap:5px;border:0;background:transparent}',
     '.dsh-cg-link:hover{border-color:var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}',
-    '.dsh-cg-tree{display:flex;flex-direction:column;gap:10px}',
-    '.dsh-cg-tree[data-loading="true"]{opacity:.55}',
-    '.dsh-cg-session{border:.5px solid var(--dsw-alias-border-l1);border-radius:12px;background:var(--dsw-alias-bg-layer-1);overflow:hidden}',
+    '.dsh-cg-tree{display:flex;flex-direction:column;gap:8px}',
+    '.dsh-cg-tree[data-loading="true"]{opacity:.55;transition:opacity .15s ease}',
+    '.dsh-cg-session{border:.5px solid var(--dsw-alias-border-l1);border-radius:12px;background:var(--dsw-alias-bg-layer-1);overflow:hidden;transition:border-color .14s ease}',
     '.dsh-cg-session[data-open="true"]{border-color:var(--dsw-alias-border-l2)}',
-    '.dsh-cg-session-top{display:flex;align-items:center;gap:8px;padding:9px 10px 0}',
+    '.dsh-cg-session--title-only{background:color-mix(in srgb,var(--dsw-alias-bg-layer-1) 72%,var(--dsw-alias-bg-base))}',
+    '.dsh-cg-session-top{display:flex;align-items:center;gap:8px;padding:7px 10px 0}',
     '.dsh-cg-toggle{display:flex;align-items:center;gap:7px;flex:1;min-width:0;padding:3px 4px;border:0;border-radius:8px;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}',
     '.dsh-cg-toggle:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:-2px}',
-    '.dsh-cg-session-title{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px;font-weight:600;line-height:1.45}',
-    '.dsh-cg-session-sub{display:flex;align-items:center;gap:7px;padding:3px 12px 9px 35px;color:var(--dsw-alias-label-secondary);font-size:11px;line-height:1.4}',
+    '.dsh-cg-session-title{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13.5px;font-weight:600;line-height:1.4;letter-spacing:-0.01em}',
+    '.dsh-cg-session-sub{display:flex;align-items:center;flex-wrap:wrap;gap:6px;padding:2px 12px 7px 34px;color:var(--dsw-alias-label-secondary);font-size:11px;line-height:1.4;font-variant-numeric:tabular-nums}',
     '.dsh-cg-dot{flex:none;width:2px;height:2px;border-radius:50%;background:currentColor;opacity:.6}',
     '.dsh-cg-path{max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
-    '.dsh-cg-hits{flex:none;padding:2px 8px;border-radius:999px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);font-size:11px;white-space:nowrap}',
-    '.dsh-cg-open{flex:none;height:26px;padding:0 11px;border:.5px solid var(--dsw-alias-border-l1);border-radius:8px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:12px;cursor:pointer}',
+    '.dsh-cg-hits{flex:none;padding:1.5px 7px;border-radius:999px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);font-size:11px;font-variant-numeric:tabular-nums;white-space:nowrap}',
+    '.dsh-cg-open{flex:none;height:25px;padding:0 10px;border:.5px solid var(--dsw-alias-border-l1);border-radius:8px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:11.5px;font-weight:500;cursor:pointer;transition:border-color .14s ease,color .14s ease}',
     '.dsh-cg-open:hover{border-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-brand-primary)}',
-    '.dsh-cg-questions{margin:0 8px 6px 20px;padding-left:12px;border-left:1.5px solid var(--dsw-alias-border-l1)}',
+    '.dsh-cg-open:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}',
+    '.dsh-cg-questions{margin:0 8px 6px 18px;padding-left:10px;border-left:1px solid var(--dsw-alias-border-l1)}',
     '.dsh-cg-question{border-top:.5px solid var(--dsw-alias-border-l1)}',
     '.dsh-cg-question:first-child{border-top:0}',
-    '.dsh-cg-question-row{display:flex;align-items:center;gap:8px;margin:3px 0;padding:3px 5px;border-radius:9px;background:rgba(127,127,127,.12)}',
-    '.dsh-cg-question-toggle{display:flex;align-items:center;gap:7px;flex:1;min-width:0;padding:6px;border:0;border-radius:8px;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}',
+    '.dsh-cg-question-row{display:flex;align-items:center;gap:6px;margin:2px 0;padding:2px 4px;border-radius:8px;background:color-mix(in srgb,var(--dsw-alias-bg-layer-2) 65%,transparent)}',
+    '.dsh-cg-question-toggle{display:flex;align-items:center;gap:6px;flex:1;min-width:0;padding:4px 5px;border:0;border-radius:7px;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}',
     '.dsh-cg-question-toggle:hover{background:var(--dsw-alias-bg-layer-2)}',
     '.dsh-cg-question-toggle:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:-2px}',
-    '.dsh-cg-q-tag{flex:none;color:var(--dsw-alias-brand-primary);font-size:11px;font-weight:600;white-space:nowrap}',
-    '.dsh-cg-q-text{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;line-height:1.5}',
-    '.dsh-cg-paras{display:flex;flex-direction:column;gap:4px;padding:0 6px 8px}',
-    '.dsh-cg-para{display:flex;flex-direction:column;gap:5px;width:100%;padding:8px 10px;border:.5px solid rgba(127,127,127,.28);border-radius:10px;background:var(--dsw-alias-bg-base);color:inherit;font:inherit;text-align:left;cursor:pointer;transition:background-color .12s ease,border-color .12s ease,box-shadow .12s ease}',
+    '.dsh-cg-q-tag{flex:none;color:var(--dsw-alias-brand-primary);font-size:11px;font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap}',
+    '.dsh-cg-q-text{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12.5px;line-height:1.45}',
+    '.dsh-cg-paras{display:flex;flex-direction:column;gap:3px;padding:2px 4px 6px}',
+    '.dsh-cg-para{display:flex;flex-direction:column;gap:3px;width:100%;padding:6px 9px;border:.5px solid var(--dsw-alias-border-l1);border-radius:9px;background:var(--dsw-alias-bg-base);color:inherit;font:inherit;text-align:left;cursor:pointer;transition:background-color .14s ease,border-color .14s ease,box-shadow .14s ease}',
     '.dsh-cg-para:hover{border-color:var(--dsw-alias-brand-primary);background:rgba(74,144,255,.10);box-shadow:0 1px 6px rgba(0,0,0,.06)}',
     '.dsh-cg-para--picked{border-color:var(--dsw-alias-brand-primary);background:rgba(74,144,255,.14);box-shadow:inset 3px 0 0 var(--dsw-alias-brand-primary)}',
     '.dsh-cg-para--picked:hover{background:rgba(74,144,255,.2)}',
     '.dsh-cg-para:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:-2px}',
-    '.dsh-cg-para-meta{display:flex;align-items:center;gap:7px;color:var(--dsw-alias-label-secondary);font-size:11px}',
-    '.dsh-cg-para-hits{padding:0 7px;border-radius:999px;background:color-mix(in srgb,var(--dsw-alias-brand-primary) 12%,transparent);color:var(--dsw-alias-brand-primary)}',
-    '.dsh-cg-snippet{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;font-size:13px;line-height:1.65;overflow-wrap:anywhere}',
+    '.dsh-cg-para-meta{display:flex;align-items:center;gap:6px;color:var(--dsw-alias-label-secondary);font-size:11px;font-variant-numeric:tabular-nums}',
+    '.dsh-cg-para-hits{padding:0 6px;border-radius:999px;background:color-mix(in srgb,var(--dsw-alias-brand-primary) 12%,transparent);color:var(--dsw-alias-brand-primary);font-weight:500}',
+    '.dsh-cg-snippet{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;font-size:12.5px;line-height:1.58;overflow-wrap:anywhere}',
     '.dsh-cg-files{display:flex;flex-wrap:wrap;gap:4px}',
     '.dsh-cg-page mark{padding:0 1px;border-radius:2px;background:rgba(255,199,0,.45);color:inherit}',
     '.dsh-cg-build{margin-left:8px;padding:1px 6px;border-radius:999px;border:.5px solid var(--dsw-alias-border-l1);color:var(--dsw-alias-label-secondary);font-size:11px;font-weight:400;vertical-align:middle}',
@@ -581,6 +639,8 @@ export function createSearchClient(React) {
     '.dsh-cg-mask-sub{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:var(--dsw-alias-label-secondary)}',
     '@keyframes dsh-cg-spin{to{transform:rotate(360deg)}}',
     '@keyframes dsh-cg-mask-in{from{opacity:0}to{opacity:1}}',
+    '@media (max-width:720px){.dsh-cg-head{padding:18px 16px 0}.dsh-cg-bar{padding:12px 16px 10px}.dsh-cg-body{padding:6px 16px 36px}.dsh-cg-session-top{flex-wrap:wrap}.dsh-cg-session-sub{padding-left:14px}.dsh-cg-questions{margin-left:10px;padding-left:8px}.dsh-cg-scope,.dsh-cg-page-btn,.dsh-cg-open{min-height:34px}.dsh-cg-pager{flex-direction:column;align-items:stretch}.dsh-cg-pager-btns{margin-left:0;justify-content:flex-end}.dsh-cg-stats-actions{margin-left:0;width:100%;justify-content:flex-end}}',
+    '@media (prefers-reduced-motion:reduce){.dsh-spin,.dsh-cg-progress--indeterminate .dsh-cg-progress-fill,.dsh-cg-jump,.dsh-cg-pill{animation:none}.dsh-cg-caret,.dsh-cg-para,.dsh-cg-session,.dsh-cg-page-btn,.dsh-cg-open,.dsh-csearch-item{transition:none}}',
   ].join('\n')
 
   const EMPTY_RESULTS = { groups: [], matches: 0, truncated: false }
@@ -663,12 +723,10 @@ export function createSearchClient(React) {
   }
 
   /** What the global page shows when the reader comes back to it. */
-  const globalMemory = { query: '', scope: 'all', result: null, status: 'idle', error: '', picked: '' }
+  const globalMemory = { query: '', scope: 'all', offset: 0, result: null, status: 'idle', error: '', picked: '' }
 
   /** Recent global queries, newest first; page memory only, never persisted. */
   const recentQueries = []
-  /** The Host index is warmed once per page load, not on every visit to the page. */
-  let warmStarted = false
 
   function recordRecent(query) {
     const index = recentQueries.indexOf(query)
@@ -2504,11 +2562,13 @@ export function createSearchClient(React) {
     return payload.value
   }
 
-  /** Ask the Host for one page of global results; `refresh` forces a corpus rebuild. */
-  function fetchGlobalSearch(query, scope, signal, refresh, filters) {
+  /** Ask the Host for one page of global results. */
+  function fetchGlobalSearch(query, scope, signal, filters, offset, pageSize, revision) {
     const body = { action: 'search', query, scope }
-    if (refresh === true) body.refresh = true
     if (filters !== undefined) body.filters = filters
+    if (typeof offset === 'number' && Number.isFinite(offset) && offset >= 0) body.offset = Math.floor(offset)
+    if (typeof pageSize === 'number' && Number.isFinite(pageSize) && pageSize > 0) body.pageSize = Math.floor(pageSize)
+    if (Number.isInteger(revision) && offset > 0) body.revision = revision
     return postGlobal(body, signal)
   }
 
@@ -2526,7 +2586,7 @@ export function createSearchClient(React) {
   /** Ask the Host for the saved filter window. */
   async function fetchFilters(signal) {
     const value = await postGlobal({ action: 'filters' }, signal)
-    return normalizeFilters(value.filters)
+    return { ...normalizeFilters(value.filters), includeDeleted: value.filters?.includeDeleted === true }
   }
 
   /** Persist the filter window; a failure keeps the in-page value. */
@@ -2544,15 +2604,34 @@ export function createSearchClient(React) {
     return parts.slice(-2).join('/')
   }
 
+  /** Order sessions so conversation-text matches always precede title-only matches. */
+  function prioritizeSessions(raw) {
+    const list = Array.isArray(raw) ? raw : []
+    const content = []
+    const titleOnly = []
+    for (const session of list) {
+      if (session !== null && typeof session === 'object' && Array.isArray(session.questions) && session.questions.length > 0) {
+        content.push(session)
+      } else if (session !== null && typeof session === 'object') {
+        titleOnly.push(session)
+      }
+    }
+    return { ordered: content.concat(titleOnly), contentCount: content.length, titleOnlyCount: titleOnly.length }
+  }
+
   /** Session and question keys a fresh result starts expanded. */
   function defaultOpen(result) {
     const open = new Set()
     if (result === null || !Array.isArray(result.sessions)) return open
-    /* Only the first couple of Sessions start expanded: enough to read, cheap to paint. */
-    const limit = result.sessions.length <= 2 ? result.sessions.length : 2
-    for (const session of result.sessions.slice(0, limit)) {
+    const { ordered } = prioritizeSessions(result.sessions)
+    /* Expand the top conversation-text matches right away so grouped snippets are scannable. */
+    let expandedCount = 0
+    for (const session of ordered) {
+      if (!Array.isArray(session.questions) || session.questions.length === 0) continue
+      if (expandedCount >= 3) break
       open.add('s:' + session.id)
-      for (const question of session.questions || []) open.add('q:' + session.id + ':' + question.seq)
+      for (const question of session.questions) open.add('q:' + session.id + ':' + question.seq)
+      expandedCount += 1
     }
     return open
   }
@@ -2744,8 +2823,13 @@ export function createSearchClient(React) {
     if (!container || typeof container.querySelectorAll !== 'function') return false
     const rows = Array.prototype.slice.call(container.querySelectorAll('[data-csearch-row]'))
     if (rows.length === 0) return false
-    const current = rows.indexOf(document.activeElement)
-    const next = current < 0 ? (delta > 0 ? 0 : rows.length - 1) : Math.min(rows.length - 1, Math.max(0, current + delta))
+    let next
+    if (delta === 'first') next = 0
+    else if (delta === 'last') next = rows.length - 1
+    else {
+      const current = rows.indexOf(document.activeElement)
+      next = current < 0 ? (delta > 0 ? 0 : rows.length - 1) : Math.min(rows.length - 1, Math.max(0, current + delta))
+    }
     const row = rows[next]
     if (row === undefined) return false
     row.focus()
@@ -3477,6 +3561,7 @@ export function createSearchClient(React) {
 
     const [query, setQuery] = useState(() => globalMemory.query)
     const [scope, setScope] = useState(() => globalMemory.scope)
+    const [offset, setOffset] = useState(() => (typeof globalMemory.offset === 'number' && globalMemory.offset > 0 ? globalMemory.offset : 0))
     const [status, setStatus] = useState(() => globalMemory.status)
     const [result, setResult] = useState(() => globalMemory.result)
     const [error, setError] = useState(() => globalMemory.error)
@@ -3484,7 +3569,11 @@ export function createSearchClient(React) {
     const [recent, setRecent] = useState(() => recentQueries.slice())
     const [filters, setFilters] = useState(() => defaultFilters())
     const [tick, setTick] = useState(0)
-    const [refreshing, setRefreshing] = useState(false)
+    const [indexAttempt, setIndexAttempt] = useState(0)
+    const [refreshing, setRefreshing] = useState(true)
+    const [indexError, setIndexError] = useState('')
+    const [includeDeleted, setIncludeDeleted] = useState(false)
+    const [revisionUpdated, setRevisionUpdated] = useState(false)
     /* First-build progress, polled from the Host while the corpus is still being assembled. */
     const [build, setBuild] = useState(null)
     const [indexBuilt, setIndexBuilt] = useState(null)
@@ -3496,10 +3585,29 @@ export function createSearchClient(React) {
       if (!snapshot.active) setPendingRow('')
     }), [])
     const abortRef = useRef(null)
+    const requestSeqRef = useRef(0)
+    const pageRevisionRef = useRef(
+      globalMemory.result !== null && typeof globalMemory.result.revision === 'number' ? globalMemory.result.revision : null,
+    )
     const inputRef = useRef(null)
     const bodyRef = useRef(null)
-    const forceRefresh = useRef(false)
     const lastQuery = useRef(query)
+    const debouncedQueryRef = useRef(query)
+
+    useEffect(() => {
+      const controller = new AbortController()
+      setRefreshing(true)
+      setIndexError('')
+      postGlobal({ action: 'warm' }, controller.signal).then(
+        () => { if (!controller.signal.aborted) setRefreshing(false) },
+        (failure) => {
+          if (controller.signal.aborted) return
+          setIndexError(String(failure.message ?? failure))
+          setRefreshing(false)
+        },
+      )
+      return () => controller.abort()
+    }, [indexAttempt])
 
     /* The marker belongs to the search that produced it: a new query clears it. */
     useEffect(() => {
@@ -3529,13 +3637,13 @@ export function createSearchClient(React) {
           },
         )
       }
-      tick()
+      if (!indexError) tick()
       return () => {
         cancelled = true
         controller.abort()
         if (timer !== null) clearTimeout(timer)
       }
-    }, [refreshing])
+    }, [refreshing, indexError])
 
     /* One-shot "index ready" confirmation: only on the false -> true edge, never on remount. */
     const builtBefore = useRef(null)
@@ -3550,26 +3658,45 @@ export function createSearchClient(React) {
     }, [indexBuilt, build, t])
 
     useEffect(() => {
+      if (refreshing || indexError) return undefined
       const trimmed = query.trim()
+      const queryChanged = debouncedQueryRef.current !== query
+      debouncedQueryRef.current = query
+      if (abortRef.current !== null) {
+        abortRef.current.abort()
+        abortRef.current = null
+      }
+      const reqId = ++requestSeqRef.current
       if (trimmed === '') {
+        pageRevisionRef.current = null
+        setRevisionUpdated(false)
         setStatus('idle')
         setResult(null)
         setError('')
         globalMemory.status = 'idle'
         globalMemory.result = null
         globalMemory.error = ''
+        globalMemory.offset = 0
         return undefined
       }
-      if (abortRef.current !== null) abortRef.current.abort()
       const controller = new AbortController()
       abortRef.current = controller
-      const force = forceRefresh.current
-      forceRefresh.current = false
+      const delay = queryChanged ? GLOBAL_DEBOUNCE_MS : 0
       const timer = setTimeout(() => {
+        if (controller.signal.aborted || reqId !== requestSeqRef.current) return
         setStatus('loading')
-        fetchGlobalSearch(trimmed, scope, controller.signal, force, filters).then(
+        fetchGlobalSearch(trimmed, scope, controller.signal, { ...filters, includeDeleted }, offset, DEFAULT_PAGE_SIZE, pageRevisionRef.current).then(
           (value) => {
-            if (controller.signal.aborted) return
+            if (controller.signal.aborted || reqId !== requestSeqRef.current) return
+            /* Track index revision across pages so an index rebuild mid-pagination is visible. */
+            const nextRevision = value !== null && typeof value.revision === 'number' ? value.revision : null
+            if (offset === 0) {
+              pageRevisionRef.current = nextRevision
+              setRevisionUpdated(false)
+            } else if (nextRevision !== null && pageRevisionRef.current !== null && nextRevision !== pageRevisionRef.current) {
+              pageRevisionRef.current = nextRevision
+              setRevisionUpdated(true)
+            }
             /* The Host owns the persisted history; fall back to local memory if it has none. */
             if (Array.isArray(value.recent)) {
               recentQueries.length = 0
@@ -3580,29 +3707,31 @@ export function createSearchClient(React) {
             setRecent(recentQueries.slice())
             setResult(value)
             setStatus('ready')
-            setRefreshing(false)
             setError('')
             setExpanded(defaultOpen(value))
             globalMemory.result = value
             globalMemory.status = 'ready'
             globalMemory.error = ''
+            globalMemory.offset = offset
           },
           (failure) => {
-            if (controller.signal.aborted) return
+            if (controller.signal.aborted || reqId !== requestSeqRef.current) return
             const message =
               failure !== null && typeof failure === 'object' && typeof failure.message === 'string'
                 ? failure.message
                 : String(failure)
             setStatus('error')
-            setRefreshing(false)
             setError(message)
             globalMemory.status = 'error'
             globalMemory.error = message
           },
         )
-      }, GLOBAL_DEBOUNCE_MS)
-      return () => clearTimeout(timer)
-    }, [query, scope, tick, filters])
+      }, delay)
+      return () => {
+        clearTimeout(timer)
+        controller.abort()
+      }
+    }, [query, scope, tick, filters, offset, refreshing, indexError, includeDeleted])
 
     /* Highlight the words the RESULTS matched, not what is being typed right now: typing must
        not rebuild the whole tree while the next request is in flight. */
@@ -3611,38 +3740,55 @@ export function createSearchClient(React) {
       return normalizeWords(source)
     }, [result])
 
-    const onChange = useCallback((event) => {
-      const next = event.target.value
-      setQuery(next)
-      globalMemory.query = next
+    const resetPage = useCallback(() => {
+      setOffset(0)
+      globalMemory.offset = 0
+      setRevisionUpdated(false)
     }, [])
 
-    const chooseScope = useCallback((id) => {
-      setScope(id)
-      globalMemory.scope = id
-    }, [])
+    const onChange = useCallback(
+      (event) => {
+        const next = event.target.value
+        setQuery(next)
+        globalMemory.query = next
+        resetPage()
+      },
+      [resetPage],
+    )
+
+    const chooseScope = useCallback(
+      (id) => {
+        setScope(id)
+        globalMemory.scope = id
+        resetPage()
+      },
+      [resetPage],
+    )
 
     const submit = useCallback(() => {
       setTick((value) => value + 1)
     }, [])
 
-    const refresh = useCallback(() => {
-      forceRefresh.current = true
-      setRefreshing(true)
-      setTick((value) => value + 1)
-    }, [])
-
     /* The window is a preference: debounce the write so typing a date or a count is cheap. */
+    const filtersRef = useRef(filters)
+    filtersRef.current = filters
     const filterSaveTimer = useRef(null)
-    const applyFilters = useCallback((next) => {
-      const normalized = normalizeFilters(next)
-      setFilters((current) => (sameFilters(current, normalized) ? current : normalized))
-      if (filterSaveTimer.current !== null) clearTimeout(filterSaveTimer.current)
-      filterSaveTimer.current = setTimeout(() => {
-        filterSaveTimer.current = null
-        saveFilters(normalized)
-      }, 400)
-    }, [])
+    const applyFilters = useCallback(
+      (next) => {
+        const normalized = normalizeFilters(next)
+        if (!sameFilters(filtersRef.current, normalized)) {
+          filtersRef.current = normalized
+          setFilters(normalized)
+          resetPage()
+        }
+        if (filterSaveTimer.current !== null) clearTimeout(filterSaveTimer.current)
+        filterSaveTimer.current = setTimeout(() => {
+          filterSaveTimer.current = null
+          saveFilters({ ...normalized, includeDeleted })
+        }, 400)
+      },
+      [resetPage, includeDeleted],
+    )
     useEffect(
       () => () => {
         if (filterSaveTimer.current !== null) clearTimeout(filterSaveTimer.current)
@@ -3650,10 +3796,14 @@ export function createSearchClient(React) {
       [],
     )
 
-    const pickRecent = useCallback((value) => {
-      setQuery(value)
-      globalMemory.query = value
-    }, [])
+    const pickRecent = useCallback(
+      (value) => {
+        setQuery(value)
+        globalMemory.query = value
+        resetPage()
+      },
+      [resetPage],
+    )
 
     const expandAll = useCallback(() => {
       const sessions = result !== null && Array.isArray(result.sessions) ? result.sessions : []
@@ -3670,21 +3820,27 @@ export function createSearchClient(React) {
     }, [])
 
     const onListKeyDown = useCallback((event) => {
-      if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return
-      if (moveRowFocus(event.currentTarget, event.key === 'ArrowDown' ? 1 : -1)) event.preventDefault()
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        if (moveRowFocus(event.currentTarget, event.key === 'ArrowDown' ? 1 : -1)) event.preventDefault()
+        return
+      }
+      if (event.key === 'Home' || event.key === 'End') {
+        if (moveRowFocus(event.currentTarget, event.key === 'Home' ? 'first' : 'last')) event.preventDefault()
+        return
+      }
+      if (event.key === 'Escape') {
+        const input = inputRef.current
+        if (input !== null && typeof input.focus === 'function') {
+          event.preventDefault()
+          input.focus()
+        }
+      }
     }, [])
 
     /* A search page opens ready to type. */
     useEffect(() => {
       const input = inputRef.current
       if (input !== null && typeof input.focus === 'function') input.focus()
-    }, [])
-
-    /* Warm the Host index in the background, so the first query is not the one paying for it. */
-    useEffect(() => {
-      if (warmStarted) return
-      warmStarted = true
-      postGlobal({ action: 'warm' }).catch(() => {})
     }, [])
 
     /* Pull the persisted history once; a failure keeps whatever memory already holds. */
@@ -3712,7 +3868,10 @@ export function createSearchClient(React) {
       let cancelled = false
       fetchFilters(controller.signal).then(
         (next) => {
-          if (!cancelled) setFilters((current) => (sameFilters(current, next) ? current : next))
+          if (!cancelled) {
+            setFilters((current) => (sameFilters(current, next) ? current : next))
+            setIncludeDeleted(next.includeDeleted === true)
+          }
         },
         () => {},
       )
@@ -3738,9 +3897,10 @@ export function createSearchClient(React) {
           event.stopPropagation()
           setQuery('')
           globalMemory.query = ''
+          resetPage()
         }
       },
-      [query, submit],
+      [query, submit, resetPage],
     )
 
     const toggle = useCallback((key) => {
@@ -3832,6 +3992,7 @@ export function createSearchClient(React) {
           key: question.seq + ':' + paragraph.index,
           'data-csearch-row': '',
           title: t('jump.paraHint'),
+          disabled: session.deleted === true,
           onClick: () => openParagraph(session, question, paragraph),
         },
         h(
@@ -3894,6 +4055,7 @@ export function createSearchClient(React) {
               className: 'dsh-cg-question-toggle',
               'data-csearch-row': '',
               title: t('jump.paraHint'),
+              disabled: session.deleted === true,
               onClick: () => openQuestion(session, question),
             },
             h('span', { className: 'dsh-cg-caret-space' }),
@@ -3908,7 +4070,7 @@ export function createSearchClient(React) {
           { className: 'dsh-cg-question-row' },
           head,
           hidden > 0 ? h('span', { className: 'dsh-cg-hits' }, t('global.paragraph.more', { count: hidden })) : null,
-          expandable
+          expandable || session.deleted
             ? null
             : h(
                 'button',
@@ -3954,13 +4116,21 @@ export function createSearchClient(React) {
       const questions = Array.isArray(session.questions) ? session.questions : []
       const canExpand = questions.length > 0
       let hits = session.matched ? 1 : 0
+      let snippetCount = 0
       for (const question of questions) {
         if (question.matched) hits += 1
-        for (const paragraph of question.paragraphs || []) hits += typeof paragraph.hits === 'number' && paragraph.hits > 0 ? paragraph.hits : 1
+        const paras = Array.isArray(question.paragraphs) ? question.paragraphs : []
+        snippetCount += paras.length
+        for (const paragraph of paras) hits += typeof paragraph.hits === 'number' && paragraph.hits > 0 ? paragraph.hits : 1
       }
       return h(
         'section',
-        { className: 'dsh-cg-session', key: session.id, 'data-open': open ? 'true' : 'false' },
+        {
+          className: canExpand ? 'dsh-cg-session' : 'dsh-cg-session dsh-cg-session--title-only',
+          key: session.id,
+          'data-open': open ? 'true' : 'false',
+          'data-match-kind': canExpand ? 'content' : 'title',
+        },
         h(
           'div',
           { className: 'dsh-cg-session-top' },
@@ -3981,13 +4151,25 @@ export function createSearchClient(React) {
                 h('span', { className: 'dsh-cg-session-title', title }, markSegments(segmentsOf(title, resultWords))),
               )
             : h(
-                'div',
-                { className: 'dsh-cg-toggle', 'data-csearch-row': '' },
-                h('span', { className: 'dsh-cg-caret-space' }),
+                'button',
+                {
+                  type: 'button',
+                  className: 'dsh-cg-toggle',
+                  'data-csearch-row': '',
+                  title: t('global.session.open'),
+                  disabled: session.deleted === true,
+                  onClick: () => openSession(session),
+                },
+                pendingRow === 's:' + session.id ? spinner('sm') : h('span', { className: 'dsh-cg-caret-space' }),
                 h('span', { className: 'dsh-cg-session-title', title }, markSegments(segmentsOf(title, resultWords))),
               ),
+          !canExpand && session.matched
+            ? h('span', { className: 'dsh-cg-kind-pill dsh-cg-kind-pill--title' }, t('global.badge.titleOnly'))
+            : null,
           hits > 0 ? h('span', { className: 'dsh-cg-hits' }, t('global.resultCount', { count: hits })) : null,
-          h('button', { type: 'button', className: 'dsh-cg-open', onClick: () => openSession(session) }, t('open')),
+          session.deleted
+            ? h('span', { className: 'dsh-cg-kind-pill' }, t('global.deleted'))
+            : h('button', { type: 'button', className: 'dsh-cg-open', onClick: () => openSession(session) }, t('open')),
         ),
         h(
           'div',
@@ -3999,19 +4181,72 @@ export function createSearchClient(React) {
             null,
             t('global.session.counts', { questions: session.questionTotal, paragraphs: session.paragraphTotal }),
           ),
+          canExpand && (questions.length > 0 || snippetCount > 0)
+            ? h('span', { className: 'dsh-cg-dot' })
+            : null,
+          canExpand && (questions.length > 0 || snippetCount > 0)
+            ? h('span', null, t('global.matchSummary', { turns: questions.length, snippets: snippetCount }))
+            : null,
         ),
         open && canExpand ? h('div', { className: 'dsh-cg-questions' }, questions.map((question) => questionBlock(session, question))) : null,
       )
     }
 
     const stats = result !== null && result.stats !== null && typeof result.stats === 'object' ? result.stats : null
-    const sessions = result !== null && Array.isArray(result.sessions) ? result.sessions : []
+    const coverage = result !== null && result.coverage !== null && typeof result.coverage === 'object' ? result.coverage : null
+    const { ordered: sessions, contentCount, titleOnlyCount } = useMemo(
+      () => prioritizeSessions(result !== null ? result.sessions : []),
+      [result],
+    )
+    const effectivePageSize =
+      result !== null && typeof result.pageSize === 'number' && result.pageSize > 0 ? result.pageSize : DEFAULT_PAGE_SIZE
+    const activeOffset = result !== null && typeof result.offset === 'number' && result.offset >= 0 ? result.offset : offset
+    const totalMatches =
+      result !== null && typeof result.totalMatches === 'number'
+        ? result.totalMatches
+        : stats !== null && typeof stats.sessions === 'number'
+          ? stats.sessions
+          : sessions.length
+    const nextOffset = result !== null && typeof result.nextOffset === 'number' ? result.nextOffset : null
+    const showPager = sessions.length > 0 && (activeOffset > 0 || nextOffset !== null || totalMatches > sessions.length)
+    const pageFrom = sessions.length > 0 ? activeOffset + 1 : 0
+    const pageTo = activeOffset + sessions.length
+    const currentPage = Math.floor(activeOffset / effectivePageSize) + 1
+    const totalPages = Math.max(currentPage, Math.ceil(Math.max(totalMatches, pageTo) / effectivePageSize))
+
+    const scrollBodyTop = useCallback(() => {
+      const el = bodyRef.current
+      if (el !== null && typeof el.scrollTop === 'number') el.scrollTop = 0
+    }, [])
+    const goPrevPage = useCallback(() => {
+      if (status === 'loading' || activeOffset <= 0) return
+      const prev = Math.max(0, activeOffset - effectivePageSize)
+      setOffset(prev)
+      globalMemory.offset = prev
+      scrollBodyTop()
+    }, [status, activeOffset, effectivePageSize, scrollBodyTop])
+    const goNextPage = useCallback(() => {
+      if (status === 'loading' || nextOffset === null) return
+      setOffset(nextOffset)
+      globalMemory.offset = nextOffset
+      scrollBodyTop()
+    }, [status, nextOffset, scrollBodyTop])
 
     /* One element tree per (result, expansion): status pulses and typing never rebuild it. */
-    const tree = useMemo(
-      () => (result === null ? null : (Array.isArray(result.sessions) ? result.sessions : []).map((session) => sessionBlock(session))),
-      [result, expanded, resultWords, openTarget],
-    )
+    const tree = useMemo(() => {
+      if (result === null) return null
+      const items = []
+      let sepInserted = false
+      for (const session of sessions) {
+        const isTitleOnly = !Array.isArray(session.questions) || session.questions.length === 0
+        if (isTitleOnly && !sepInserted && contentCount > 0 && titleOnlyCount > 0) {
+          sepInserted = true
+          items.push(h('div', { className: 'dsh-cg-section-sep', key: 'sep:title-only' }, t('global.section.titleOnly')))
+        }
+        items.push(sessionBlock(session))
+      }
+      return items
+    }, [result, sessions, contentCount, titleOnlyCount, expanded, resultWords, openTarget, pendingRow, picked])
 
     const progressPercent =
       build !== null && build.total > 0 ? Math.min(100, Math.round((build.done / build.total) * 100)) : 0
@@ -4060,6 +4295,73 @@ export function createSearchClient(React) {
             h('span', { className: 'dsh-cg-progress-text' }, t('global.building')),
           )
 
+    const coverageBadge =
+      coverage !== null
+        ? (() => {
+            const indexed = Number(coverage.indexed) || 0
+            const total = Number(coverage.total) || indexed
+            const unreadable = Number(coverage.unreadable) || 0
+            const limited = Number(coverage.limited) || 0
+            const hasWarn = unreadable > 0 || limited > 0
+            const titleText = t('global.coverage.title', { indexed, total, unreadable, limited })
+            return h(
+              'span',
+              {
+                className: hasWarn ? 'dsh-cg-coverage dsh-cg-coverage--warn' : 'dsh-cg-coverage',
+                title: titleText,
+                'aria-label': titleText,
+              },
+              h('span', { className: 'dsh-cg-coverage-dot', 'aria-hidden': 'true' }),
+              h('span', null, t('global.coverage.ratio', { indexed, total })),
+              unreadable > 0
+                ? h('span', { className: 'dsh-cg-coverage-flag' }, t('global.coverage.unreadable', { count: unreadable }))
+                : null,
+              limited > 0
+                ? h('span', { className: 'dsh-cg-coverage-flag' }, t('global.coverage.limited', { count: limited }))
+                : null,
+            )
+          })()
+        : null
+
+    const pagerBar = showPager
+      ? h(
+          'nav',
+          { className: 'dsh-cg-pager', 'aria-label': t('global.pager.label') },
+          h(
+            'span',
+            { className: 'dsh-cg-pager-meta' },
+            h('span', null, t('global.pager.range', { from: pageFrom, to: pageTo, total: totalMatches })),
+            h('span', { className: 'dsh-cg-dot', 'aria-hidden': 'true' }),
+            h('span', null, t('global.pager.page', { page: currentPage, pages: totalPages })),
+            revisionUpdated ? h('span', { className: 'dsh-cg-coverage-flag' }, t('global.revisionChanged')) : null,
+          ),
+          h(
+            'span',
+            { className: 'dsh-cg-pager-btns' },
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'dsh-cg-page-btn',
+                disabled: status === 'loading' || activeOffset <= 0,
+                onClick: goPrevPage,
+              },
+              t('global.pager.prev'),
+            ),
+            h(
+              'button',
+              {
+                type: 'button',
+                className: 'dsh-cg-page-btn',
+                disabled: status === 'loading' || nextOffset === null,
+                onClick: goNextPage,
+              },
+              t('global.pager.next'),
+            ),
+          ),
+        )
+      : null
+
     let body
     if (query.trim() === '' || status === 'idle') {
       body = h(
@@ -4081,7 +4383,7 @@ export function createSearchClient(React) {
     } else if (status === 'error' && result === null) {
       body = h(
         'div',
-        { className: 'dsh-cg-state' },
+        { className: 'dsh-cg-state', role: 'alert' },
         h('strong', null, t('global.error')),
         h('span', { className: 'dsh-cg-error-text' }, error),
         h('button', { type: 'button', className: 'dsh-cg-submit', onClick: submit }, t('global.retry')),
@@ -4089,14 +4391,14 @@ export function createSearchClient(React) {
     } else if (result === null) {
       body = h(
         'div',
-        { className: 'dsh-cg-state' },
+        { className: 'dsh-cg-state', role: 'status', 'aria-live': 'polite' },
         h('div', { className: 'dsh-cg-state dsh-cg-state--row' }, spinner(), h('span', null, t('global.loading'))),
         buildBar,
       )
     } else if (sessions.length === 0) {
       body = h(
         'div',
-        { className: 'dsh-cg-state' },
+        { className: 'dsh-cg-state', role: 'status' },
         h('strong', null, t('global.empty')),
         h('span', null, t('global.emptyBody')),
         scope === 'all'
@@ -4107,7 +4409,16 @@ export function createSearchClient(React) {
       body = h(
         'div',
         { className: 'dsh-cg-tree', 'data-loading': status === 'loading' ? 'true' : 'false' },
+        status === 'error' && error !== ''
+          ? h(
+              'div',
+              { className: 'dsh-cg-inline-err', role: 'alert' },
+              h('span', null, t('global.error') + '：' + error),
+              h('button', { type: 'button', onClick: submit }, t('global.retry')),
+            )
+          : null,
         tree,
+        pagerBar,
       )
     }
 
@@ -4163,6 +4474,7 @@ export function createSearchClient(React) {
                     onClick: () => {
                       setQuery('')
                       globalMemory.query = ''
+                      resetPage()
                       const input = inputRef.current
                       if (input !== null && typeof input.focus === 'function') input.focus()
                     },
@@ -4191,28 +4503,42 @@ export function createSearchClient(React) {
           ),
         ),
         filterBarWide(t, filters, applyFilters),
+        h('label', { className: 'dsh-cg-scope-label' },
+          h('input', { type: 'checkbox', checked: includeDeleted, onChange: (event) => {
+            setIncludeDeleted(event.target.checked)
+            resetPage()
+            saveFilters({ ...filters, includeDeleted: event.target.checked })
+          } }),
+          ' ', t('global.includeDeleted'),
+        ),
       ),
       h(
         'div',
         { className: 'dsh-cg-body', ref: bodyRef, onKeyDown: onListKeyDown },
-        stats === null
+        stats === null && coverageBadge === null
           ? null
           : h(
               'div',
-              { className: 'dsh-cg-stats' },
-              h(
-                'span',
-                { className: 'dsh-cg-stats-text' },
-                t('global.stats', {
-                  sessions: stats.sessions,
-                  questions: stats.questions,
-                  paragraphs: stats.paragraphs,
-                  ms: stats.tookMs,
-                }),
-              ),
-              h('span', { className: 'dsh-cg-stats-text' }, t('global.indexed', { count: stats.indexed })),
+              { className: 'dsh-cg-stats', 'aria-live': 'polite' },
+              stats === null
+                ? null
+                : h(
+                    'span',
+                    { className: 'dsh-cg-stats-text' },
+                    t('global.stats', {
+                      sessions: totalMatches,
+                      questions: stats.questions,
+                      paragraphs: stats.paragraphs,
+                      ms: stats.tookMs,
+                    }),
+                  ),
+              coverageBadge !== null
+                ? coverageBadge
+                : stats !== null
+                  ? h('span', { className: 'dsh-cg-stats-text' }, t('global.indexed', { count: stats.indexed }))
+                  : null,
               /* Debug only: the numbers the next performance round has to move. */
-              debugEnabled()
+              debugEnabled() && stats !== null
                 ? h('span', { className: 'dsh-cg-stats-text' }, `build ${stats.buildMs || 0}ms · match ${stats.matchMs || 0}ms · jump ${jumpTiming.lastMs}ms`)
                 : null,
               h('span', { className: 'dsh-cg-stats-text' }, t('global.scopeHint.' + scope)),
@@ -4220,50 +4546,26 @@ export function createSearchClient(React) {
               status === 'loading' && !refreshing
                 ? h('span', { className: 'dsh-cg-pulse' }, spinner('sm'), t('global.loading'))
                 : null,
-              stats.truncated ? h('span', { className: 'dsh-cg-stats-text' }, t('global.truncated', { count: stats.sessions })) : null,
+              stats !== null && stats.truncated && !showPager
+                ? h('span', { className: 'dsh-cg-stats-text' }, t('global.truncated', { count: stats.sessions }))
+                : null,
               sessions.length === 0
                 ? null
                 : h(
                     'span',
                     { className: 'dsh-cg-stats-actions' },
-                    /* The refresh is usually instant (nothing new to index), so a bar would flash
-                       and push the row around; the button alone reports the state. The bar markup
-                       is kept below, commented, for when the corpus is big enough to warrant it. */
-                    h(
-                      'button',
-                      {
-                        type: 'button',
-                        className: 'dsh-cg-link dsh-cg-refresh-btn',
-                        disabled: refreshingNow,
-                        onClick: refresh,
-                      },
-                      refreshingNow ? spinner('sm') : null,
-                      refreshingNow ? t('global.refreshing') : t('global.refresh'),
-                      /*
-                      refreshingNow
-                        ? h(
-                            'span',
-                            { className: 'dsh-cg-btn-track' },
-                            h('span', {
-                              className:
-                                build !== null && build.total > 0
-                                  ? 'dsh-cg-btn-progress'
-                                  : 'dsh-cg-btn-progress dsh-cg-btn-progress--indeterminate',
-                              style:
-                                build !== null && build.total > 0
-                                  ? { width: Math.min(100, Math.round((build.done / build.total) * 100)) + '%' }
-                                  : undefined,
-                            }),
-                          )
-                        : null,
-                      */
-                    ),
                     h('button', { type: 'button', className: 'dsh-cg-link', onClick: expandAll }, t('expandAll')),
                     h('button', { type: 'button', className: 'dsh-cg-link', onClick: collapseAll }, t('collapseAll')),
                   ),
             ),
         stats === null || sessions.length === 0 ? null : h('div', { className: 'dsh-cg-legend' }, t('global.legend')),
-        firstBuild ? progressBlock : body,
+        indexError
+          ? h('div', { className: 'dsh-cg-state', role: 'alert' },
+              h('strong', null, t('global.error')),
+              h('span', { className: 'dsh-cg-error-text' }, indexError),
+              h('button', { type: 'button', className: 'dsh-cg-submit', onClick: () => setIndexAttempt(attempt => attempt + 1) }, t('global.retry')),
+            )
+          : refreshing || firstBuild ? progressBlock : body,
       ),
     )
   }

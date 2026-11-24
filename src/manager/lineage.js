@@ -174,3 +174,46 @@ export function classifyLineage(header) {
 export function emptyScanCandidate(sizeBytes) {
   return Number.isFinite(sizeBytes) && sizeBytes <= EMPTY_DECODE_LIMIT
 }
+
+// DSH persists the inclusive source cut as inheritedEventCount = atSeq + 1.
+export function groupBranchPoints(events, branches) {
+  const cuts = new Map()
+  const unanchored = []
+  for (const { inheritedEventCount, child } of branches) {
+    const index = inheritedEventCount - 1
+    if (!Number.isSafeInteger(inheritedEventCount) || events[index]?.seq !== index) {
+      unanchored.push(child)
+      continue
+    }
+    let point = cuts.get(index)
+    if (!point) {
+      point = { atSeq: index, recordIndex: index, turn: null, messageId: null, children: [] }
+      cuts.set(index, point)
+    }
+    point.children.push(child)
+  }
+
+  let turn = null
+  let messageId = null
+  for (const event of events) {
+    if (!event) continue
+    if (event.type === 'turn/start') {
+      turn = event.data?.turn ?? null
+      messageId = null
+    } else if (event.type === 'assistant/message' && turn !== null && (event.data?.turn ?? turn) === turn) {
+      messageId = event.data?.message?.id ?? null
+    }
+    const point = cuts.get(event.seq)
+    if (point && event.type === 'user/message') point.messageId = event.data?.id ?? null
+    if (point && event.type === 'assistant/message') point.messageId = event.data?.message?.id ?? null
+    if (point && Number.isSafeInteger(turn) && event.type === 'turn/end' && event.data?.turn === turn) {
+      point.turn = turn
+      point.messageId = messageId
+    }
+    if (event.type === 'turn/end') {
+      turn = null
+      messageId = null
+    }
+  }
+  return { points: [...cuts.values()].sort((a, b) => a.atSeq - b.atSeq), unanchored }
+}

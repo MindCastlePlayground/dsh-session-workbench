@@ -20,14 +20,15 @@ export function register(ctx, name, description, properties, required, run, opti
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
     },
     ...options,
-    async execute(args, { agent, signal }) {
+    async execute(args, runtime) {
+      const { agent, signal } = runtime
       signal.throwIfAborted()
       const caller = agent?.session?.header
       if (!caller?.id || caller.origin === 'subagent') {
         throw failure('SESSION_SCOPE', 'Use this tool from an independent session.')
       }
       validate(args, properties, required)
-      return run(args, caller, signal)
+      return run(args, caller, signal, runtime)
     },
   })
 }
@@ -40,10 +41,20 @@ function validate(args, properties, required) {
     if (!Object.hasOwn(args, key)) throw failure('INVALID_ARGS', `${key} is required.`)
   }
   for (const [key, value] of Object.entries(args)) {
-    const spec = Object.hasOwn(properties, key) && properties[key]
-    const valid = spec && (spec.type === 'string'
-      ? typeof value === 'string' && value.trim().length >= spec.minLength && value.length <= spec.maxLength
-      : Number.isSafeInteger(value) && value >= spec.minimum && value <= (spec.maximum ?? Number.MAX_SAFE_INTEGER))
-    if (!valid) throw failure('INVALID_ARGS', `Invalid ${key}.`)
+    const spec = Object.hasOwn(properties, key) ? properties[key] : undefined
+    if (!isValidArgument(value, spec)) throw failure('INVALID_ARGS', 'Invalid ' + key + '.')
+  }
+}
+
+function isValidArgument(value, spec) {
+  switch (spec?.type) {
+    case 'string':
+      return typeof value === 'string' && value.trim().length >= spec.minLength && value.length <= spec.maxLength
+    case 'boolean':
+      return typeof value === 'boolean'
+    case 'integer':
+      return Number.isSafeInteger(value) && value >= spec.minimum && value <= (spec.maximum ?? Number.MAX_SAFE_INTEGER)
+    default:
+      return false
   }
 }

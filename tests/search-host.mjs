@@ -589,8 +589,9 @@ check('a fresh instance reads the saved window', JSON.parse(savedWindow).value.f
 const stored = logs.find((entry) => entry.id === 's1')
 const added = makeSession('s1', null, stored.header.cwd, [{ user: 'stored refresh marker' }]).events[0]
 stored.events.push({ ...added, seq: stored.events.at(-1).seq + 1 })
-const storedRefresh = await post({ action: 'search', query: 'stored refresh marker', refresh: true })
-check('forced refresh re-reads a changed stored log', storedRefresh.body.value?.sessions.some((session) => session.id === 's1'))
+await post({ action: 'warm' })
+const storedRefresh = await post({ action: 'search', query: 'stored refresh marker' })
+check('opening search re-reads a changed stored log', storedRefresh.body.value?.sessions.some((session) => session.id === 's1'))
 
 await Promise.all([
   post({ action: 'search', query: 'concurrent marker one' }),
@@ -604,6 +605,25 @@ for (const marker of ['concurrent marker one', 'concurrent marker two']) {
 
 const unknownScope = await post({ action: 'search', query: '侧边栏', scope: 'constructor' })
 check('unrecognized search scope uses all', unknownScope.body.value?.scope === 'all')
+
+
+for (let index = 0; index < 425; index += 1) {
+  const log = makeSession('scale-' + String(index).padStart(3, '0'), 'Other thread', '/search-scale', [
+    { user: 'Some question', replies: [{ text: 'archive-wide reply marker' + (index === 424 ? ' unique overflow hit' : '') }] },
+  ])
+  log.header.createdAt = 999 - index
+  logs.push(log)
+}
+const scaleRequest = { action: 'search', query: 'archive-wide reply marker', pageSize: 30, filters: { turns: 0 } }
+await post({ action: 'warm' })
+const scaleFirst = (await post(scaleRequest)).body.value
+const scaleSecond = (await post({ ...scaleRequest, offset: scaleFirst.nextOffset, revision: scaleFirst.revision })).body.value
+const scaleLast = (await post({ ...scaleRequest, offset: 420, revision: scaleFirst.revision })).body.value
+const cold = (await post({ ...scaleRequest, query: 'unique overflow hit' })).body.value
+check('pagination reports all 425 body hits', scaleFirst.totalMatches === 425 && scaleFirst.nextOffset === 30)
+check('the second page has 30 distinct results', scaleSecond.sessions.length === 30 && !scaleSecond.sessions.some(row => scaleFirst.sessions.some(first => first.id === row.id)))
+check('the last page includes cold sessions and terminates', scaleLast.sessions.length === 5 && scaleLast.nextOffset === null && scaleLast.sessions.at(-1)?.id === 'scale-424')
+check('assistant content outside the hot cache remains searchable', cold.sessions[0]?.id === 'scale-424' && cold.totalMatches === 1 && cold.coverage.indexed > 400)
 
 fs.rmSync(profileDir, { recursive: true, force: true })
 

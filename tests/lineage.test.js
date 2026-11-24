@@ -4,7 +4,7 @@ import { Readable } from 'node:stream'
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { classifyLineage, emptyScanCandidate, isEmptyLogSize, isEmptyEventTypes, subagentDescendantsOf, EMPTY_DECODE_LIMIT } from '../src/manager/lineage.js'
+import { groupBranchPoints, classifyLineage, emptyScanCandidate, isEmptyLogSize, isEmptyEventTypes, subagentDescendantsOf, EMPTY_DECODE_LIMIT } from '../src/manager/lineage.js'
 
 // ---- 纯函数：空白判定阈值（实测基线见 src/lineage.js 注释）------------------
 
@@ -352,4 +352,26 @@ test('subagentDescendantsOf caps pathological trees', () => {
   // 0 / 负数 / NaN 一律回落到默认上限，不会变成「不删任何后代」。
   assert.equal(subagentDescendantsOf(headers, 'p', 0).length, 10)
   assert.equal(subagentDescendantsOf(headers, 'p', -5).length, 10)
+})
+
+test('groups every child of an exact fork cut and keeps older uncertain forks separate', () => {
+  const events = [
+    { seq: 0, type: 'turn/start', data: { turn: 7 } },
+    { seq: 1, type: 'assistant/message', data: { turn: 7, message: { id: 'assistant-7' } } },
+    { seq: 2, type: 'turn/end', data: { turn: 7 } },
+    { seq: 3, type: 'session/title', data: { title: 'later' } },
+  ]
+  const result = groupBranchPoints(events, [
+    { inheritedEventCount: 3, child: { id: 'fork-a' } },
+    { inheritedEventCount: 3, child: { id: 'fork-b' } },
+    { inheritedEventCount: 4, child: { id: 'fork-other' } },
+    { inheritedEventCount: 255, child: { id: 'legacy-fork' } },
+  ])
+  assert.deepEqual(result, {
+    points: [
+      { atSeq: 2, recordIndex: 2, turn: 7, messageId: 'assistant-7', children: [{ id: 'fork-a' }, { id: 'fork-b' }] },
+      { atSeq: 3, recordIndex: 3, turn: null, messageId: null, children: [{ id: 'fork-other' }] },
+    ],
+    unanchored: [{ id: 'legacy-fork' }],
+  })
 })

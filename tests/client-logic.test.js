@@ -1,6 +1,33 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { analyzeMoveSource, filterMoveWorkspaces, formatSingleMoveResult, isMoveDestinationBlocked, summarizeBatchMoveResult } from '../src/manager/client/logic.js'
 import { aliveSessionCount, applyTagFilter, ascBranchTime, authoritativeTitleForFirstPaint, branchTimeKey, canDropOnWorkspace, collapsedVisibleTotal, countRenderedVisible, dragAutoScrollStep, effectiveTitleOf, filterShapeFromSaved, filterSnapshotOf, foldBranches, foldOrphanSubagents, foldSubagents, matchWorkspaceFilter, moveNoticeText, noticeToastPlan, openSubagentToast, overflowPlan, pathTail, remainingRows, sessionForNodes, shortId, shouldHideEmptyGroup, starredOf, tagDeleteConfirm, titleBackfillDecision, TOAST_MAX_MS, TOAST_MIN_MS, toastDurationFor, workspaceForNodes, WS_GONE, WS_UNGROUPED } from '../src/manager/client/logic.js'
+
+test('blocks the current workspace only when all selected sessions are already there', () => {
+  const a = { workspacePath: '/source/' }
+  const b = { workspacePath: '/destination' }
+  assert.equal(isMoveDestinationBlocked('/source', analyzeMoveSource([a, a])), true)
+  assert.equal(isMoveDestinationBlocked('/source', analyzeMoveSource([a, b])), false)
+  assert.equal(isMoveDestinationBlocked('/source', analyzeMoveSource([a, {}])), false)
+  assert.equal(isMoveDestinationBlocked('H:/test/source', analyzeMoveSource([{ workspacePath: 'h:\\Test\\Source\\' }])), true)
+})
+
+test('finds move destinations by project title and by directory path', () => {
+  const workspaces = [{ title: '项目甲', path: '/home/src' }, { title: '项目乙', path: '/tmp/demo' }]
+  assert.deepEqual(filterMoveWorkspaces(workspaces, ' 项目甲 '), [workspaces[0]])
+  assert.deepEqual(filterMoveWorkspaces(workspaces, 'TMP/DEMO'), [workspaces[1]])
+  assert.deepEqual(filterMoveWorkspaces(workspaces, '不存在'), [])
+})
+
+test('keeps queued, already present and failed sessions out of the newly moved count', () => {
+  const failed = [{ sessionId: 'failed', error: 'missing' }]
+  const result = summarizeBatchMoveResult({ moved: 3, already: 1, queued: ['busy'], failed })
+  assert.deepEqual([result.movedCount, result.alreadyCount, result.queuedCount, result.failedCount], [2, 1, 1, 1])
+  assert.deepEqual(result.failedItems, failed)
+  assert.equal(summarizeBatchMoveResult({ moved: 2 }).movedCount, 2)
+  assert.equal(formatSingleMoveResult({ queued: true }).status, 'queued')
+  assert.equal(formatSingleMoveResult({ already: true }).status, 'already')
+})
 
 test('authoritative title only corrects the first cold paint', () => {
   assert.equal(authoritativeTitleForFirstPaint({ firstPaint: true, rendered: '旧 header', authoritative: '最新标题' }), '最新标题')

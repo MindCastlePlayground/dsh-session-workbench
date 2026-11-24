@@ -155,7 +155,11 @@ export const TOAST_MAX_MS = 11000
 export function toastDurationFor(text, kind) {
   const chars = String(text == null ? '' : text).length
   const readingMs = Math.round((chars / 6) * 1000 * 1.4)
-  const scaled = kind === 'err' ? Math.round(readingMs * 1.25) : readingMs
+  const scaled = kind === 'err'
+    ? Math.round(readingMs * 1.25)
+    : kind === 'warn'
+      ? Math.round(readingMs * 1.15)
+      : readingMs
   return Math.min(TOAST_MAX_MS, Math.max(TOAST_MIN_MS, scaled))
 }
 
@@ -641,4 +645,461 @@ export function overflowPlan(text, more) {
     more: remaining,
     changed: true,
   }
+}
+
+// —— 会话移动目的地选择与结果反馈（纯函数，可 node --test）——
+
+export const QUEUE_RETRY_HINT = '不会自动重试，请手动重试或取消'
+
+export const MOVE_ERR_RUNNING = 'DSM_SESSION_RUNNING'
+export const MOVE_ERR_BUSY = 'DSM_SESSION_BUSY'
+export const MOVE_ERR_IN_PROGRESS = 'DSM_MOVE_IN_PROGRESS'
+
+export function classifyMoveError(err) {
+  const code = err && typeof err === 'object' && typeof err.code === 'string' ? err.code : ''
+  const raw = String((err && typeof err === 'object' ? err.message || err.error : err) || '').trim()
+  if (code === MOVE_ERR_RUNNING) {
+    return {
+      code,
+      canStopAndMove: true,
+      canRetry: false,
+      message: '该会话正在运行中，无法直接移动。可点击“停止并移动”中止当前运行并立即移动。',
+    }
+  }
+  if (code === MOVE_ERR_BUSY) {
+    return {
+      code,
+      canStopAndMove: false,
+      canRetry: true,
+      message: '该会话正被其他持有方占用，请在持有方关闭或释放后手动重试。',
+    }
+  }
+  if (code === MOVE_ERR_IN_PROGRESS) {
+    return {
+      code,
+      canStopAndMove: false,
+      canRetry: false,
+      message: '该会话已有另一项移动正在进行中，请等待其完成后再试。',
+    }
+  }
+  return {
+    code,
+    canStopAndMove: false,
+    canRetry: false,
+    message: raw || '移动失败',
+  }
+}
+
+export function normalizeWorkspacePath(p) {
+  if (typeof p !== 'string') return ''
+  const path = p.trim()
+  if (/^[A-Za-z]:[\\/]/.test(path) || path.startsWith('\\\\')) {
+    const windowsPath = path.replaceAll('\\', '/').toLowerCase()
+    return /^[a-z]:\/+$/i.test(windowsPath) ? windowsPath.slice(0, 3) : windowsPath.replace(/\/+$/, '')
+  }
+  return path === '/' ? path : path.replace(/\/+$/, '')
+}
+
+export function sameWorkspacePath(a, b) {
+  const na = normalizeWorkspacePath(a)
+  const nb = normalizeWorkspacePath(b)
+  return !!na && na === nb
+}
+
+/**
+ * 分析待移动会话集合的工作区分布。
+ * 只有当全部选中会话都位于同一个已知工作区时，才将 `blockedPath` 设为该路径（禁选该目的地）。
+ */
+export function analyzeMoveSource(items) {
+  const list = Array.isArray(items) ? items.filter((x) => x && typeof x === 'object') : []
+  const countByPath = new Map()
+  let ungroupedCount = 0
+  for (const item of list) {
+    const norm = normalizeWorkspacePath(item.workspacePath)
+    if (!norm) {
+      ungroupedCount++
+      continue
+    }
+    countByPath.set(norm, (countByPath.get(norm) || 0) + 1)
+  }
+  const distinctPaths = [...countByPath.keys()]
+  const total = list.length
+  const blockedPath = total > 0 && ungroupedCount === 0 && distinctPaths.length === 1 ? distinctPaths[0] : null
+  return {
+    total,
+    countByPath,
+    ungroupedCount,
+    distinctPaths,
+    blockedPath,
+  }
+}
+
+export function isMoveDestinationBlocked(targetPath, sourceInfo) {
+  return !!(sourceInfo && sourceInfo.blockedPath && sameWorkspacePath(targetPath, sourceInfo.blockedPath))
+}
+
+export function filterMoveWorkspaces(workspaces, query) {
+  const list = Array.isArray(workspaces) ? workspaces.filter((w) => w && typeof w === 'object') : []
+  const needle = String(query == null ? '' : query).trim().toLocaleLowerCase()
+  if (!needle) return list
+  return list.filter((w) => {
+    const title = String(w.title || '').toLocaleLowerCase()
+    const path = String(w.path || '').toLocaleLowerCase()
+    const tail = pathTail(w.path).toLocaleLowerCase()
+    return title.includes(needle) || path.includes(needle) || tail.includes(needle)
+  })
+}
+
+export function formatSingleMoveResult(result, { title = '', targetLabel = '' } = {}) {
+  const r = result && typeof result === 'object' ? result : {}
+  const dest = String(targetLabel || r.workspaceTitle || pathTail(r.workspacePath) || r.workspacePath || '目标工作区')
+  const cleanTitle = String(title || '').trim()
+  const subject = cleanTitle ? `「${cleanTitle}」` : ''
+  const notes = Array.isArray(r.notes)
+    ? r.notes.map((x) => String(x || '').trim()).filter(Boolean)
+    : []
+  if (r.queued) {
+    return {
+      status: 'queued',
+      queued: true,
+      already: false,
+      moved: false,
+      kind: 'err',
+      text: `${subject}未能立即移动（目标：${dest}），请稍后手动重试`,
+    }
+  }
+  if (r.already) {
+    return {
+      status: 'already',
+      queued: false,
+      already: true,
+      moved: false,
+      kind: 'ok',
+      text: `${subject}已在「${dest}」，无需移动`,
+    }
+  }
+  const base = subject ? `已把${subject}移到「${dest}」` : `已移到「${dest}」`
+  if (notes.length > 0) {
+    return {
+      status: 'moved',
+      queued: false,
+      already: false,
+      moved: true,
+      kind: 'warn',
+      text: `${base}（提示：${notes.join(' ')}）`,
+    }
+  }
+  return {
+    status: 'moved',
+    queued: false,
+    already: false,
+    moved: true,
+    kind: 'ok',
+    text: base,
+  }
+}
+
+export function summarizeBatchMoveResult(result, { targetLabel = '' } = {}) {
+  const r = result && typeof result === 'object' ? result : {}
+  const dest = String(targetLabel || pathTail(r.workspacePath) || r.workspacePath || '目标工作区')
+  const rawMovedNum = Number(r.moved)
+  const rawMoved = Number.isFinite(rawMovedNum) && rawMovedNum > 0 ? Math.floor(rawMovedNum) : 0
+  const hasAlready = r.already != null && r.already !== '' && Number.isFinite(Number(r.already))
+  const alreadyCount = hasAlready ? Math.min(rawMoved, Math.max(0, Math.floor(Number(r.already)))) : 0
+  const movedCount = hasAlready ? Math.max(0, rawMoved - alreadyCount) : rawMoved
+  const queuedIds = Array.isArray(r.queued) ? r.queued.map(String) : []
+  const queuedCount = queuedIds.length
+  const failedItems = Array.isArray(r.failed) ? r.failed : []
+  const failedCount = failedItems.length
+  const runningItems = failedItems.filter((item) => item && item.code === MOVE_ERR_RUNNING)
+
+  const parts = []
+  if (movedCount > 0) parts.push(`已移动 ${movedCount} 个`)
+  if (alreadyCount > 0) parts.push(`已在目标 ${alreadyCount} 个`)
+  if (queuedCount > 0) parts.push(`未立即完成 ${queuedCount} 个`)
+  if (failedCount > 0) parts.push(`失败 ${failedCount} 个`)
+  const countsText = parts.length ? parts.join('，') : '未移动任何会话'
+  const kind = (failedCount > 0 || queuedCount > 0) ? 'err' : 'ok'
+
+  let text
+  if (movedCount > 0 && alreadyCount === 0 && queuedCount === 0 && failedCount === 0) {
+    text = `已移动 ${movedCount} 个会话至「${dest}」`
+  } else if (alreadyCount > 0 && movedCount === 0 && queuedCount === 0 && failedCount === 0) {
+    text = `${alreadyCount} 个会话已在「${dest}」，无需移动`
+  } else {
+    text = `目标「${dest}」：${countsText}`
+  }
+
+  return {
+    movedCount,
+    alreadyCount,
+    queuedCount,
+    failedCount,
+    queuedIds,
+    failedItems,
+    runningItems,
+    hasAlready,
+    countsText,
+    kind,
+    text,
+  }
+}
+
+// —— 侧栏分支树索引（纯函数，无 DOM）——
+// 仅纳入普通 fork 分支（parentSession 非空且 origin !== 'subagent'），严格区分于子代理；
+// 过滤已删除/墓碑节点，防自指与成环。
+export function buildForkTreeIndex(lineage, excludedIds) {
+  const excluded = excludedIds instanceof Set ? excludedIds : new Set()
+  const entries = lineage instanceof Map
+    ? [...lineage.entries()]
+    : (lineage && typeof lineage === 'object' ? Object.entries(lineage) : [])
+
+  const parentOf = new Map()
+  const childrenOf = new Map()
+  for (const [rawId, info] of entries) {
+    if (!info || typeof info !== 'object') continue
+    if (info.origin === 'subagent') continue
+    const id = String(rawId)
+    const parent = info.parentSession ? String(info.parentSession) : ''
+    if (!id || !parent || parent === id) continue
+    if (excluded.has(id) || excluded.has(parent)) continue
+    parentOf.set(id, parent)
+    if (!childrenOf.has(parent)) childrenOf.set(parent, [])
+    childrenOf.get(parent).push(id)
+  }
+
+  const depthOf = (id, maxDepth = 6) => {
+    const start = String(id || '')
+    if (!start || !parentOf.has(start)) return 0
+    const seen = new Set([start])
+    let cur = start
+    let depth = 0
+    while (depth < maxDepth) {
+      const p = parentOf.get(cur)
+      if (!p || seen.has(p)) break
+      seen.add(p)
+      depth++
+      cur = p
+    }
+    return depth
+  }
+
+  const descendantsOf = (rootId, maxDepth = 4, maxNodes = 200) => {
+    const root = String(rootId || '')
+    if (!root) return []
+    const out = []
+    const visited = new Set([root])
+    const walk = (pid, depth) => {
+      if (depth > maxDepth || out.length >= maxNodes) return
+      const kids = childrenOf.get(pid) || []
+      for (const cid of kids) {
+        if (visited.has(cid) || out.length >= maxNodes) continue
+        visited.add(cid)
+        out.push({ id: cid, parentId: pid, depth })
+        walk(cid, depth + 1)
+      }
+    }
+    walk(root, 1)
+    return out
+  }
+
+  return { parentOf, childrenOf, depthOf, descendantsOf }
+}
+
+// —— 对话内精确分支锚点解析（绝不猜测、绝不用原始序号索引渲染 DOM）——
+
+export function branchPointKey(point) {
+  if (!point || typeof point !== 'object') return ''
+  const seq = Number.isSafeInteger(point.atSeq) ? point.atSeq : (Number.isSafeInteger(point.recordIndex) ? point.recordIndex : null)
+  const turn = Number.isSafeInteger(point.turn) ? point.turn : ''
+  const msg = typeof point.messageId === 'string' ? point.messageId : ''
+  return `${seq === null ? '' : seq}|${turn}|${msg}`
+}
+
+function chatNodeTurn(node) {
+  const loc = node && node.location
+  if (!loc || typeof loc !== 'object') return null
+  if (loc.kind !== 'turn' && loc.kind !== 'step') return null
+  const turn = loc.turn && loc.turn.turn
+  return Number.isSafeInteger(turn) ? turn : null
+}
+
+function chatNodeMessageId(node) {
+  if (!node || typeof node !== 'object') return null
+  if (typeof node.messageId === 'string' && node.messageId) return node.messageId
+  const data = node.data
+  if (!data || typeof data !== 'object') return null
+  if (typeof data.messageId === 'string' && data.messageId) return data.messageId
+  if (data.message && typeof data.message === 'object' && typeof data.message.id === 'string' && data.message.id) return data.message.id
+  if (typeof data.id === 'string' && data.id) return data.id
+  return null
+}
+
+function chatNodeEndSeq(node) {
+  if (!node || typeof node !== 'object') return null
+  if (Number.isSafeInteger(node.endSeq)) return node.endSeq
+  if (Number.isSafeInteger(node.lastSeq)) return node.lastSeq
+  const end = node.location && node.location.turn && node.location.turn.end
+  if (end && Number.isSafeInteger(end.seq)) return end.seq
+  return null
+}
+
+/**
+ * 将后端返回的单个精确分支点匹配到已加载的 `useChat` 节点键（对应 DOM `data-chat-node-key`）。
+ * 严禁使用 `recordIndex` 作为渲染数组/DOM 序号；无法确信匹配时返回 null，交由会话级披露展示。
+ */
+export function resolveBranchPointAnchor(point, order, nodes) {
+  if (!point || typeof point !== 'object' || !Array.isArray(order) || !order.length || !nodes) return null
+  const getNode = typeof nodes.get === 'function' ? (k) => nodes.get(k) : (k) => nodes[k]
+  const wantMsgId = typeof point.messageId === 'string' && point.messageId ? point.messageId : null
+  const wantTurn = Number.isSafeInteger(point.turn) ? point.turn : null
+  const wantSeq = Number.isSafeInteger(point.atSeq) ? point.atSeq : null
+
+  // 1) 精确 messageId 匹配（最高置信度）
+  if (wantMsgId) {
+    for (const key of order) {
+      const node = getNode(key)
+      if (!node) continue
+      if (chatNodeMessageId(node) === wantMsgId) {
+        return { nodeKey: String(node.key || key), confidence: 'messageId' }
+      }
+    }
+  }
+
+  // 2) 经过后端校验的原生 turn/end 轮次尾部（匹配该轮最后一个 assistant-step）
+  if (wantTurn !== null) {
+    let lastAssistant = null
+    let turnClosed = false
+    let hasLaterTurn = false
+    let observedTurnEndSeq = null
+    for (const key of order) {
+      const node = getNode(key)
+      if (!node) continue
+      const t = chatNodeTurn(node)
+      if (t === null) continue
+      if (t > wantTurn) {
+        hasLaterTurn = true
+        continue
+      }
+      if (t !== wantTurn) continue
+      const turnMeta = node.location && node.location.turn
+      if (turnMeta && turnMeta.status === 'closed') turnClosed = true
+      if (turnMeta && turnMeta.end && Number.isSafeInteger(turnMeta.end.seq)) {
+        observedTurnEndSeq = turnMeta.end.seq
+      }
+      if (node.kind === 'assistant-step' || node.kind === 'assistant') {
+        lastAssistant = { key: String(node.key || key), node }
+      }
+    }
+    if (lastAssistant) {
+      const nodeMsgId = chatNodeMessageId(lastAssistant.node)
+      const msgConflicts = Boolean(wantMsgId && nodeMsgId && nodeMsgId !== wantMsgId)
+      const seqConflicts = Boolean(wantSeq !== null && observedTurnEndSeq !== null && observedTurnEndSeq !== wantSeq)
+      if (!msgConflicts && !seqConflicts && (turnClosed || hasLaterTurn || (wantSeq !== null && observedTurnEndSeq === wantSeq))) {
+        return { nodeKey: lastAssistant.key, confidence: 'turn-tail' }
+      }
+    }
+  }
+
+  // 3) 精确事件 seq 匹配（仅在单节点精确命中且无冲突时采用）
+  if (wantSeq !== null) {
+    const seqHits = []
+    for (const key of order) {
+      const node = getNode(key)
+      if (!node) continue
+      const endSeq = chatNodeEndSeq(node)
+      const anchorSeq = Number.isSafeInteger(node.anchorSeq) ? node.anchorSeq : null
+      const dataSeq = node.data && Number.isSafeInteger(node.data.seq) ? node.data.seq : null
+      if (endSeq === wantSeq || anchorSeq === wantSeq || dataSeq === wantSeq) {
+        const nodeMsgId = chatNodeMessageId(node)
+        if (wantMsgId && nodeMsgId && nodeMsgId !== wantMsgId) continue
+        seqHits.push(String(node.key || key))
+      }
+    }
+    if (seqHits.length === 1) {
+      return { nodeKey: seqHits[0], confidence: 'seq' }
+    }
+  }
+
+  return null
+}
+
+/**
+ * 将后端分支点匹配到官方 `conversation.chat.assistant-actions` 槽位 props。
+ * 同样禁止使用序号猜测：只认精确 messageId / 校验后的 turn / 精确 endSeq。
+ */
+export function matchPointToActionSlot(points, slotProps) {
+  if (!Array.isArray(points) || !points.length || !slotProps || typeof slotProps !== 'object') return null
+  const node = slotProps.node && typeof slotProps.node === 'object' ? slotProps.node : null
+  const message = slotProps.message && typeof slotProps.message === 'object' ? slotProps.message : null
+  const slotMsgId =
+    (typeof slotProps.messageId === 'string' && slotProps.messageId) ||
+    (message && typeof message.id === 'string' && message.id) ||
+    chatNodeMessageId(node) ||
+    null
+  const rawTurn =
+    (Number.isSafeInteger(slotProps.turn) && slotProps.turn) ||
+    (Number.isSafeInteger(slotProps.turnNumber) && slotProps.turnNumber) ||
+    (slotProps.turn && Number.isSafeInteger(slotProps.turn.turn) && slotProps.turn.turn) ||
+    chatNodeTurn(node)
+  const slotTurn = Number.isSafeInteger(rawTurn) ? rawTurn : null
+  const slotEndSeq =
+    (Number.isSafeInteger(slotProps.endSeq) ? slotProps.endSeq : null) ??
+    (Number.isSafeInteger(slotProps.turnEndSeq) ? slotProps.turnEndSeq : null) ??
+    chatNodeEndSeq(node)
+
+  if (slotMsgId) {
+    const exact = points.find((p) => p && typeof p.messageId === 'string' && p.messageId === slotMsgId)
+    if (exact) return exact
+  }
+  if (slotTurn !== null) {
+    const byTurn = points.find((p) => {
+      if (!p || !Number.isSafeInteger(p.turn) || p.turn !== slotTurn) return false
+      if (slotMsgId && typeof p.messageId === 'string' && p.messageId && p.messageId !== slotMsgId) return false
+      if (slotEndSeq !== null && Number.isSafeInteger(p.atSeq) && slotEndSeq !== p.atSeq) return false
+      return true
+    })
+    if (byTurn) return byTurn
+  }
+  if (slotEndSeq !== null) {
+    const bySeq = points.find((p) => {
+      if (!p || !Number.isSafeInteger(p.atSeq) || p.atSeq !== slotEndSeq) return false
+      if (slotMsgId && typeof p.messageId === 'string' && p.messageId && p.messageId !== slotMsgId) return false
+      return true
+    })
+    if (bySeq) return bySeq
+  }
+  return null
+}
+
+/**
+ * 将 `/archived-sessions/branch-points` 响应划分为：
+ * - slotAnchored: 已由官方 assistant-actions 槽位内联渲染
+ * - domAnchored:  已精确锚定到当前加载的 `[data-chat-node-key]`
+ * - unloadedPoints: 有精确分支点但当前视口未加载或无法确信定位（进会话级披露）
+ * - unanchored:   后端未找到源锚点的子分支（进会话级披露，显式标注未定位）
+ */
+export function partitionBranchPoints(data, order, nodes, slotRenderedKeys) {
+  const points = data && Array.isArray(data.points) ? data.points.filter((p) => p && Array.isArray(p.children) && p.children.length > 0) : []
+  const unanchored = data && Array.isArray(data.unanchored) ? data.unanchored.filter((c) => c && c.id) : []
+  const renderedInSlot = slotRenderedKeys instanceof Set ? slotRenderedKeys : new Set()
+  const slotAnchored = []
+  const domAnchored = []
+  const unloadedPoints = []
+
+  for (const point of points) {
+    const key = branchPointKey(point)
+    if (renderedInSlot.has(key)) {
+      slotAnchored.push({ point, pointKey: key })
+      continue
+    }
+    const resolved = resolveBranchPointAnchor(point, order, nodes)
+    if (resolved && resolved.nodeKey) {
+      domAnchored.push({ point, pointKey: key, nodeKey: resolved.nodeKey, confidence: resolved.confidence })
+    } else {
+      unloadedPoints.push({ point, pointKey: key })
+    }
+  }
+
+  return { slotAnchored, domAnchored, unloadedPoints, unanchored }
 }

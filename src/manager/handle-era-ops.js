@@ -24,7 +24,7 @@
 // FIRST"）并持有到 agent 卸载，于是「在 DSH 里点开过的会话」一律处于占用态。
 // 这是宿主机制决定的硬约束，不是插件能绕开的判定，提示必须如实说明。
 
-import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { link, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import { rewriteFrame0CwdInMemory, scanZstdFrames } from './zstd-frame.js'
 import { deriveSessionDir, encodeSegmentFor, generationVersionOf, locateSessionArtifacts } from './handle-era-paths.js'
@@ -115,8 +115,8 @@ async function removeSourceDir(sessionDir) {
 // 在 DSH 里点开过的会话都处于被占用状态。runtime 未提供任何能远程释放该所有权
 // 的公共 API（无 unloadSession / closeSession / evict），因此插件不能替用户解锁，
 // 只能如实说明可操作的自救路径，并靠「重试」让用户切走会话后原地再试一次。
-const BUSY_MOVE_MESSAGE = '会话正被 DSH 打开，暂时无法移动；请重启 DSH 后再试。'
-const BUSY_PURGE_MESSAGE = '会话正被 DSH 打开，暂时无法彻底删除；请重启 DSH 后再试。'
+const BUSY_MOVE_MESSAGE = '会话仍由 DSH 持有。请在持有它的宿主关闭会话，再重试移动。'
+const BUSY_PURGE_MESSAGE = '会话仍由 DSH 持有。请在持有它的宿主关闭会话，再重试删除。'
 
 function conflictError(message) {
   const error = new Error(message)
@@ -161,7 +161,7 @@ async function createWithCompatibleHeader(sp, header, createOptions) {
 }
 
 function isAlreadyOwned(e) {
-  return /already owned/i.test(failureText(e))
+  return e?.name === 'SessionAlreadyOwnedError' || /already owned|written by another owner/i.test(failureText(e))
 }
 
 function isAlreadyExists(e) {
@@ -241,8 +241,12 @@ async function relocateRewrittenBackup({ sid, canonical, backupLogPath, artifact
   const targetDir = deriveSessionDir(artifacts.root, canonical, sid)
   await mkdir(targetDir, { recursive: true })
   const staged = join(targetDir, `.move-stage-${process.pid}-${Date.now()}`)
-  await writeFile(staged, rewritten, { mode: 0o600 })
-  await rename(staged, join(targetDir, artifacts.generationFiles[0]))
+  await writeFile(staged, rewritten, { mode: 0o600, flag: 'wx' })
+  try {
+    await link(staged, join(targetDir, artifacts.generationFiles[0]))
+  } finally {
+    await rm(staged, { force: true }).catch(() => {})
+  }
   return targetDir
 }
 
@@ -255,135 +259,158 @@ async function relocateRewrittenBackup({ sid, canonical, backupLogPath, artifact
 // （v0/v2 → v3）且**不删旧代**，一个会话目录里可同时有 v0/v2/v3；而官方
 // listArtifacts/findLog 会跨项目目录解析同一个 id，**任意两个目录同时持有该 id
 // 的日志（无论哪一代）都会抛 duplicate**。所以搬运必须是：
-//   探测（会发布新代，必须先做）→ 定位 → 同 id 残留清理
+//   获取并持有写句柄（可能发布新代）→ 定位 → 同 id 残留清理
 //   → **把整个源会话目录改名移开**（对官方彻底不可见，而不是只搬单个文件）
 //   → 目标侧 create+append+校验 → 成功则删除移开的源目录，失败则整体改回。
-export async function moveSessionToCwd({ sp, sid, header, canonical, events = [], inheritedEventCount = 0 }) {
-  // 1) 写所有权探测放最前：它可能发布新代，之后定位到的才是权威路径。
-  // 非「已被占用」的探测失败（后端异常等）不在此处立即上抛——先看能否定位，
-  // 定位也失败时如实回报定位错误（提示更可操作），能定位时才报告写状态未知。
-  let probeError = null
+export async function moveSessionToCwd({ sp, sid, header, canonical, events = [], inheritedEventCount = 0, onRelocated }) {
+  let lease
   try {
-    await ensureNoActiveWriter(sp, sid)
-  } catch (e) {
-    if (e && e.status === 409) throw e
-    probeError = e
-  }
-  const artifacts = await locateSessionArtifacts(sp, header)
-  if (!artifacts) {
-    const error = new Error('无法定位该会话的物理日志，已停止移动')
-    error.status = 409
+    lease = await sp.open(sid, 'write')
+  } catch (error) {
+    if (isAlreadyOwned(error)) throw conflictError(BUSY_MOVE_MESSAGE)
+    if (!await locateSessionArtifacts(sp, header)) throw conflictError('无法定位该会话的物理日志，已停止移动。')
     throw error
   }
-  if (probeError) {
-    const error = new Error('无法确认该会话是否正被写入，已停止移动：' + String((probeError && probeError.message) || probeError))
-    error.status = 409
-    throw error
-  }
-  // 数据安全守卫（最后一层保险）：源日志明显不只是头部（> 4KB），但我们拿到的事件
-  // 是空的 —— 说明读取链路出了问题。此时若继续，就是"用空事件重建日志"再删掉源目录，
-  // 等于清空会话。2026-09-10 实测过一次（0.1.5 读取返回结构变更），绝不能再发生。
-  const HEADER_ONLY_MAX = 4096
-  if (events.length === 0) {
-    let sourceBytes = null
-    try { sourceBytes = (await stat(artifacts.logPath)).size } catch (e) { sourceBytes = null }
-    if (sourceBytes !== null && sourceBytes > HEADER_ONLY_MAX) {
-      const error = new Error(
-        `移动前校验失败：源日志有 ${sourceBytes} 字节但读到 0 条事件（读取链路异常），已停止移动以免丢失会话内容。`,
-      )
+  try {
+    const artifacts = await locateSessionArtifacts(sp, lease.header ?? header)
+    if (!artifacts) {
+      const error = new Error('无法定位该会话的物理日志，已停止移动')
       error.status = 409
-      error.code = 'DSM_MOVE_EMPTY_READ'
       throw error
     }
-  }
-  // 2) 同 id 跨目录残留：空壳与被取代的旧代直接回收（会以 note 回报），
-  //    版本相同/更高的真重复拒绝移动并给出清单。必须在 rename 备份之前做——
-  //    rename 后源目录暂时变成壳，会干扰判定。
-  const siblings = await cleanSiblingCopies(artifacts.root, sid, artifacts.sessionDir, artifacts.generationVersion)
-  if (siblings.real.length > 0) {
-    const error = new Error(
-      '无法移动：在其他工作区目录发现同一会话的日志副本，请先确认保留哪一份：\n' +
-      siblings.real.map((p) => '· ' + p).join('\n')
-    )
-    error.status = 409
-    error.code = 'DSM_SESSION_DUP_LOG'
-    throw error
-  }
-  const newHeaderBase = Object.assign({}, header, { cwd: canonical })
-  // 写所有权探测可能已为旧代会话发布了当前代；探测成功后再用官方 stat 重新
-  // 采样一次 header —— 后端自己编码的 header 天然携带当前格式版本与完整词汇表
-  // （0.1.7 的 create 严格要求 header.version === 后端当前版本）。stat 失败则
-  // 保留调用方 header，交给 createWithCompatibleHeader 的错误驱动重试兜底。
-  let createHeader = newHeaderBase
-  if (typeof sp.stat === 'function') {
-    try {
-      const fresh = await sp.stat(sid)
-      if (fresh && fresh.header && fresh.header.id === sid) {
-        createHeader = Object.assign({}, fresh.header, { cwd: canonical })
+    if (lease.header?.cwd !== undefined && lease.header.cwd !== header.cwd) {
+      throw conflictError('会话已移动到其他项目，请刷新列表后重试。')
+    }
+    if (typeof lease.read === 'function') {
+      const current = []
+      for (let offset = 0;; offset += MOVE_BATCH) {
+        const result = await lease.read(offset, MOVE_BATCH)
+        const batch = Array.isArray(result) ? result : result?.events
+        if (!Array.isArray(batch)) throw new Error('无法读取移动前的会话事件。')
+        current.push(...batch)
+        if (batch.length < MOVE_BATCH) break
       }
-    } catch (e) { /* 保持调用方 header */ }
-  }
-  const firstSeq = events.length ? Number(events[0].seq) : 0
-  const replay = firstSeq !== 0 ? events.map((event, index) => ({ ...event, seq: index })) : events
-  const createOptions = header.isSeeded && Number.isSafeInteger(inheritedEventCount) && inheritedEventCount > 0
-    ? { inheritedEventCount }
-    : undefined
-  // 3) 把**整个源会话目录**移出 sessions 根，而不是只 rename 当前代那一个文件：
-  //    - 只搬单个文件会留下并存的其他代（0.1.5 的 v0/v2/v3 多代共存），
-  //    - 在本项目目录里改名也不够：官方 listSessionDirs 枚举项目目录下的**所有**
-  //      子目录（不按名字过滤），listArtifacts 会读每个目录里的日志头，仍会看到
-  //      同一个 id → duplicate。必须移到 root 之外（与回收站同级）才对官方扫描
-  //      彻底不可见。
-  const backupRoot = join(dirname(artifacts.root), 'sessions-manager-move-backup')
-  const backupDir = join(backupRoot, `${encodeSegmentFor(sid)}-${process.pid}-${Date.now()}`)
-  await mkdir(backupRoot, { recursive: true })
-  const backupLogPath = join(backupDir, basename(artifacts.logPath))
-  await rename(artifacts.sessionDir, backupDir)
-  let writer = null
-  try {
-    try {
-      writer = await createWithCompatibleHeader(sp, createHeader, createOptions)
-      for (let i = 0; i < replay.length; i += MOVE_BATCH) {
-        await writer.append(replay.slice(i, i + MOVE_BATCH))
+      events = current
+      inheritedEventCount = lease.inheritedEventCount ?? inheritedEventCount
+    }
+    // 数据安全守卫（最后一层保险）：源日志明显不只是头部（> 4KB），但我们拿到的事件
+    // 是空的 —— 说明读取链路出了问题。此时若继续，就是"用空事件重建日志"再删掉源目录，
+    // 等于清空会话。2026-09-10 实测过一次（0.1.5 读取返回结构变更），绝不能再发生。
+    const HEADER_ONLY_MAX = 4096
+    if (events.length === 0) {
+      let sourceBytes = null
+      try { sourceBytes = (await stat(artifacts.logPath)).size } catch (e) { sourceBytes = null }
+      if (sourceBytes !== null && sourceBytes > HEADER_ONLY_MAX) {
+        const error = new Error(
+          `移动前校验失败：源日志有 ${sourceBytes} 字节但读到 0 条事件（读取链路异常），已停止移动以免丢失会话内容。`,
+        )
+        error.status = 409
+        error.code = 'DSM_MOVE_EMPTY_READ'
+        throw error
       }
-      await writer.flush()
-      await writer.close()
+    }
+    // 2) 同 id 跨目录残留：空壳与被取代的旧代直接回收（会以 note 回报），
+    //    版本相同/更高的真重复拒绝移动并给出清单。必须在 rename 备份之前做——
+    //    rename 后源目录暂时变成壳，会干扰判定。
+    const siblings = await cleanSiblingCopies(artifacts.root, sid, artifacts.sessionDir, artifacts.generationVersion)
+    if (siblings.real.length > 0) {
+      const error = new Error(
+        '无法移动：在其他工作区目录发现同一会话的日志副本，请先确认保留哪一份：\n' +
+        siblings.real.map((p) => '· ' + p).join('\n')
+      )
+      error.status = 409
+      error.code = 'DSM_SESSION_DUP_LOG'
+      throw error
+    }
+    const newHeaderBase = Object.assign({}, header, { cwd: canonical })
+    // 写所有权探测可能已为旧代会话发布了当前代；探测成功后再用官方 stat 重新
+    // 采样一次 header —— 后端自己编码的 header 天然携带当前格式版本与完整词汇表
+    // （0.1.7 的 create 严格要求 header.version === 后端当前版本）。stat 失败则
+    // 保留调用方 header，交给 createWithCompatibleHeader 的错误驱动重试兜底。
+    let createHeader = newHeaderBase
+    if (typeof sp.stat === 'function') {
+      try {
+        const fresh = await sp.stat(sid)
+        if (fresh && fresh.header && fresh.header.id === sid) {
+          createHeader = Object.assign({}, fresh.header, { cwd: canonical })
+        }
+      } catch (e) { /* 保持调用方 header */ }
+    }
+    const firstSeq = events.length ? Number(events[0].seq) : 0
+    const replay = firstSeq !== 0 ? events.map((event, index) => ({ ...event, seq: index })) : events
+    const createOptions = header.isSeeded && Number.isSafeInteger(inheritedEventCount) && inheritedEventCount > 0
+      ? { inheritedEventCount }
+      : undefined
+    // 3) 把**整个源会话目录**移出 sessions 根，而不是只 rename 当前代那一个文件：
+    //    - 只搬单个文件会留下并存的其他代（0.1.5 的 v0/v2/v3 多代共存），
+    //    - 在本项目目录里改名也不够：官方 listSessionDirs 枚举项目目录下的**所有**
+    //      子目录（不按名字过滤），listArtifacts 会读每个目录里的日志头，仍会看到
+    //      同一个 id → duplicate。必须移到 root 之外（与回收站同级）才对官方扫描
+    //      彻底不可见。
+    const backupRoot = join(dirname(artifacts.root), 'sessions-manager-move-backup')
+    const backupDir = join(backupRoot, `${encodeSegmentFor(sid)}-${process.pid}-${Date.now()}`)
+    await mkdir(backupRoot, { recursive: true })
+    const backupLogPath = join(backupDir, basename(artifacts.logPath))
+    await rename(artifacts.sessionDir, backupDir)
+    let writer = null
+    let installedTarget = false
+    try {
+      await lease.close()
+      lease = null
+      try {
+        writer = await createWithCompatibleHeader(sp, createHeader, createOptions)
+        installedTarget = true
+        for (let i = 0; i < replay.length; i += MOVE_BATCH) {
+          await writer.append(replay.slice(i, i + MOVE_BATCH))
+        }
+        await writer.flush()
+      } catch (e) {
+        if (!writer && isAlreadyExists(e)) {
+          if (await sp.stat(sid)) {
+            throw conflictError('另一个宿主已打开或移动该会话，请刷新列表后重试。')
+          }
+          // 后端内存里已有同 id 记录（created-but-unmaterialized 幽灵等）：
+          // 回退到 frame0 改写搬运，不再走 create。
+          await relocateRewrittenBackup({ sid, canonical, backupLogPath, artifacts })
+          installedTarget = true
+        } else {
+          throw e
+        }
+      }
+      // 官方视角校验：新 cwd 必须生效；事件数一致（snapshot.eventCount 缺省时跳过）。
+      if (typeof sp.stat !== 'function') throw new Error('移动后无法校验：后端未提供 stat')
+      const after = await sp.stat(sid)
+      if (!after || !after.header || after.header.cwd !== canonical) {
+        throw new Error('移动后校验失败：会话工作目录未正确更新')
+      }
+      if (Number.isSafeInteger(after.eventCount) && events.length > 0 && after.eventCount !== events.length) {
+        throw new Error(`移动后校验失败：事件数不一致（源 ${events.length}，副本 ${after.eventCount}）`)
+      }
+      await onRelocated?.(after.header)
+      await writer?.close()
       writer = null
     } catch (e) {
-      if (isAlreadyExists(e)) {
-        // 后端内存里已有同 id 记录（created-but-unmaterialized 幽灵等）：
-        // 回退到 frame0 改写搬运，不再走 create。
-        await relocateRewrittenBackup({ sid, canonical, backupLogPath, artifacts })
-      } else {
-        throw e
+      // 回滚：清掉目标目录里的半成品，把整个源目录移回原位（多代日志一起复原）。
+      await closeQuietly(writer)
+      if (installedTarget) {
+        try { await rm(deriveSessionDir(artifacts.root, canonical, sid), { recursive: true, force: true }) } catch (_) {}
       }
+      try { await mkdir(dirname(artifacts.sessionDir), { recursive: true }) } catch (_) {}
+      try { await rename(backupDir, artifacts.sessionDir) } catch (_) {}
+      if (e && e.status) throw e
+      const error = new Error('移动会话日志失败：' + String((e && e.message) || e))
+      error.status = 500
+      throw error
     }
-    // 官方视角校验：新 cwd 必须生效；事件数一致（snapshot.eventCount 缺省时跳过）。
-    if (typeof sp.stat !== 'function') throw new Error('移动后无法校验：后端未提供 stat')
-    const after = await sp.stat(sid)
-    if (!after || !after.header || after.header.cwd !== canonical) {
-      throw new Error('移动后校验失败：会话工作目录未正确更新')
+    // 4) 成功：删掉移开的源目录（含全部旧代日志）。留着它等于让同一个 id 出现在
+    //    两个项目目录，下一次 create/list 立刻被后端 duplicate 检查拒绝。
+    const sourceCleanup = await removeSourceDir(backupDir)
+    return {
+      sessionDir: deriveSessionDir(artifacts.root, canonical, sid),
+      sourceCleanup,
+      reclaimedSiblings: siblings.superseded,
     }
-    if (Number.isSafeInteger(after.eventCount) && events.length > 0 && after.eventCount !== events.length) {
-      throw new Error(`移动后校验失败：事件数不一致（源 ${events.length}，副本 ${after.eventCount}）`)
-    }
-  } catch (e) {
-    // 回滚：清掉目标目录里的半成品，把整个源目录移回原位（多代日志一起复原）。
-    await closeQuietly(writer)
-    try { await rm(deriveSessionDir(artifacts.root, canonical, sid), { recursive: true, force: true }) } catch (_) {}
-    try { await mkdir(dirname(artifacts.sessionDir), { recursive: true }) } catch (_) {}
-    try { await rename(backupDir, artifacts.sessionDir) } catch (_) {}
-    if (e && e.status) throw e
-    const error = new Error('移动会话日志失败：' + String((e && e.message) || e))
-    error.status = 500
-    throw error
-  }
-  // 4) 成功：删掉移开的源目录（含全部旧代日志）。留着它等于让同一个 id 出现在
-  //    两个项目目录，下一次 create/list 立刻被后端 duplicate 检查拒绝。
-  const sourceCleanup = await removeSourceDir(backupDir)
-  return {
-    sessionDir: deriveSessionDir(artifacts.root, canonical, sid),
-    sourceCleanup,
-    reclaimedSiblings: siblings.superseded,
+  } finally {
+    if (lease) await lease.close()
   }
 }

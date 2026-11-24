@@ -11,7 +11,8 @@
  */
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { aliveSessionCount, applyTagFilter, canDropOnWorkspace, collapsedVisibleTotal, countRenderedVisible, dragAutoScrollStep, effectiveTitleOf, filterShapeFromSaved, filterSnapshotOf, foldBranches, foldOrphanSubagents, foldSubagents, matchWorkspaceFilter, noticeToastPlan, openSubagentToast, overflowPlan, pathTail, remainingRows, sessionForNodes, shortId, shouldHideEmptyGroup, starredOf, tagDeleteConfirm, titleBackfillDecision, toastDurationFor, workspaceForNodes, WS_GONE, WS_UNGROUPED } from './logic.js'
+import { aliveSessionCount, analyzeMoveSource, applyTagFilter, buildForkTreeIndex, canDropOnWorkspace, classifyMoveError, collapsedVisibleTotal, countRenderedVisible, dragAutoScrollStep, effectiveTitleOf, filterMoveWorkspaces, filterShapeFromSaved, filterSnapshotOf, foldBranches, foldOrphanSubagents, foldSubagents, formatSingleMoveResult, isMoveDestinationBlocked, matchWorkspaceFilter, MOVE_ERR_BUSY, MOVE_ERR_RUNNING, normalizeWorkspacePath, noticeToastPlan, openSubagentToast, overflowPlan, pathTail, remainingRows, sameWorkspacePath, sessionForNodes, shortId, shouldHideEmptyGroup, starredOf, summarizeBatchMoveResult, tagDeleteConfirm, titleBackfillDecision, toastDurationFor, workspaceForNodes, WS_GONE, WS_UNGROUPED } from './logic.js'
+import { installBranchPointsIntegration } from './branch-points.jsx'
 
 export const inject = ['slots']
 
@@ -42,7 +43,15 @@ body[data-ds-dark-theme] .archv{color-scheme:dark}
 .archv-count{font-size:11px;font-weight:600;color:var(--dsw-alias-label-secondary);background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);border-radius:999px;padding:1px 8px;flex:none}
 .archv-sub{font-size:12px;line-height:1.55;color:var(--dsw-alias-label-tertiary);margin:0 0 12px;max-width:64ch}
 .archv-err{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 12px;border:1px solid color-mix(in srgb,var(--dsw-alias-state-error-primary) 40%,transparent);background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 8%,transparent);border-radius:var(--dsm-radius-sheet);color:var(--dsw-alias-state-error-primary);font-size:12px;margin-bottom:10px}
-.archv-errretry{appearance:none;border:1px solid color-mix(in srgb,var(--dsw-alias-state-error-primary) 45%,transparent);background:transparent;color:inherit;border-radius:8px;padding:4px 10px;font-size:11px;cursor:pointer;flex:none}
+.archv-errretry{appearance:none;border:1px solid color-mix(in srgb,var(--dsw-alias-state-error-primary) 45%,transparent);background:transparent;color:inherit;border-radius:8px;padding:4px 10px;font-size:11px;font-weight:500;cursor:pointer;flex:none;white-space:nowrap}
+.archv-errretry:hover:not(:disabled){background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 12%,transparent)}
+.archv-errretry:disabled{opacity:.5;cursor:default}
+.archv-err-acts{display:inline-flex;align-items:center;gap:6px;flex:none}
+.archv-warn-btn{color:var(--dsw-alias-state-error-primary);border-color:color-mix(in srgb,var(--dsw-alias-state-error-primary) 50%,transparent);background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 10%,transparent);font-weight:600}
+.archv-warn-btn:hover:not(:disabled){background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 18%,transparent);color:var(--dsw-alias-state-error-primary)}
+.dsm-pending-item{display:flex;flex-direction:column;gap:4px;padding:6px 0;border-bottom:1px solid var(--dsw-alias-border-l1)}
+.dsm-pending-item:last-child{border-bottom:none}
+.dsm-pending-err{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:5px 8px;border-radius:7px;border:1px solid color-mix(in srgb,var(--dsw-alias-state-error-primary) 38%,transparent);background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 7%,transparent);color:var(--dsw-alias-state-error-primary);font-size:11.5px;line-height:1.45}
 .sess-fwrap{margin:0 0 12px}
 .sess-filter{display:flex;align-items:center;gap:6px}
 /* 低频分类（已收藏/空白/回收站）横向收纳：默认 max-width:0 隐藏，点按箭头
@@ -142,25 +151,71 @@ body[data-ds-dark-theme] .archv{color-scheme:dark}
 @keyframes archv-pop{from{opacity:0;transform:translateX(-50%) translateY(10px)}}
 /* 失败提示用警示色 + 加粗，并停留更久（需要用户读完去做下一步操作）。 */
 .archv-status-err{border-color:var(--dsw-alias-state-error-primary);color:var(--dsw-alias-state-error-primary);font-weight:500}
-@media (prefers-reduced-motion:reduce){.archv-skel-card::after{animation:none}.archv-card,.archv-btn,.archv-star{transition:none}.archv-star:hover,.archv-star:active{transform:none}.archv-status,.archv-spin{animation:none}}
-@media (max-width:640px){.archv-card{flex-direction:column;align-items:stretch;gap:10px}.archv-actions{justify-content:flex-end}.sess-tools,.sess-tools-4,.sess-tools-5{grid-template-columns:1fr}.sess-fbtn,.archv-btn{min-height:40px}.archv-star{width:30px;height:30px}.archv-star svg{width:22px;height:22px}.dsm-kids{margin-left:10px}.archv-titlerow{flex-wrap:wrap}.dsm-kid-row{flex-wrap:wrap}.dsm-kid-acts{margin-left:0}}
+.archv-status-warn{border-color:color-mix(in srgb,var(--dsw-alias-state-warn-primary,#EAB308) 65%,transparent);background:linear-gradient(color-mix(in srgb,var(--dsw-alias-state-warn-primary,#EAB308) 10%,transparent),color-mix(in srgb,var(--dsw-alias-state-warn-primary,#EAB308) 10%,transparent)),var(--dsw-alias-bg-layer-2,Canvas);color:var(--dsw-alias-label-primary);font-weight:500}
 .mv-sheet{width:100%;box-sizing:border-box;display:flex;flex-direction:column;gap:12px;margin-top:12px;padding:14px;border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsm-radius-sheet);background:var(--dsw-alias-bg-layer-1)}
+@keyframes mv-in{from{opacity:0;transform:translateY(-4px)}}
+.mv-sheet-move{animation:mv-in .16s cubic-bezier(.16,1,.3,1)}
 .mv-sheet-head{display:flex;align-items:center;justify-content:space-between;gap:10px}
-.mv-sheet-title{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary);margin:0}
-.mv-sheet-close{appearance:none;width:26px;height:26px;color:var(--dsw-alias-label-secondary);background:0 0;border:none;border-radius:7px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;font-size:16px;line-height:1}
-.mv-sheet-close:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
-.mv-seg{display:flex;gap:2px;padding:2px;background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsm-radius-sheet);width:100%}
-.mv-segbtn{appearance:none;flex:1;min-height:30px;padding:0 12px;border:none;background:transparent;color:var(--dsw-alias-label-secondary);border-radius:8px;font-size:12px;font-weight:500;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;gap:6px}
+.mv-sheet-title{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary);margin:0;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mv-sheet-close{appearance:none;width:26px;height:26px;flex:none;color:var(--dsw-alias-label-secondary);background:0 0;border:none;border-radius:7px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;font-size:16px;line-height:1;transition:background-color .15s ease,color .15s ease}
+.mv-sheet-close:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
+.mv-sheet-close:disabled{opacity:.45;cursor:default}
+.mv-context{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:7px 10px;border:1px solid var(--dsw-alias-border-l1);border-radius:var(--dsm-radius-ctl);background:var(--dsw-alias-bg-layer-2);font-size:11.5px;line-height:1.4}
+.mv-context-label{color:var(--dsw-alias-label-tertiary);font-weight:600;flex:none}
+.mv-context-val{color:var(--dsw-alias-label-primary);font-weight:500;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mv-context-path{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:10.5px;color:var(--dsw-alias-label-tertiary);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1 1 140px}
+.mv-seg{display:flex;gap:2px;padding:2px;box-sizing:border-box;background:var(--dsw-alias-bg-layer-2);border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsm-radius-sheet);width:100%}
+.mv-segbtn{appearance:none;flex:1;min-height:30px;padding:0 12px;border:1px solid transparent;background:transparent;color:var(--dsw-alias-label-secondary);border-radius:8px;font-size:12px;font-weight:500;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;gap:6px;transition:background-color .15s ease,color .15s ease,border-color .15s ease}
 .mv-segbtn:hover:not(:disabled){color:var(--dsw-alias-label-primary)}
-.mv-segbtn-on{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);box-shadow:0 1px 2px rgb(0 0 0/.08)}
+.mv-segbtn:disabled{opacity:.55;cursor:default}
+.mv-segbtn-on{background:var(--dsw-alias-bg-layer-1);border-color:var(--dsw-alias-border-l2);color:var(--dsw-alias-label-primary);box-shadow:0 1px 3px rgb(0 0 0/.1)}
 .mv-field{display:flex;flex-direction:column;gap:6px}
 .mv-field label.mv-field-label{font-size:12px;font-weight:500;color:var(--dsw-alias-label-secondary)}
-.mv-field select,.mv-field input[type=text]{box-sizing:border-box;appearance:none;width:100%;min-height:34px;padding:0 10px;border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsm-radius-ctl);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);font-size:12px;font-family:inherit}
-.mv-field select:focus-visible,.mv-field input[type=text]:focus-visible,.mv-sheet-close:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:1px}
+.mv-field select,.mv-field input[type=text],.mv-field input[type=search]{box-sizing:border-box;appearance:none;width:100%;min-height:34px;padding:0 10px;border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsm-radius-ctl);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);font-size:12px;font-family:inherit}
+.mv-field select:focus-visible,.mv-field input[type=text]:focus-visible,.mv-field input[type=search]:focus-visible,.mv-sheet-close:focus-visible,.mv-ws-opt:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:1px}
+.mv-search-wrap{position:relative;display:flex;align-items:center}
+.mv-search-ico{position:absolute;left:10px;display:inline-flex;color:var(--dsw-alias-label-tertiary);pointer-events:none}
+.mv-field input.mv-search-input{padding:0 28px 0 30px}
+.mv-search-clear{position:absolute;right:6px;appearance:none;width:22px;height:22px;border:none;border-radius:6px;background:transparent;color:var(--dsw-alias-label-tertiary);cursor:pointer;display:inline-flex;align-items:center;justify-content:center;font-size:14px;line-height:1}
+.mv-search-clear:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
+.mv-ws-list{display:flex;flex-direction:column;gap:4px;max-height:224px;overflow-y:auto;padding:2px;scrollbar-width:thin}
+.mv-ws-opt{appearance:none;display:flex;align-items:center;gap:10px;width:100%;box-sizing:border-box;min-height:42px;padding:7px 10px;border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsm-radius-ctl);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);text-align:left;cursor:pointer;transition:background-color .14s ease,border-color .14s ease}
+.mv-ws-opt:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);border-color:var(--dsw-alias-border-l4)}
+.mv-ws-opt-sel{border-color:var(--dsw-alias-state-business-primary);background:color-mix(in srgb,var(--dsw-alias-state-business-primary) 9%,var(--dsw-alias-bg-layer-2))}
+.mv-ws-opt-sel:hover:not(:disabled){border-color:var(--dsw-alias-state-business-primary);background:color-mix(in srgb,var(--dsw-alias-state-business-primary) 13%,var(--dsw-alias-bg-layer-2))}
+.mv-ws-opt:disabled{opacity:.56;cursor:not-allowed}
+.mv-ws-opt-ico{flex:none;display:inline-flex;color:var(--dsw-alias-label-tertiary)}
+.mv-ws-opt-sel .mv-ws-opt-ico{color:var(--dsw-alias-state-business-primary)}
+.mv-ws-opt-main{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
+.mv-ws-opt-name{font-size:12.5px;font-weight:550;color:var(--dsw-alias-label-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mv-ws-opt-path{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:10.5px;color:var(--dsw-alias-label-tertiary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mv-ws-opt-end{flex:none;display:inline-flex;align-items:center;gap:6px;margin-left:auto}
+.mv-ws-badge{display:inline-flex;align-items:center;padding:2px 7px;border-radius:999px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);font-size:10.5px;font-weight:500;white-space:nowrap}
+.mv-ws-badge-cur{color:var(--dsw-alias-label-tertiary)}
+.mv-ws-check{display:inline-flex;color:var(--dsw-alias-state-business-primary)}
+.mv-ws-empty{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;padding:12px;border:1px dashed var(--dsw-alias-border-l3);border-radius:var(--dsm-radius-ctl);color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:1.5}
+.mv-inline-hint{font-size:11.5px;line-height:1.5;padding:7px 10px;border-radius:var(--dsm-radius-ctl);border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary)}
+.mv-inline-hint-warn{border-color:color-mix(in srgb,var(--dsw-alias-state-warn-primary,#EAB308) 45%,transparent);background:color-mix(in srgb,var(--dsw-alias-state-warn-primary,#EAB308) 8%,var(--dsw-alias-bg-layer-2))}
+.mv-result{display:flex;flex-direction:column;gap:8px;padding:10px 11px;border-radius:var(--dsm-radius-ctl);border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-2);font-size:12px;line-height:1.5}
+.mv-result-err{border-color:color-mix(in srgb,var(--dsw-alias-state-error-primary) 45%,transparent);background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 6%,var(--dsw-alias-bg-layer-2))}
+.mv-result-counts{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.mv-chip{display:inline-flex;align-items:center;padding:2px 8px;border-radius:999px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);font-size:11px;font-weight:500;font-variant-numeric:tabular-nums}
+.mv-chip-ok{color:var(--dsw-alias-state-success-primary);border-color:color-mix(in srgb,var(--dsw-alias-state-success-primary) 40%,transparent);background:color-mix(in srgb,var(--dsw-alias-state-success-primary) 9%,transparent)}
+.mv-chip-warn{color:var(--dsw-alias-label-primary);border-color:color-mix(in srgb,var(--dsw-alias-state-warn-primary,#EAB308) 50%,transparent);background:color-mix(in srgb,var(--dsw-alias-state-warn-primary,#EAB308) 12%,transparent)}
+.mv-chip-err{color:var(--dsw-alias-state-error-primary);border-color:color-mix(in srgb,var(--dsw-alias-state-error-primary) 45%,transparent);background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 9%,transparent)}
+.mv-fail-list{display:flex;flex-direction:column;gap:4px;max-height:132px;overflow-y:auto;scrollbar-width:thin}
+.mv-fail-row{display:flex;align-items:baseline;justify-content:space-between;gap:10px;padding:4px 6px;border-radius:6px;background:var(--dsw-alias-bg-layer-1);font-size:11.5px}
+.mv-fail-name{font-weight:500;color:var(--dsw-alias-label-primary);flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mv-fail-err{color:var(--dsw-alias-state-error-primary);flex:1 1 auto;min-width:0;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .mv-browse-row{display:flex;align-items:center;gap:8px}
 .mv-browse-row input[type=text]{flex:1;min-width:0}
-.mv-foot{display:flex;justify-content:flex-end;align-items:center;gap:8px;margin-top:2px}
-@media (max-width:640px){.archv-row{flex-wrap:wrap}.mv-sheet{padding:12px}}
+.mv-foot{display:flex;justify-content:flex-end;align-items:center;flex-wrap:wrap;gap:10px;margin-top:2px}
+.mv-sheet-move .mv-foot{padding-top:6px;border-top:1px solid var(--dsw-alias-border-l1)}
+.mv-foot-sel{font-size:11.5px;color:var(--dsw-alias-label-secondary);min-width:0;flex:1 1 180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mv-foot-sel-err{color:var(--dsw-alias-state-error-primary)}
+.mv-foot-acts{display:flex;align-items:center;gap:8px;margin-left:auto;flex:none}
+@media (prefers-reduced-motion:reduce){.archv-skel-card::after{animation:none}.archv-card,.archv-btn,.archv-star,.mv-ws-opt,.mv-segbtn,.mv-sheet-close{transition:none}.archv-star:hover,.archv-star:active{transform:none}.archv-status,.archv-spin,.mv-sheet-move{animation:none}}
+@media (max-width:640px){.archv-card{flex-direction:column;align-items:stretch;gap:10px}.archv-actions{justify-content:flex-end}.sess-tools,.sess-tools-4,.sess-tools-5{grid-template-columns:1fr}.sess-fbtn,.archv-btn{min-height:40px}.archv-star{width:30px;height:30px}.archv-star svg{width:22px;height:22px}.dsm-kids{margin-left:10px}.archv-titlerow{flex-wrap:wrap}.dsm-kid-row{flex-wrap:wrap}.dsm-kid-acts{margin-left:0}.archv-row{flex-wrap:wrap}.mv-sheet{padding:12px}.mv-ws-opt{min-height:44px}.mv-foot-sel{flex-basis:100%}.mv-foot-acts{width:100%;justify-content:flex-end}}
 .dtl-sheet{margin-top:12px;padding:14px;border:1px solid var(--dsw-alias-border-l2);border-radius:var(--dsm-radius-sheet);background:var(--dsw-alias-bg-layer-1)}
 .dtl-sheet-head{display:flex;align-items:center;justify-content:space-between;gap:10px}
 .dtl-sheet-title{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary);margin:0}
@@ -244,9 +299,8 @@ function pathName(p) {
   return parts[parts.length - 1] || p
 }
 
-// 服务端 409 错误码：会话正被 DSH 占用写权限（0.1.3 单写者机制）。切走会话后
-// 原地重试即可，所以这类失败要给用户一个「重试」入口。
-const BUSY_CODE = 'DSM_SESSION_BUSY'
+// 服务端 409 错误码常量（与 logic.js 对齐）
+const BUSY_CODE = MOVE_ERR_BUSY
 
 async function postJSON(path, body) {
   const res = await fetch(path, {
@@ -518,6 +572,414 @@ function installSettingsNavIcons(ctx) {
   })
 }
 
+function MoveDestinationSheet({
+  title,
+  ariaLabel,
+  idPrefix,
+  sourceItems,
+  workspaces,
+  mode,
+  onModeChange,
+  selectedWsId,
+  onSelectWsId,
+  wsQuery,
+  onWsQueryChange,
+  newPath,
+  onNewPathChange,
+  onPickDirectory,
+  picking,
+  canPickDirectory,
+  submitting,
+  onSubmit,
+  onClose,
+  submitLabel,
+  inlineError,
+  inlineAction,
+  batchOutcome,
+  onStopRunningBatch,
+}) {
+  const searchRef = useRef(null)
+  const newPathRef = useRef(null)
+  const listRef = useRef(null)
+
+  const wsList = Array.isArray(workspaces) ? workspaces : []
+  const items = Array.isArray(sourceItems) ? sourceItems : []
+  const sourceInfo = useMemo(() => analyzeMoveSource(items), [items])
+  const filteredWorkspaces = useMemo(() => filterMoveWorkspaces(wsList, wsQuery), [wsList, wsQuery])
+
+  useEffect(() => {
+    const id = requestAnimationFrame(() => {
+      if (mode === 'existing') {
+        if (searchRef.current && searchRef.current.isConnected) searchRef.current.focus()
+      } else if (newPathRef.current && newPathRef.current.isConnected) {
+        newPathRef.current.focus()
+      }
+    })
+    return () => cancelAnimationFrame(id)
+  }, [mode])
+
+  const selectedWs = mode === 'existing' && selectedWsId
+    ? wsList.find((w) => String(w.workspaceId) === String(selectedWsId)) || null
+    : null
+  const trimmedNewPath = String(newPath || '').trim()
+  const activeDestPath = mode === 'existing' ? (selectedWs ? selectedWs.path : '') : trimmedNewPath
+  const destinationSelected = !!activeDestPath
+  const destinationBlocked = destinationSelected && isMoveDestinationBlocked(activeDestPath, sourceInfo)
+  const destinationLabel = mode === 'existing'
+    ? (selectedWs ? (selectedWs.title || pathName(selectedWs.path) || selectedWs.workspaceId) : '')
+    : (pathTail(trimmedNewPath) || trimmedNewPath)
+  const selectedOverlapCount = destinationSelected && !destinationBlocked
+    ? (sourceInfo.countByPath.get(normalizeWorkspacePath(activeDestPath)) || 0)
+    : 0
+  const canSubmit = !submitting && sourceInfo.total > 0 && destinationSelected && !destinationBlocked
+
+  const contextSummary = useMemo(() => {
+    if (sourceInfo.total === 1) {
+      const it = items[0]
+      const rawPath = it && it.workspacePath ? String(it.workspacePath) : ''
+      if (it && it.hasWorkspace && it.workspaceGone) {
+        return { label: '当前工作区', val: `工作区已删 · ${pathName(rawPath) || '?'}`, path: rawPath }
+      }
+      if (rawPath) {
+        const matched = wsList.find((w) => sameWorkspacePath(w.path, rawPath))
+        const name = (matched && matched.title) || it.workspaceTitle || pathName(rawPath) || rawPath
+        return { label: '当前工作区', val: `${name}（已禁选）`, path: rawPath }
+      }
+      return { label: '当前工作区', val: '未分组', path: '' }
+    }
+    if (sourceInfo.blockedPath) {
+      const matched = wsList.find((w) => sameWorkspacePath(w.path, sourceInfo.blockedPath))
+      const name = (matched && matched.title) || pathName(sourceInfo.blockedPath) || sourceInfo.blockedPath
+      return { label: `已选 ${sourceInfo.total} 个`, val: `全部位于「${name}」（已禁选该目标）`, path: sourceInfo.blockedPath }
+    }
+    const parts = []
+    if (sourceInfo.distinctPaths.length > 0) parts.push(`来自 ${sourceInfo.distinctPaths.length} 个工作区`)
+    if (sourceInfo.ungroupedCount > 0) parts.push(`${sourceInfo.ungroupedCount} 个未分组`)
+    return {
+      label: `已选 ${sourceInfo.total} 个`,
+      val: parts.length ? parts.join('，') : '待移动会话',
+      path: '',
+    }
+  }, [items, sourceInfo, wsList])
+
+  const focusEnabledOption = (index) => {
+    const root = listRef.current
+    if (!root) return false
+    const opts = [...root.querySelectorAll('.mv-ws-opt:not(:disabled)')]
+    if (!opts.length) return false
+    const target = opts[Math.max(0, Math.min(opts.length - 1, index))]
+    if (!target) return false
+    target.focus()
+    target.scrollIntoView({ block: 'nearest' })
+    return true
+  }
+
+  const onListKeyDown = (e) => {
+    const root = listRef.current
+    if (!root) return
+    const opts = [...root.querySelectorAll('.mv-ws-opt:not(:disabled)')]
+    if (!opts.length) return
+    const idx = opts.indexOf(document.activeElement)
+    if (e.key === 'ArrowDown') {
+      e.preventDefault()
+      focusEnabledOption(idx < 0 ? 0 : (idx + 1) % opts.length)
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault()
+      if (idx <= 0 && searchRef.current) searchRef.current.focus()
+      else focusEnabledOption(idx - 1)
+    } else if (e.key === 'Home') {
+      e.preventDefault()
+      focusEnabledOption(0)
+    } else if (e.key === 'End') {
+      e.preventDefault()
+      focusEnabledOption(opts.length - 1)
+    }
+  }
+
+  const onTabKeyDown = (e) => {
+    if (submitting) return
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+      e.preventDefault()
+      onModeChange(mode === 'existing' ? 'new' : 'existing')
+    } else if (e.key === 'Home') {
+      e.preventDefault()
+      onModeChange('existing')
+    } else if (e.key === 'End') {
+      e.preventDefault()
+      onModeChange('new')
+    }
+  }
+
+  const onSheetKeyDown = (e) => {
+    if (e.key === 'Escape') {
+      if (submitting) return
+      e.preventDefault()
+      e.stopPropagation()
+      onClose()
+      return
+    }
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && canSubmit) {
+      e.preventDefault()
+      onSubmit()
+    }
+  }
+
+  const summary = batchOutcome && batchOutcome.summary ? batchOutcome.summary : null
+  const failedEntries = batchOutcome && Array.isArray(batchOutcome.failedEntries) ? batchOutcome.failedEntries : []
+
+  return (
+    <div className="mv-sheet mv-sheet-move" role="region" aria-label={ariaLabel || title} onKeyDown={onSheetKeyDown}>
+      <div className="mv-sheet-head">
+        <h3 className="mv-sheet-title">{title}</h3>
+        <button type="button" className="mv-sheet-close" aria-label="关闭" disabled={submitting} onClick={onClose}>×</button>
+      </div>
+      <div className="mv-context">
+        <span className="mv-context-label">{contextSummary.label}</span>
+        <span className="mv-context-val" title={contextSummary.val}>{contextSummary.val}</span>
+        {contextSummary.path && <span className="mv-context-path" title={contextSummary.path}>{contextSummary.path}</span>}
+      </div>
+      <div className="mv-seg" role="tablist" aria-label="目的地选择方式" onKeyDown={onTabKeyDown}>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={mode === 'existing'}
+          disabled={submitting}
+          className={'mv-segbtn' + (mode === 'existing' ? ' mv-segbtn-on' : '')}
+          onClick={() => onModeChange('existing')}
+        >已有工作区</button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={mode === 'new'}
+          disabled={submitting}
+          className={'mv-segbtn' + (mode === 'new' ? ' mv-segbtn-on' : '')}
+          onClick={() => onModeChange('new')}
+        >新建目录</button>
+      </div>
+      {mode === 'existing' ? (
+        <div className="mv-field">
+          <label className="mv-field-label" htmlFor={`${idPrefix}-ws-search`}>选择目标工作区</label>
+          {wsList.length > 0 && (
+            <div className="mv-search-wrap">
+              <span className="mv-search-ico" aria-hidden="true">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <circle cx="11" cy="11" r="7" />
+                  <path d="M21 21l-4.3-4.3" />
+                </svg>
+              </span>
+              <input
+                ref={searchRef}
+                id={`${idPrefix}-ws-search`}
+                type="search"
+                className="mv-search-input"
+                value={wsQuery}
+                disabled={submitting}
+                placeholder="按名称或路径搜索工作区…"
+                onChange={(e) => onWsQueryChange(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'ArrowDown') {
+                    e.preventDefault()
+                    focusEnabledOption(0)
+                  } else if (e.key === 'Escape' && wsQuery) {
+                    e.preventDefault()
+                    e.stopPropagation()
+                    onWsQueryChange('')
+                  }
+                }}
+              />
+              {wsQuery && (
+                <button
+                  type="button"
+                  className="mv-search-clear"
+                  aria-label="清空工作区搜索"
+                  disabled={submitting}
+                  onClick={() => {
+                    onWsQueryChange('')
+                    requestAnimationFrame(() => searchRef.current && searchRef.current.focus())
+                  }}
+                >×</button>
+              )}
+            </div>
+          )}
+          {wsList.length === 0 ? (
+            <div className="mv-ws-empty">
+              <span>暂无可用工作区，可切换到「新建目录」指定目标路径。</span>
+              <button type="button" className="archv-btn" disabled={submitting} onClick={() => onModeChange('new')}>新建目录</button>
+            </div>
+          ) : filteredWorkspaces.length === 0 ? (
+            <div className="mv-ws-empty">
+              <span>没有匹配“{wsQuery.trim()}”的工作区。</span>
+              <button
+                type="button"
+                className="archv-btn"
+                disabled={submitting}
+                onClick={() => {
+                  onWsQueryChange('')
+                  requestAnimationFrame(() => searchRef.current && searchRef.current.focus())
+                }}
+              >清空搜索</button>
+            </div>
+          ) : (
+            <div ref={listRef} className="mv-ws-list" role="listbox" aria-label="可选目标工作区" onKeyDown={onListKeyDown}>
+              {filteredWorkspaces.map((w) => {
+                const blocked = isMoveDestinationBlocked(w.path, sourceInfo)
+                const overlap = sourceInfo.countByPath.get(normalizeWorkspacePath(w.path)) || 0
+                const selected = !blocked && String(selectedWsId || '') === String(w.workspaceId)
+                const label = w.title || pathName(w.path) || w.workspaceId
+                return (
+                  <button
+                    key={w.workspaceId}
+                    type="button"
+                    role="option"
+                    aria-selected={selected}
+                    aria-disabled={blocked || submitting}
+                    disabled={blocked || submitting}
+                    title={blocked ? '会话已在该工作区中' : w.path}
+                    className={'mv-ws-opt' + (selected ? ' mv-ws-opt-sel' : '')}
+                    onClick={() => { if (!blocked && !submitting) onSelectWsId(w.workspaceId) }}
+                  >
+                    <span className="mv-ws-opt-ico" aria-hidden="true">
+                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+                      </svg>
+                    </span>
+                    <span className="mv-ws-opt-main">
+                      <span className="mv-ws-opt-name">{label}</span>
+                      <span className="mv-ws-opt-path">{w.path}</span>
+                    </span>
+                    <span className="mv-ws-opt-end">
+                      {blocked ? (
+                        <span className="mv-ws-badge mv-ws-badge-cur">{sourceInfo.total > 1 ? '全部在此' : '当前工作区'}</span>
+                      ) : sourceInfo.total > 1 && overlap > 0 ? (
+                        <span className="mv-ws-badge">已有 {overlap} 个</span>
+                      ) : null}
+                      {selected && (
+                        <span className="mv-ws-check" aria-hidden="true">
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M20 6L9 17l-5-5" />
+                          </svg>
+                        </span>
+                      )}
+                    </span>
+                  </button>
+                )
+              })}
+            </div>
+          )}
+        </div>
+      ) : (
+        <div className="mv-field">
+          <label className="mv-field-label" htmlFor={`${idPrefix}-new-path`}>新工作区目录路径</label>
+          <div className="mv-browse-row">
+            <input
+              ref={newPathRef}
+              id={`${idPrefix}-new-path`}
+              type="text"
+              value={newPath}
+              disabled={submitting}
+              onChange={(e) => onNewPathChange(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter' && canSubmit) { e.preventDefault(); onSubmit() } }}
+              placeholder="例如 /Users/you/Projects/demo 或 ~/demo"
+            />
+            <button
+              type="button"
+              className="archv-btn"
+              onClick={onPickDirectory}
+              disabled={submitting || picking || !canPickDirectory}
+              title={!canPickDirectory ? '当前运行环境不支持系统目录选择' : '打开系统目录选择窗口'}
+            >
+              {picking ? '选择中…' : '浏览…'}
+            </button>
+          </div>
+          {destinationBlocked && (
+            <div className="mv-inline-hint mv-inline-hint-warn" role="status">
+              所选会话已全部位于该目录，请填写或浏览其他目标目录。
+            </div>
+          )}
+        </div>
+      )}
+      {destinationSelected && !destinationBlocked && sourceInfo.total > 1 && selectedOverlapCount > 0 && selectedOverlapCount < sourceInfo.total && (
+        <div className="mv-inline-hint">
+          所选会话中有 {selectedOverlapCount} 个已在「{destinationLabel}」，提交后将跳过它们并移动其余 {sourceInfo.total - selectedOverlapCount} 个。
+        </div>
+      )}
+      {summary && (
+        <div className={'mv-result' + (summary.failedCount > 0 ? ' mv-result-err' : '')} role="status">
+          <div className="mv-result-counts">
+            <span className={'mv-chip' + (summary.movedCount > 0 ? ' mv-chip-ok' : '')}>已移动 {summary.movedCount}</span>
+            <span className="mv-chip">已在目标 {summary.alreadyCount}</span>
+            {summary.queuedCount > 0 && (
+              <span className="mv-chip mv-chip-err">未完成 {summary.queuedCount}</span>
+            )}
+            <span className={'mv-chip' + (summary.failedCount > 0 ? ' mv-chip-err' : '')}>失败 {summary.failedCount}</span>
+          </div>
+          {failedEntries.length > 0 && (
+            <>
+              <div className="dtl-note" style={{ marginTop: 0 }}>
+                已保留下方失败条目与所选目标，可按原因处理后手动重试。
+              </div>
+              {onStopRunningBatch && onStopRunningBatch.count > 0 && (
+                <div className="archv-err" style={{ marginBottom: 0 }} role="alert">
+                  <span>有 {onStopRunningBatch.count} 个会话正在运行中，需停止后才能移动。</span>
+                  <button
+                    type="button"
+                    className="archv-btn archv-warn-btn"
+                    disabled={submitting}
+                    onClick={onStopRunningBatch.onClick}
+                  >
+                    停止并移动 ({onStopRunningBatch.count})
+                  </button>
+                </div>
+              )}
+              <div className="mv-fail-list" role="list" aria-label="移动失败的会话">
+                {failedEntries.map((f) => (
+                  <div key={String(f.sessionId)} className="mv-fail-row" role="listitem">
+                    <span className="mv-fail-name" title={f.title || f.sessionId}>{f.title || shortId(f.sessionId)}</span>
+                    <span className="mv-fail-err" title={f.error}>{f.error}</span>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+      )}
+      {inlineError && (
+        <div className="archv-err" style={{ marginBottom: 0 }} role="alert">
+          <span>{inlineError}</span>
+          {inlineAction && (
+            <span className="archv-err-acts">
+              <button
+                type="button"
+                className={'archv-errretry' + (inlineAction.variant === 'warn' ? ' archv-warn-btn' : '')}
+                disabled={submitting}
+                onClick={inlineAction.onClick}
+              >
+                {inlineAction.label}
+              </button>
+            </span>
+          )}
+        </div>
+      )}
+      <div className="mv-foot">
+        <span className={'mv-foot-sel' + (destinationBlocked ? ' mv-foot-sel-err' : '')} title={activeDestPath || undefined}>
+          {destinationBlocked
+            ? '目标与当前位置相同，请改选其他工作区'
+            : destinationSelected
+              ? `目标：${destinationLabel}`
+              : (mode === 'existing' ? '请先选择目标工作区' : '请输入或浏览目标目录')}
+        </span>
+        <span className="mv-foot-acts">
+          <button type="button" className="archv-btn" disabled={submitting} onClick={onClose}>取消</button>
+          <button type="button" className="archv-btn archv-go" disabled={!canSubmit} onClick={onSubmit}>
+            {submitting && <span className="archv-spin" aria-hidden="true" />}
+            {submitting ? '移动中…' : (submitLabel || '确认移动')}
+          </button>
+        </span>
+      </div>
+    </div>
+  )
+}
+
 function SessionPanel({ workspacesSvc }) {
   const [sessions, setSessions] = useState(null)
   const [workspaces, setWorkspaces] = useState([])
@@ -539,12 +1001,19 @@ function SessionPanel({ workspacesSvc }) {
   const [cascadeSub, setCascadeSub] = useState(true)
   useEffect(() => { if (delTarget) setCascadeSub(true) }, [delTarget])
   const [confirmBatch, setConfirmBatch] = useState(false)
-  const [batchMoveOpen, setBatchMoveOpen] = useState(false)
   const [busy, setBusy] = useState(null)
-  const [openMove, setOpenMove] = useState(null)
+  // 单条与批量移动共用同一个状态机：同一时刻最多只展开一个移动面板。
+  const [movePanel, setMovePanel] = useState(null)
+  const openMove = movePanel && movePanel.kind === 'single' ? movePanel.sessionId : null
+  const batchMoveOpen = !!(movePanel && movePanel.kind === 'batch')
   const [moveMode, setMoveMode] = useState('existing')
   const [targetWs, setTargetWs] = useState('')
+  const [moveWsQuery, setMoveWsQuery] = useState('')
   const [newPath, setNewPath] = useState('')
+  const [moveInlineError, setMoveInlineError] = useState(null)
+  const [moveInlineAction, setMoveInlineAction] = useState(null)
+  const [batchMoveOutcome, setBatchMoveOutcome] = useState(null)
+  const moveReturnFocusRef = useRef(null)
   const [error, setError] = useState(null)
   // 可重试的失败：{ run } —— run 是「把刚才那一步原样再做一次」的闭包。存对象
   // 而非裸函数，避免被 useState 当成更新函数吃掉。没有它时错误条的「重试」退回
@@ -552,16 +1021,77 @@ function SessionPanel({ workspacesSvc }) {
   const [retry, setRetry] = useState(null)
   const [toast, setToast] = useState(null)
   const [picking, setPicking] = useState(false)
+  const resetMoveDraft = (nextMode) => {
+    setMoveMode(nextMode || (workspaces.length ? 'existing' : 'new'))
+    setTargetWs('')
+    setMoveWsQuery('')
+    setNewPath('')
+    setMoveInlineError(null)
+    setMoveInlineAction(null)
+    setBatchMoveOutcome(null)
+  }
+  const closeMovePanel = ({ restoreFocus = false } = {}) => {
+    setMovePanel(null)
+    resetMoveDraft()
+    if (restoreFocus) {
+      const trigger = moveReturnFocusRef.current
+      moveReturnFocusRef.current = null
+      if (trigger && trigger.isConnected && typeof trigger.focus === 'function') {
+        requestAnimationFrame(() => trigger.focus())
+      }
+    } else {
+      moveReturnFocusRef.current = null
+    }
+  }
   const [trash, setTrash] = useState([])
-  // T2：待移动队列小节（D4 拍板随本期）——README 承诺了查看/取消，路由早就有，
-  // 缺的只是入口。刷新尽力而为：失败=没队列，绝不打扰列表主流程。
+  // 历史遗留待移动记录：只提供手动重试或取消，不自动重试、不提示重启。
   const [pendingQueue, setPendingQueue] = useState([])
+  const [pendingBusy, setPendingBusy] = useState(null)
+  const [pendingRowErrors, setPendingRowErrors] = useState({})
   const cancelQueuedMove = async (sid) => {
+    const key = String(sid)
+    if (pendingBusy) return
+    setPendingBusy(key)
     try {
       await postJSON('/archived-sessions/pending-moves/cancel', { sessionIds: [sid] })
-      showToast('已取消排队，会话留在原工作区', 'ok')
-      setPendingQueue((q) => q.filter((x) => String(x.sessionId) !== String(sid)))
-    } catch (e) { showToast('取消失败：' + String((e && e.message) || e), 'err') }
+      showToast('已取消历史移动记录，会话留在原工作区', 'ok')
+      setPendingQueue((q) => q.filter((x) => String(x.sessionId) !== key))
+      setPendingRowErrors((prev) => { const next = { ...prev }; delete next[key]; return next })
+    } catch (e) {
+      showToast('取消失败：' + String((e && e.message) || e), 'err')
+    } finally {
+      setPendingBusy(null)
+    }
+  }
+  const retryPendingMove = async (entry, opts = {}) => {
+    if (!entry || !entry.sessionId || pendingBusy) return
+    const key = String(entry.sessionId)
+    const stopRunning = opts && opts.stopRunning === true
+    setPendingBusy(key)
+    setPendingRowErrors((prev) => { const next = { ...prev }; delete next[key]; return next })
+    try {
+      const r = await postActiveAware('/archived-sessions/pending-moves/retry', {
+        sessionId: entry.sessionId,
+        ...(stopRunning ? { stopRunning: true } : {}),
+      })
+      const matched = sessionsById.get(key)
+      const outcome = formatSingleMoveResult(r, {
+        title: (matched && matched.title) || shortId(entry.sessionId),
+        targetLabel: (r && r.workspaceTitle) || pathTail((r && r.workspacePath) || entry.targetPath) || '目标工作区',
+      })
+      showToast(outcome.text, outcome.kind)
+      setPendingQueue((q) => q.filter((x) => String(x.sessionId) !== key))
+      refresh({ keepSelection: true })
+    } catch (e) {
+      const classified = classifyMoveError(e)
+      showToast(classified.message, 'err')
+      setPendingRowErrors((prev) => ({
+        ...prev,
+        [key]: { message: classified.message, canStopAndMove: classified.canStopAndMove },
+      }))
+    } finally {
+      setPendingBusy(null)
+    }
   }
   const [trashBusy, setTrashBusy] = useState(null)
   const [trashSettings, setTrashSettings] = useState({ retentionDays: 0 })
@@ -940,13 +1470,14 @@ function SessionPanel({ workspacesSvc }) {
     .then((r) => setLineage((r && r.lineage) || {}))
     .catch(() => {})
 
-  // kind: 'ok'（默认）| 'err'。停留时长按**字数**给（logic.toastDurationFor）：
+  // kind: 'ok'（默认）| 'warn'（排队/提醒）| 'err'（错误）。停留时长按**字数**给（logic.toastDurationFor）：
   // 固定 2.4s 对"排队/失败"这类几十字的文案根本读不完（用户 2026-09-10 反馈）；
-  // 失败类再 +2s 并用警示色。任何提示都可以**点击立即关闭**，不必干等。
+  // 失败/排队类按对应系数延长。任何提示都可以**点击立即关闭**，不必干等。
   const showToast = (msg, kind) => {
     if (timer.current) clearTimeout(timer.current)
-    setToast({ msg, kind: kind === 'err' ? 'err' : 'ok' })
-    timer.current = setTimeout(() => setToast(null), toastDurationFor(msg, kind))
+    const normKind = kind === 'err' ? 'err' : kind === 'warn' ? 'warn' : 'ok'
+    setToast({ msg, kind: normKind })
+    timer.current = setTimeout(() => setToast(null), toastDurationFor(msg, normKind))
   }
 
   // 版本徽章点击复制完整 buildStamp。webview 里 navigator.clipboard 可能缺失
@@ -1011,7 +1542,8 @@ function SessionPanel({ workspacesSvc }) {
     } else viaExecCommand()
   }
 
-  const refresh = () => {
+  const refresh = (opts = {}) => {
+    const keepSelection = !!(opts && opts.keepSelection)
     setError(null)
     Promise.all([
       postJSON('/archived-sessions/sessions', {}),
@@ -1023,17 +1555,28 @@ function SessionPanel({ workspacesSvc }) {
         // in-memory session index still lists them after the file was unlinked.
         const purged = dsmLoadPurged()
         const visible = (s.items || []).filter((x) => !purged.has(String(x.sessionId)))
+        dsmHydrateSessionMeta(visible)
         setSessions(visible)
         setWorkspaces(works.items || [])
         setCapabilities(caps || null)
         // 构建指纹打到控制台：面板行为与源码不一致时，第一件事就是核对这行——
         // host 端只在宿主启动时加载一次，不重启宿主看到的永远是旧代码。
         if (caps && caps.buildStamp) console.info('[dsh-sessions-manager] host build:', caps.buildStamp)
-        setSelected({})
+        if (keepSelection) {
+          const visibleIds = new Set(visible.map((x) => String(x.sessionId)))
+          setSelected((prev) => {
+            const next = {}
+            for (const [k, v] of Object.entries(prev || {})) {
+              if (v && visibleIds.has(String(k))) next[k] = true
+            }
+            return next
+          })
+        } else {
+          setSelected({})
+        }
         setDelTarget(null)
         setConfirmBatch(false)
         loadLineage()
-        if (!targetWs && works.items && works.items.length) setTargetWs(works.items[0].workspaceId)
         loadTrash()
         // T4：标签与已存筛选的旁路读取（与 pending-moves 同一先例：失败降级，
         // 不进主错误条）。
@@ -1150,10 +1693,7 @@ function SessionPanel({ workspacesSvc }) {
     }
   }, [delTarget, purgeTarget])
 
-  const wsPath = (id) => {
-    const w = workspaces.find((x) => x.workspaceId === id)
-    return w ? w.path : ''
-  }
+  const wsObj = (id) => workspaces.find((x) => String(x.workspaceId) === String(id)) || null
   // 能力读取：优先 v3.5.2 规范键名，回退旧键名（旧 host / 缓存响应兼容）。
   const actionCapability = (name, legacy) => {
     const source = capabilities && capabilities.actions
@@ -1215,6 +1755,16 @@ function SessionPanel({ workspacesSvc }) {
     })
   }, [sessions, archivedAll, activeAll, starredAll, emptyAll, filter, query, workspaceFilter, sortBy, tagFilter, tagsReady])
   const selIds = Object.keys(selected).filter((k) => selected[k])
+  useEffect(() => {
+    if (movePanel && movePanel.kind === 'batch' && selIds.length === 0) {
+      setMovePanel(null)
+      setMoveWsQuery('')
+      setNewPath('')
+      setTargetWs('')
+      setMoveInlineError(null)
+      setBatchMoveOutcome(null)
+    }
+  }, [movePanel, selIds.length])
   // 「回收站」是独立视图，不共用会话列表。
   const showSessionList = filter !== 'trash'
 
@@ -1412,13 +1962,22 @@ function SessionPanel({ workspacesSvc }) {
     )
   }
 
-  const toggle = (id) => setSelected((s) => ({ ...s, [id]: !s[id] }))
-  const clearSel = () => setSelected({})
+  const toggle = (id) => {
+    if (busy !== null) return
+    setBatchMoveOutcome(null)
+    setSelected((s) => ({ ...s, [id]: !s[id] }))
+  }
+  const clearSel = () => {
+    setSelected({})
+    if (movePanel && movePanel.kind === 'batch') closeMovePanel()
+  }
   // issue #18 第 3 条：全选只选「当前列表里真正占据一行、且能单独勾选」的会话。
   // 旧实现遍历的是过滤后的原始 list（含被折叠的子代理、被聚拢的分支成员、
   // 合成头），于是全选会在界面上看不出任何变化的情况下选中一批不可见会话——
   // 用户只能靠「取消全选」撤销，批量归档/删除会打到自己没看见的东西。
   const selectAll = () => {
+    if (busy !== null) return
+    setBatchMoveOutcome(null)
     const o = {}
     topList.forEach((x) => { if (x && x.sessionId != null && !x.syntheticRoot) o[x.sessionId] = true })
     setSelected(o)
@@ -1568,41 +2127,71 @@ function SessionPanel({ workspacesSvc }) {
       .catch((e) => { setTrashBusy(null); setError(String((e && e.message) || e)) })
   }
 
-  const doMove = (it) => {
-    if (!canMove.available) { setError(canMove.reason || '当前环境不支持跨工作区移动'); return }
-    const targetPath = moveMode === 'new' ? newPath.trim() : wsPath(targetWs)
-    if (!targetPath) { setError('请选择已有工作区或输入新的目标目录路径'); return }
+  const doMove = (it, opts = {}) => {
+    if (busy !== null) return
+    if (!canMove.available) { setMoveInlineError(canMove.reason || '当前环境不支持跨工作区移动'); setMoveInlineAction(null); return }
+    const selectedObj = moveMode === 'existing' ? wsObj(targetWs) : null
+    const targetPath = moveMode === 'new' ? newPath.trim() : (selectedObj ? selectedObj.path : '')
+    if (!targetPath) { setMoveInlineError('请先选择目标工作区或输入新的目标目录路径'); setMoveInlineAction(null); return }
+    if (isMoveDestinationBlocked(targetPath, analyzeMoveSource([it]))) {
+      setMoveInlineError('目标与当前工作区相同，请选择其他工作区')
+      setMoveInlineAction(null)
+      return
+    }
+    const targetLabel = moveMode === 'existing'
+      ? ((selectedObj && (selectedObj.title || pathName(selectedObj.path))) || pathName(targetPath) || targetPath)
+      : (pathTail(targetPath) || targetPath)
+    const stopRunning = opts && opts.stopRunning === true
     setBusy(it.sessionId)
     setError(null)
-    postActiveAware('/archived-sessions/move', { sessionId: it.sessionId, targetPath })
+    setMoveInlineError(null)
+    setMoveInlineAction(null)
+    postActiveAware('/archived-sessions/move', {
+      sessionId: it.sessionId,
+      targetPath,
+      ...(stopRunning ? { stopRunning: true } : {}),
+    })
       .then((r) => {
         setBusy(null)
-        setOpenMove(null)
-        setMoveMode('existing')
-        setNewPath('')
-        // 会话被 DSH 占用（活跃会话 / 未关闭的会话）：服务端已登记排队，等它
-        // 释放（session/disposed）或下次启动时自动完成。不要谎报"已移动"。
+        const outcome = formatSingleMoveResult(r, { title: it.title || shortId(it.sessionId), targetLabel })
+        setRetry(null)
         if (r && r.queued) {
-          showToast(r.notes && r.notes.length ? r.notes.join(' ') : '会话正被 DSH 打开，已排队待移动。', 'err')
-          setRetry(null)
-          refresh()
+          setMoveInlineError(outcome.text)
+          showToast(outcome.text, 'err')
+          postJSON('/archived-sessions/pending-moves', {}).then((q) => setPendingQueue((q && q.items) || [])).catch(() => {})
           return
         }
-        showToast(`已把「${it.title || it.sessionId}」移到 ${r.workspaceTitle || targetPath}`)
-        // 非致命提示（如源目录仍有旧代日志未自动清理）：错误样式 + 停留更久，
-        // 让用户来得及读完再去决定怎么处理。
-        if (Array.isArray(r.notes) && r.notes.length > 0) showToast(r.notes.join(' '), 'err')
+        closeMovePanel({ restoreFocus: true })
+        showToast(outcome.text, outcome.kind)
+        if (r && r.already) return
         // 移动只改 workspacePath/workspaceTitle：本地替换该行，不整表 refresh。
         setSessions((s) => s && s.map((x) => (x.sessionId === it.sessionId
-          ? { ...x, workspacePath: r.workspacePath || targetPath, workspaceTitle: r.workspaceTitle || targetPath }
+          ? {
+              ...x,
+              workspacePath: r.workspacePath || targetPath,
+              workspaceTitle: r.workspaceTitle || targetLabel,
+              hasWorkspace: true,
+              workspaceGone: false,
+            }
           : x)))
-        setRetry(null)
+        if (moveMode === 'new') {
+          postJSON('/archived-sessions/workspaces', {}).then((works) => setWorkspaces((works && works.items) || [])).catch(() => {})
+        }
       })
       .catch((e) => {
         setBusy(null)
-        setError(String((e && e.message) || e))
-        // 会话被 DSH 占用写权限：切走会话后原地重试即可，不必重新选目标。
-        setRetry(e && e.code === BUSY_CODE ? { run: () => doMove(it) } : null)
+        const classified = classifyMoveError(e)
+        setMoveInlineError(classified.message)
+        if (classified.canStopAndMove) {
+          setMoveInlineAction({ label: '停止并移动', variant: 'warn', onClick: () => doMove(it, { stopRunning: true }) })
+          setRetry(null)
+        } else if (classified.canRetry) {
+          setMoveInlineAction({ label: '手动重试', variant: 'normal', onClick: () => doMove(it) })
+          setRetry({ run: () => doMove(it) })
+        } else {
+          setMoveInlineAction(null)
+          setRetry(null)
+        }
       })
   }
 
@@ -1626,71 +2215,109 @@ function SessionPanel({ workspacesSvc }) {
   }
 
   // issue #7：批量移动到同一个目标工作区。失败逐条回报，不中断其余会话。
-  // 传入 ids 时只搬这些（用于「重试失败的会话」），否则搬当前选中。
-  const doBatchMove = (retryIds) => {
+  // 传入 ids 时只搬这些（用于「重试失败的会话」或「停止并移动运行中会话」），否则搬当前选中。
+  const doBatchMove = (retryIds, opts = {}) => {
     const ids = (Array.isArray(retryIds) && retryIds.length) ? retryIds : selIds
-    if (!ids.length || busy) return
-    if (!canMove.available) { setError(canMove.reason || '当前环境不支持跨工作区移动'); return }
-    const targetPath = moveMode === 'new' ? newPath.trim() : wsPath(targetWs)
-    if (!targetPath) { setError('请选择已有工作区或输入新的目标目录路径'); return }
+    if (!ids.length || busy !== null) return
+    if (!canMove.available) { setMoveInlineError(canMove.reason || '当前环境不支持跨工作区移动'); setMoveInlineAction(null); return }
+    const selectedObj = moveMode === 'existing' ? wsObj(targetWs) : null
+    const targetPath = moveMode === 'new' ? newPath.trim() : (selectedObj ? selectedObj.path : '')
+    if (!targetPath) { setMoveInlineError('请先选择目标工作区或输入新的目标目录路径'); setMoveInlineAction(null); return }
+    const batchItems = ids.map((id) => sessionsById.get(String(id))).filter(Boolean)
+    if (isMoveDestinationBlocked(targetPath, analyzeMoveSource(batchItems))) {
+      setMoveInlineError('所选会话已全部位于该工作区，请改选其他目标')
+      setMoveInlineAction(null)
+      return
+    }
+    const targetLabel = moveMode === 'existing'
+      ? ((selectedObj && (selectedObj.title || pathName(selectedObj.path))) || pathName(targetPath) || targetPath)
+      : (pathTail(targetPath) || targetPath)
+    const stopRunning = opts && opts.stopRunning === true
     setBusy('__batch__')
     setError(null)
+    setMoveInlineError(null)
+    setMoveInlineAction(null)
     setRetry(null)
-    postActiveAware('/archived-sessions/move-many', { sessionIds: ids, targetPath })
+    postActiveAware('/archived-sessions/move-many', {
+      sessionIds: ids,
+      targetPath,
+      ...(stopRunning ? { stopRunning: true } : {}),
+    })
       .then((r) => {
         setBusy(null)
-        setBatchMoveOpen(false)
-        setMoveMode('existing')
-        setNewPath('')
-        const moved = (r && r.moved) || 0
-        const failed = (r && Array.isArray(r.failed)) ? r.failed : []
-        const queued = (r && Array.isArray(r.queued)) ? r.queued : []
-        if (queued.length) {
-          // 活跃/被占用的会话：服务端已排队，下次重启 DSH 时自动完成。
-          showToast(`${queued.length} 个会话已排队（正被 DSH 打开），重启 DSH 后自动完成；请先别打开它们。`, 'err')
+        const summary = summarizeBatchMoveResult(r, { targetLabel })
+        const queued = summary.queuedIds
+        if (summary.failedItems.length > 0) {
+          const nextSel = {}
+          const failedEntries = []
+          for (const f of summary.failedItems) {
+            const fid = String(f.sessionId)
+            nextSel[fid] = true
+            const sItem = sessionsById.get(fid)
+            const classified = classifyMoveError({ code: f && f.code, message: f && f.error })
+            const reason = classified.message.split('\n')[0]
+            failedEntries.push({ sessionId: fid, title: (sItem && sItem.title) || '', error: reason, code: classified.code })
+          }
+          setSelected(nextSel)
+          setBatchMoveOutcome({ summary, failedEntries })
+          showToast(summary.text, summary.kind)
+          refresh({ keepSelection: true })
+          return
         }
-        if (failed.length) {
-          // 短 ID 列表 + 首个失败原因：长 UUID 全列出来不可读，原因只给第一条
-          // （通常同批失败同因），完整原因仍可在控制台网络面板查到。
-          const firstReason = failed[0] && failed[0].error ? `，首个原因：${failed[0].error.split('\n')[0]}` : ''
-          setError(`已移动 ${moved} 个会话，${failed.length} 个失败（${failed.map((f) => shortId(f.sessionId)).join('、')}）${firstReason}`)
-          // 被 DSH 占用写权限的那几个：切走会话后重试仍有戏，只重投这几条。
-          const busyIds = failed.filter((f) => f.code === BUSY_CODE).map((f) => f.sessionId)
-          setRetry(busyIds.length ? { run: () => doBatchMove(busyIds) } : null)
-        } else if (moved > 0) {
-          showToast(`已把 ${moved} 个会话移到 ${targetPath}`)
-          setRetry(null)
-        } else {
-          setRetry(null)
-        }
+        closeMovePanel({ restoreFocus: true })
         clearSel()
+        setRetry(null)
+        showToast(summary.text, summary.kind)
+        if (queued.length) {
+          postJSON('/archived-sessions/pending-moves', {}).then((q) => setPendingQueue((q && q.items) || [])).catch(() => {})
+        }
         refresh()
       })
       .catch((e) => {
         setBusy(null)
-        setError(String((e && e.message) || e))
-        setRetry(e && e.code === BUSY_CODE ? { run: () => doBatchMove(ids) } : null)
+        const classified = classifyMoveError(e)
+        setMoveInlineError(classified.message)
+        if (classified.canStopAndMove) {
+          setMoveInlineAction({ label: '停止并移动', variant: 'warn', onClick: () => doBatchMove(ids, { stopRunning: true }) })
+          setRetry(null)
+        } else if (classified.canRetry) {
+          setMoveInlineAction({ label: '手动重试', variant: 'normal', onClick: () => doBatchMove(ids) })
+          setRetry({ run: () => doBatchMove(ids) })
+        } else {
+          setMoveInlineAction(null)
+          setRetry(null)
+        }
       })
   }
 
-  const openMoveFor = (it) => {
+  const openMoveFor = (it, triggerEl) => {
+    if (busy !== null) return
     if (!canMove.available) { setError(canMove.reason || '当前环境不支持跨工作区移动'); return }
-    if (openMove === it.sessionId) { setOpenMove(null); return }
+    if (openMove === it.sessionId) { closeMovePanel({ restoreFocus: true }); return }
     setOpenTags(null)
-    setTargetWs(workspaces.length ? (targetWs || workspaces[0].workspaceId) : '')
-    setMoveMode('existing')
-    setNewPath('')
-    setOpenMove(it.sessionId)
+    moveReturnFocusRef.current = triggerEl || document.activeElement || null
+    resetMoveDraft(workspaces.length ? 'existing' : 'new')
+    setMovePanel({ kind: 'single', sessionId: it.sessionId })
+  }
+
+  const toggleBatchMove = (triggerEl) => {
+    if (!canMove.available) { setError(canMove.reason || '当前环境不支持跨工作区移动'); return }
+    if (batchMoveOpen) { closeMovePanel({ restoreFocus: true }); return }
+    setOpenTags(null)
+    moveReturnFocusRef.current = triggerEl || document.activeElement || null
+    resetMoveDraft(workspaces.length ? 'existing' : 'new')
+    setMovePanel({ kind: 'batch' })
   }
 
   const pickDirectory = async () => {
-    if (!workspacesSvc || picking) return
+    if (!workspacesSvc || picking || busy !== null) return
     setPicking(true)
+    setMoveInlineError(null)
     try {
       const p = await workspacesSvc.pickDirectory()
       if (p) { setNewPath(p); setMoveMode('new') }
     } catch (e) {
-      setError(String((e && e.message) || e))
+      setMoveInlineError(String((e && e.message) || e))
     } finally {
       setPicking(false)
     }
@@ -1731,33 +2358,37 @@ function SessionPanel({ workspacesSvc }) {
   }
 
   const openTagsFor = (it) => {
+    if (busy !== null && movePanel) return
     if (!tagsReady) { showToast(tagsState === 'failed' ? '标签数据未能加载，暂时无法编辑标签；重新打开设置面板可重试' : '标签数据还在加载中，稍候再试', 'err'); return }
     if (openTags === it.sessionId) { setOpenTags(null); return }
-    setOpenMove(null)
+    if (movePanel) closeMovePanel()
     setCardTagName('')
     setOpenTags(it.sessionId)
   }
 
-  const runMenu = (id, it) => {
+  const runMenu = (id, it, triggerEl) => {
     setOpenMenu(null)
     if (id === 'restore') act('restore', it)
     else if (id === 'archive') act('archive', it)
     else if (id === 'delete') setDelTarget(it)
-    else if (id === 'move') openMoveFor(it)
+    else if (id === 'move') openMoveFor(it, triggerEl)
     else if (id === 'tags') openTagsFor(it)
     else if (id === 'details') toggleDetails(it)
   }
 
   const rowMenu = (it) => {
+    const moveLabel = openMove === it.sessionId ? '收起移动' : '移动'
+    const tagsLabel = openTags === it.sessionId ? '收起标签' : '标签'
+    const detailsLabel = openDetails === it.sessionId ? '收起详情' : '详情'
     const items = it.archived
       ? [
           ['restore', '恢复'],
-          ['move', openMove === it.sessionId ? '收起移动' : '移动'],
-          ['tags', '标签'],
-          ['details', openDetails === it.sessionId ? '收起详情' : '详情'],
+          ['move', moveLabel],
+          ['tags', tagsLabel],
+          ['details', detailsLabel],
           ['delete', '删除'],
         ]
-      : [['archive', '归档'], ['move', '移动'], ['tags', openTags === it.sessionId ? '收起标签' : '标签'], ['details', '详情'], ['delete', '删除']]
+      : [['archive', '归档'], ['move', moveLabel], ['tags', tagsLabel], ['details', detailsLabel], ['delete', '删除']]
     return (
       <div ref={openMenu === it.sessionId ? menuRef : null} className="more-wrap">
         <button
@@ -1781,7 +2412,10 @@ function SessionPanel({ workspacesSvc }) {
                 className={'more-item' + (id === 'delete' ? ' more-item-danger' : '')}
                 disabled={blocked}
                 title={blocked ? blockedTitle : undefined}
-                onClick={() => runMenu(id, it)}
+                onClick={(e) => {
+                  const triggerEl = e.currentTarget.closest('.more-wrap')?.querySelector('.more-btn') || null
+                  runMenu(id, it, triggerEl)
+                }}
               >{label}</button>
               )
             })}
@@ -1953,20 +2587,47 @@ function SessionPanel({ workspacesSvc }) {
             </div>
           )}
           {pendingQueue.length > 0 && (
-            <div className="mv-sheet" aria-label="待移动队列">
+            <div className="mv-sheet" aria-label="历史待移动记录">
               <div className="mv-sheet-head">
-                <h3 className="mv-sheet-title">待移动队列 · {pendingQueue.length}</h3>
+                <h3 className="mv-sheet-title">历史待移动记录 · {pendingQueue.length}</h3>
               </div>
-              <div className="dtl-note">这些会话正被 DSH 打开着，官方只在进程退出时释放写权限；释放后插件会自动完成移动，也可重启 DSH 让它在启动头几秒抢先补跑。</div>
-              {pendingQueue.map((q) => (
-                <div key={String(q.sessionId)} className="dsm-kid-row">
-                  <span className="dsm-kid-name" title={`${q.sessionId} → ${q.targetPath || ''}`}>{shortId(q.sessionId)}… → {pathTail(q.targetPath) || '目标工作区'}</span>
-                  <span className="dsm-kid-acts">
-                    {Number.isSafeInteger(q.attempts) && q.attempts > 0 ? <span className="maint-note">已失败 {q.attempts} 次</span> : null}
-                    <button type="button" className="archv-btn" onClick={() => cancelQueuedMove(q.sessionId)}>取消</button>
-                  </span>
-                </div>
-              ))}
+              <div className="dtl-note">以下为历史遗留的待移动记录，不会自动重试。可手动立即重试移动，或取消记录保留在原工作区。</div>
+              {pendingQueue.map((q) => {
+                const sid = String(q.sessionId)
+                const matched = sessionsById.get(sid)
+                const name = (matched && matched.title) || shortId(sid) || sid
+                const rowBusy = pendingBusy === sid
+                const rowErr = pendingRowErrors[sid] || null
+                return (
+                  <div key={sid} className="dsm-pending-item">
+                    <div className="dsm-kid-row">
+                      <span className="dsm-kid-name" title={`${sid} → ${q.targetPath || ''}`}>{name} → {pathTail(q.targetPath) || '目标工作区'}</span>
+                      <span className="dsm-kid-acts">
+                        {Number.isSafeInteger(q.attempts) && q.attempts > 0 ? <span className="maint-note">历史尝试 {q.attempts} 次</span> : null}
+                        <button type="button" className="archv-btn archv-go" disabled={pendingBusy !== null} onClick={() => retryPendingMove(q)}>
+                          {rowBusy ? '重试中…' : '立即重试'}
+                        </button>
+                        <button type="button" className="archv-btn" disabled={pendingBusy !== null} onClick={() => cancelQueuedMove(q.sessionId)}>取消</button>
+                      </span>
+                    </div>
+                    {rowErr && (
+                      <div className="dsm-pending-err" role="alert">
+                        <span>{rowErr.message}</span>
+                        {rowErr.canStopAndMove && (
+                          <button
+                            type="button"
+                            className="archv-errretry archv-warn-btn"
+                            disabled={pendingBusy !== null}
+                            onClick={() => retryPendingMove(q, { stopRunning: true })}
+                          >
+                            停止并移动
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )
+              })}
             </div>
           )}
           {aaOpen && (
@@ -2170,7 +2831,7 @@ function SessionPanel({ workspacesSvc }) {
               <span className="sess-btntext">{selIds.length ? `已选 ${selIds.length} 项` : (filter === 'archived' ? `共 ${archivedList.length} 个归档会话` : filter === 'starred' ? `共 ${starredList.length} 个收藏会话` : `共 ${totalTopCount} 个会话（活动 ${activeList.length} / 已归档 ${archivedList.length}）`)}</span>
               {/* issue #18 第 3 条：全选只覆盖当前列表里能单独勾选的行；折叠中的
                   子代理 / 分支成员与合成头不参与，避免「选中了看不见的东西」。 */}
-              <button type="button" className="archv-btn" disabled={topList.length === 0} title={groupByLineage ? '选中当前列表的会话行（折叠中的子代理与分支成员不会被选中）' : undefined} onClick={selectAll}>全选</button>
+              <button type="button" className="archv-btn" disabled={busy !== null || topList.length === 0} title={groupByLineage ? '选中当前列表的会话行（折叠中的子代理与分支成员不会被选中）' : undefined} onClick={selectAll}>全选</button>
               {selIds.length > 0 && (
                 <>
                   {filter === 'archived' && (
@@ -2190,65 +2851,47 @@ function SessionPanel({ workspacesSvc }) {
                       className="archv-btn"
                       disabled={busy !== null}
                       aria-expanded={batchMoveOpen}
-                      onClick={() => setBatchMoveOpen(!batchMoveOpen)}
+                      onClick={(e) => toggleBatchMove(e.currentTarget)}
                     >
                       移动所选…
                     </button>
                   )}
-                  <button type="button" className="archv-btn" onClick={clearSel}>取消选择</button>
+                  <button type="button" className="archv-btn" disabled={busy !== null} onClick={clearSel}>取消选择</button>
                 </>
               )}
-              {selIds.length > 0 && batchMoveOpen && canMove.available && (
-                <div className="mv-sheet" role="region" aria-label="批量移动到工作区">
-                  <div className="mv-sheet-head">
-                    <h3 className="mv-sheet-title">批量移动 {selIds.length} 个会话</h3>
-                    <button type="button" className="mv-sheet-close" aria-label="关闭" onClick={() => setBatchMoveOpen(false)}>×</button>
-                  </div>
-                  <div className="mv-seg" role="tablist">
-                    <button type="button" role="tab" aria-selected={moveMode === 'existing'} className={'mv-segbtn' + (moveMode === 'existing' ? ' mv-segbtn-on' : '')} onClick={() => setMoveMode('existing')}>已有工作区</button>
-                    <button type="button" role="tab" aria-selected={moveMode === 'new'} className={'mv-segbtn' + (moveMode === 'new' ? ' mv-segbtn-on' : '')} onClick={() => setMoveMode('new')}>新建目录</button>
-                  </div>
-                  {moveMode === 'existing' ? (
-                    <div className="mv-field">
-                      <label className="mv-field-label" htmlFor="mv-batch-ws">目标工作区</label>
-                      <select id="mv-batch-ws" value={targetWs} onChange={(e) => setTargetWs(e.target.value)}>
-                        {workspaces.length === 0 && <option value="">（暂无工作区）</option>}
-                        {workspaces.map((w) => (
-                          <option key={w.workspaceId} value={w.workspaceId}>{w.title} · {w.path}</option>
-                        ))}
-                      </select>
-                    </div>
-                  ) : (
-                    <div className="mv-field">
-                      <label className="mv-field-label" htmlFor="mv-batch-path">新工作区目录路径</label>
-                      <div className="mv-browse-row">
-                        <input
-                          id="mv-batch-path"
-                          type="text"
-                          value={newPath}
-                          onChange={(e) => setNewPath(e.target.value)}
-                          placeholder="例如 /Users/you/Projects/demo 或 ~/demo"
-                        />
-                        <button
-                          type="button"
-                          className="archv-btn"
-                          onClick={pickDirectory}
-                          disabled={busy !== null || picking || !workspacesSvc}
-                          title={!workspacesSvc ? '当前运行环境不支持系统目录选择' : '打开系统目录选择窗口'}
-                        >
-                          {picking ? '选择中…' : '浏览…'}
-                        </button>
-                      </div>
-                    </div>
-                  )}
-                  <div className="mv-foot">
-                    <button type="button" className="archv-btn" onClick={() => setBatchMoveOpen(false)}>取消</button>
-                    <button type="button" className="archv-btn archv-go" disabled={busy !== null} onClick={() => doBatchMove()}>
-                      {busy === '__batch__' && <span className="archv-spin" aria-hidden="true" />}确认移动
-                    </button>
-                  </div>
-                </div>
-              )}
+              {selIds.length > 0 && batchMoveOpen && canMove.available && (() => {
+                const runningBatchIds = batchMoveOutcome && Array.isArray(batchMoveOutcome.failedEntries)
+                  ? batchMoveOutcome.failedEntries.filter((f) => f.code === MOVE_ERR_RUNNING).map((f) => f.sessionId)
+                  : []
+                return (
+                <MoveDestinationSheet
+                  title={`批量移动 ${selIds.length} 个会话`}
+                  ariaLabel="批量移动到工作区"
+                  idPrefix="mv-batch"
+                  sourceItems={selIds.map((id) => sessionsById.get(String(id))).filter(Boolean)}
+                  workspaces={workspaces}
+                  mode={moveMode}
+                  onModeChange={(m) => { setMoveMode(m); setMoveInlineError(null); setMoveInlineAction(null) }}
+                  selectedWsId={targetWs}
+                  onSelectWsId={(id) => { setTargetWs(id); setMoveInlineError(null); setMoveInlineAction(null) }}
+                  wsQuery={moveWsQuery}
+                  onWsQueryChange={setMoveWsQuery}
+                  newPath={newPath}
+                  onNewPathChange={(v) => { setNewPath(v); setMoveInlineError(null); setMoveInlineAction(null) }}
+                  onPickDirectory={pickDirectory}
+                  picking={picking}
+                  canPickDirectory={!!workspacesSvc}
+                  submitting={busy === '__batch__'}
+                  onSubmit={() => doBatchMove()}
+                  onClose={() => closeMovePanel({ restoreFocus: true })}
+                  submitLabel={batchMoveOutcome && batchMoveOutcome.failedEntries && batchMoveOutcome.failedEntries.length > 0 ? '重试失败项' : '确认移动'}
+                  inlineError={moveInlineError}
+                  inlineAction={moveInlineAction}
+                  batchOutcome={batchMoveOutcome}
+                  onStopRunningBatch={runningBatchIds.length > 0 ? { count: runningBatchIds.length, onClick: () => doBatchMove(runningBatchIds, { stopRunning: true }) } : null}
+                />
+                )
+              })()}
             </div>
           )}
 
@@ -2294,6 +2937,7 @@ function SessionPanel({ workspacesSvc }) {
                       <input
                         type="checkbox"
                         className="archv-check"
+                        disabled={busy !== null}
                         checked={!!selected[it.sessionId]}
                         onChange={() => toggle(it.sessionId)}
                         aria-label={'选择 ' + (it.title || it.sessionId)}
@@ -2330,56 +2974,31 @@ function SessionPanel({ workspacesSvc }) {
                     </div>
                     {groupByLineage && renderKids(it.sessionId, 0)}
                     {groupByLineage && renderBranchGroup(it.sessionId)}
-                    {expanded && (
-                      <div className="mv-sheet" role="region" aria-label="移动到工作区">
-                        <div className="mv-sheet-head">
-                          <h3 className="mv-sheet-title">移动到工作区</h3>
-                          <button type="button" className="mv-sheet-close" aria-label="关闭" onClick={() => setOpenMove(null)}>×</button>
-                        </div>
-                        <div className="mv-seg" role="tablist">
-                          <button type="button" role="tab" aria-selected={moveMode === 'existing'} className={'mv-segbtn' + (moveMode === 'existing' ? ' mv-segbtn-on' : '')} onClick={() => setMoveMode('existing')}>已有工作区</button>
-                          <button type="button" role="tab" aria-selected={moveMode === 'new'} className={'mv-segbtn' + (moveMode === 'new' ? ' mv-segbtn-on' : '')} onClick={() => setMoveMode('new')}>新建目录</button>
-                        </div>
-                        {moveMode === 'existing' ? (
-                          <div className="mv-field">
-                            <label className="mv-field-label" htmlFor="mv-target-ws">目标工作区</label>
-                            <select id="mv-target-ws" value={targetWs} onChange={(e) => setTargetWs(e.target.value)}>
-                              {workspaces.length === 0 && <option value="">（暂无工作区）</option>}
-                              {workspaces.map((w) => (
-                                <option key={w.workspaceId} value={w.workspaceId}>{w.title} · {w.path}</option>
-                              ))}
-                            </select>
-                          </div>
-                        ) : (
-                          <div className="mv-field">
-                            <label className="mv-field-label" htmlFor="mv-new-path">新工作区目录路径</label>
-                            <div className="mv-browse-row">
-                              <input
-                                id="mv-new-path"
-                                type="text"
-                                value={newPath}
-                                onChange={(e) => setNewPath(e.target.value)}
-                                placeholder="例如 /Users/you/Projects/demo 或 ~/demo"
-                              />
-                              <button
-                                type="button"
-                                className="archv-btn"
-                                onClick={pickDirectory}
-                                disabled={busy !== null || picking || !workspacesSvc}
-                                title={!workspacesSvc ? '当前运行环境不支持系统目录选择' : '打开系统目录选择窗口'}
-                              >
-                                {picking ? '选择中…' : '浏览…'}
-                              </button>
-                            </div>
-                          </div>
-                        )}
-                        <div className="mv-foot">
-                          <button type="button" className="archv-btn" onClick={() => setOpenMove(null)}>取消</button>
-                          <button type="button" className="archv-btn archv-go" disabled={busy !== null} onClick={() => doMove(it)}>
-                            {busy === it.sessionId && <span className="archv-spin" aria-hidden="true" />}确认移动
-                          </button>
-                        </div>
-                      </div>
+                    {openMove === it.sessionId && (
+                      <MoveDestinationSheet
+                        title={`移动到工作区 · ${it.title || shortId(it.sessionId)}`}
+                        ariaLabel="移动到工作区"
+                        idPrefix={`mv-row-${String(it.sessionId)}`}
+                        sourceItems={[it]}
+                        workspaces={workspaces}
+                        mode={moveMode}
+                        onModeChange={(m) => { setMoveMode(m); setMoveInlineError(null); setMoveInlineAction(null) }}
+                        selectedWsId={targetWs}
+                        onSelectWsId={(id) => { setTargetWs(id); setMoveInlineError(null); setMoveInlineAction(null) }}
+                        wsQuery={moveWsQuery}
+                        onWsQueryChange={setMoveWsQuery}
+                        newPath={newPath}
+                        onNewPathChange={(v) => { setNewPath(v); setMoveInlineError(null); setMoveInlineAction(null) }}
+                        onPickDirectory={pickDirectory}
+                        picking={picking}
+                        canPickDirectory={!!workspacesSvc}
+                        submitting={busy === it.sessionId}
+                        onSubmit={() => doMove(it)}
+                        onClose={() => closeMovePanel({ restoreFocus: true })}
+                        submitLabel="确认移动"
+                        inlineError={moveInlineError}
+                        inlineAction={moveInlineAction}
+                      />
                     )}
                     {openTags === it.sessionId && (() => {
                       // T4 卡内标签编辑 sheet（mv-sheet 同型）：勾选即时全量
@@ -2558,7 +3177,7 @@ function SessionPanel({ workspacesSvc }) {
           ) : null}
         </>
       )}
-      {toast && <div className={'archv-status' + (toast.kind === 'err' ? ' archv-status-err' : '') + (String(toast.msg).length > 28 ? ' archv-status-long' : '')} role="status" title="点击关闭" onClick={() => setToast(null)}>{toast.msg}</div>}
+      {toast && <div className={'archv-status' + (toast.kind === 'err' ? ' archv-status-err' : toast.kind === 'warn' ? ' archv-status-warn' : '') + (String(toast.msg).length > 28 ? ' archv-status-long' : '')} role="status" title="点击关闭" onClick={() => setToast(null)}>{toast.msg}</div>}
       {delTarget && (
         <div className="dlg-backdrop" onClick={() => setDelTarget(null)}>
           <div ref={dialogRef} className="dlg" role="alertdialog" aria-modal="true" aria-label="删除会话" onClick={(e) => e.stopPropagation()}>
@@ -2661,14 +3280,23 @@ const SIDEBAR_AUG_CSS = `
 .dsm-btn:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
 .dsm-del{color:var(--dsw-alias-state-error-primary);border-color:color-mix(in srgb,var(--dsw-alias-state-error-primary) 45%,transparent)}
 .dsm-del:hover{background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 10%,transparent);color:var(--dsw-alias-state-error-primary)}
-.dsm-toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);z-index:2147483601;background:Canvas;color:CanvasText;border:1px solid color-mix(in srgb,CanvasText 25%,transparent);padding:9px 16px;border-radius:999px;font-size:12px;box-shadow:0 8px 24px rgb(0 0 0/.25);max-width:min(92vw,460px);cursor:pointer}
+.dsm-toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);z-index:2147483601;background:Canvas;color:CanvasText;border:1px solid color-mix(in srgb,CanvasText 25%,transparent);padding:9px 16px;border-radius:999px;font-size:12px;box-shadow:0 8px 24px rgb(0 0 0/.25);max-width:min(92vw,520px);cursor:pointer;display:flex;align-items:center;gap:10px}
 .dsm-toast-long{border-radius:14px;text-align:left;line-height:18px}
+.dsm-toast-warn{background:var(--dsw-alias-bg-layer-2,Canvas);color:var(--dsw-alias-label-primary,CanvasText);border:1px solid color-mix(in srgb,var(--dsw-alias-state-warn-primary,#EAB308) 65%,transparent);font-weight:500}
 .dsm-toast-err{background:#4A1D1D;color:#FFD9D9;border:1px solid var(--dsw-alias-state-error-primary)}
-.dsm-sub{position:fixed;z-index:1100;box-sizing:border-box;min-width:190px;max-width:320px;padding:4px;display:flex;flex-direction:column;gap:0;background:var(--dsw-specific-menu);backdrop-filter:var(--dsw-menu-backdrop-filter,blur(40px) saturate(150%));border:1px solid var(--dsw-alias-border-inverted);border-radius:12px;box-shadow:var(--dsw-shadow-lv3)}
+.dsm-toast-msg{flex:1;min-width:0}
+.dsm-toast-act{appearance:none;flex:none;padding:4px 10px;border:1px solid rgba(255,217,217,.55);border-radius:8px;background:rgba(255,255,255,.14);color:inherit;font:inherit;font-size:11.5px;font-weight:600;cursor:pointer;white-space:nowrap;transition:background-color .14s ease}
+.dsm-toast-act:hover:not(:disabled){background:rgba(255,255,255,.24)}
+.dsm-toast-act:focus-visible{outline:2px solid #fff;outline-offset:1px}
+.dsm-toast-act:disabled{opacity:.6;cursor:default}
+.dsm-toast-close{appearance:none;flex:none;width:20px;height:20px;padding:0;border:none;border-radius:6px;background:transparent;color:inherit;opacity:.75;font-size:14px;line-height:1;cursor:pointer;display:inline-flex;align-items:center;justify-content:center}
+.dsm-toast-close:hover{opacity:1;background:rgba(255,255,255,.14)}
+.dsm-sub{position:fixed;z-index:1100;box-sizing:border-box;min-width:190px;max-width:320px;max-height:min(320px,calc(100vh - 24px));overflow-y:auto;scrollbar-width:thin;padding:4px;display:flex;flex-direction:column;gap:0;background:var(--dsw-specific-menu);backdrop-filter:var(--dsw-menu-backdrop-filter,blur(40px) saturate(150%));border:1px solid var(--dsw-alias-border-inverted);border-radius:12px;box-shadow:var(--dsw-shadow-lv3)}
 .dsm-sub-loading,.dsm-sub-empty{font-size:12px;color:var(--dsw-alias-label-tertiary);padding:6px 10px}
 .dsm-sub-err{font-size:12px;color:var(--dsw-alias-state-error-primary);padding:6px 10px}
 .dsm-sub-item{display:flex;align-items:center;gap:8px;width:100%;min-height:36px;padding:6px 10px;border:none;border-radius:8px;background:transparent;cursor:pointer;font-size:13px;line-height:18px;color:var(--dsw-alias-label-primary);text-align:left}
 .dsm-sub-item:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover)}
+.dsm-sub-item:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:-2px;background:var(--dsw-alias-interactive-bg-hover)}
 .dsm-sub-item:disabled{opacity:.5;cursor:default}
 .dsm-sub-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dsm-sub-cur{font-size:11px;color:var(--dsw-alias-state-business-primary);flex:none;margin-left:8px}
@@ -2734,17 +3362,32 @@ const SIDEBAR_AUG_CSS = `
 .dsm-tag{display:inline-flex;align-items:center;margin-left:auto;padding:1px 7px;border-radius:999px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-tertiary);font-size:10px;font-weight:500;line-height:15px;flex:none;pointer-events:auto;border:none;cursor:default}
 .dsm-tag-fork{cursor:pointer;background:color-mix(in srgb,var(--dsw-alias-state-success-primary) 12%,transparent);color:var(--dsw-alias-state-success-primary);font-weight:600}
 .dsm-tag-fork:hover{background:color-mix(in srgb,var(--dsw-alias-state-success-primary) 20%,transparent)}
+.dsm-forks-badge{appearance:none;display:inline-flex;align-items:center;gap:3px;margin-left:auto;padding:1px 7px;border:.5px solid color-mix(in srgb,var(--dsw-alias-state-success-primary) 34%,transparent);border-radius:999px;background:color-mix(in srgb,var(--dsw-alias-state-success-primary) 9%,transparent);color:var(--dsw-alias-state-success-primary);font:inherit;font-size:10px;font-weight:600;line-height:15px;cursor:pointer;flex:none;pointer-events:auto;font-variant-numeric:tabular-nums;transition:background-color .14s ease,border-color .14s ease}
+.dsm-forks-badge:hover{background:color-mix(in srgb,var(--dsw-alias-state-success-primary) 18%,transparent);border-color:color-mix(in srgb,var(--dsw-alias-state-success-primary) 55%,transparent)}
+.dsm-forks-badge:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:1px}
+.dsm-fork-tree{display:flex;flex-direction:column;gap:2px;margin:2px 6px 6px 18px;padding-left:10px;border-left:1px solid color-mix(in srgb,var(--dsw-alias-state-success-primary) 34%,var(--dsw-alias-border-l2));pointer-events:auto}
+.dsm-fork-row{appearance:none;display:flex;align-items:center;gap:6px;width:100%;min-height:26px;padding:3px 7px;border:none;border-radius:7px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:11.5px;text-align:left;cursor:pointer;position:relative;transition:background-color .14s ease,color .14s ease}
+.dsm-fork-row:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}
+.dsm-fork-row:focus-visible{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:-1px}
+.dsm-fork-row--active{background:var(--dsw-alias-interactive-bg-active);color:var(--dsw-alias-label-primary);font-weight:550}
+.dsm-fork-ico{flex:none;color:var(--dsw-alias-state-success-primary);display:inline-flex;opacity:.85}
+.dsm-fork-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dsm-fork-ws{flex:none;max-width:92px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:0 5px;border-radius:999px;border:.5px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:16px}
+.dsm-fork-arch{flex:none;padding:0 5px;border-radius:999px;border:.5px dashed var(--dsw-alias-border-l3);color:var(--dsw-alias-label-tertiary);font-size:10px;line-height:15px}
+.dsm-row-fork-child{margin-left:var(--dsm-fork-indent,10px);max-width:calc(100% - var(--dsm-fork-indent,10px));box-sizing:border-box;position:relative;transition:margin-left .15s ease}
+.dsm-row-fork-child::before{content:'';position:absolute;left:calc(-6px);top:4px;bottom:4px;width:1.5px;border-radius:1px;background:color-mix(in srgb,var(--dsw-alias-state-success-primary) 38%,transparent);pointer-events:none}
 .dsm-row-flash{outline:2px solid var(--dsw-alias-state-business-primary);outline-offset:-2px;border-radius:8px;transition:outline-color .6s ease}
 /* 徽标/标签统一显隐（对齐「子代理折叠」的节奏）：默认一律隐藏，维持 DSH
    原生行外观；行被选中（dsm-row-active，paint 按 activeId 刷新）、鼠标悬
    停、键盘聚焦或已展开子代理列表（dsm-row-open）时才出现。display 切换
-   不占位：隐藏时标题拿全宽，悬停时才让位给徽标。 */
+   不占位：隐藏时标题拿全宽，悬停时才让位给徽标。分支树徽标 .dsm-forks-badge
+   保持轻度常驻可见，便于一眼识别有子分支的会话。 */
 [role="treeitem"]>.dsm-kids-badge,[role="treeitem"]>.dsm-tag{display:none}
 [role="treeitem"]:hover>.dsm-kids-badge,[role="treeitem"]:hover>.dsm-tag,
 [role="treeitem"].dsm-row-active>.dsm-kids-badge,[role="treeitem"].dsm-row-active>.dsm-tag,
 [role="treeitem"].dsm-row-open>.dsm-kids-badge,
 [role="treeitem"]:focus-within>.dsm-kids-badge,[role="treeitem"]:focus-within>.dsm-tag{display:inline-flex}
-@media (prefers-reduced-motion:reduce){.dsm-row-sub{transition:none}.dsm-row-flash{transition:none}}
+@media (prefers-reduced-motion:reduce){.dsm-row-sub,.dsm-row-fork-child,.dsm-forks-badge,.dsm-fork-row{transition:none}.dsm-row-flash{transition:none}}
 @media (max-width:640px){.dsm-storage-bar{display:none}.dsm-storage-count{max-width:40%}}
 `
 
@@ -2781,6 +3424,189 @@ let dsmCapabilities = null
 // 血缘分层披露（issue #6）：服务端血缘分类 + 本地视图状态。
 // dsmLineage: id → { origin, parentSession, delegationDepth, empty }
 const dsmLineage = new Map()
+// 轻量会话元数据缓存（workspacePath / archived / title），仅在展开分支树或拖拽刷新时按需填充。
+const dsmSessionMetaCache = new Map()
+let dsmSessionMetaAt = 0
+let dsmSessionMetaInflight = null
+const DSM_SESSION_META_TTL = 30000
+function dsmHydrateSessionMeta(items) {
+  if (!Array.isArray(items)) return
+  for (const it of items) {
+    if (!it || it.sessionId == null) continue
+    dsmSessionMetaCache.set(String(it.sessionId), {
+      workspacePath: typeof it.workspacePath === 'string' ? it.workspacePath : null,
+      workspaceTitle: typeof it.workspaceTitle === 'string' ? it.workspaceTitle : null,
+      archived: Boolean(it.archived),
+      title: typeof it.title === 'string' ? it.title : null,
+    })
+  }
+  dsmSessionMetaAt = Date.now()
+}
+function dsmEnsureSessionMeta() {
+  if (dsmSessionMetaInflight) return dsmSessionMetaInflight
+  if (dsmSessionMetaCache.size > 0 && Date.now() - dsmSessionMetaAt < DSM_SESSION_META_TTL) {
+    return Promise.resolve(dsmSessionMetaCache)
+  }
+  dsmSessionMetaInflight = postJSON('/archived-sessions/sessions', {})
+    .then((r) => {
+      dsmHydrateSessionMeta(r && r.items)
+      if (dsmRepaintDots) dsmRepaintDots()
+      return dsmSessionMetaCache
+    })
+    .catch(() => dsmSessionMetaCache)
+    .finally(() => { dsmSessionMetaInflight = null })
+  return dsmSessionMetaInflight
+}
+function dsmGetSessionCwd(id) {
+  const rec = dsmSessionMetaCache.get(String(id || ''))
+  return rec && rec.workspacePath ? rec.workspacePath : null
+}
+
+// 分支血缘变化订阅：当某个父会话的非子代理分支列表变化时，通知对话内分支点组件刷新。
+const dsmForkLineageWatchers = new Map()
+const dsmLastForkSigByParent = new Map()
+function dsmForkChildrenSigFor(parentId) {
+  const pid = String(parentId || '')
+  if (!pid) return ''
+  const kids = []
+  for (const [id, info] of dsmLineage.entries()) {
+    if (!info || info.origin === 'subagent' || String(info.parentSession || '') !== pid) continue
+    kids.push(id)
+  }
+  kids.sort()
+  return kids.join(',')
+}
+function dsmSubscribeForkLineage(parentId, fn) {
+  const pid = String(parentId || '')
+  if (!pid || typeof fn !== 'function') return () => {}
+  if (!dsmForkLineageWatchers.has(pid)) dsmForkLineageWatchers.set(pid, new Set())
+  dsmForkLineageWatchers.get(pid).add(fn)
+  dsmLastForkSigByParent.set(pid, dsmForkChildrenSigFor(pid))
+  return () => {
+    const set = dsmForkLineageWatchers.get(pid)
+    if (!set) return
+    set.delete(fn)
+    if (!set.size) {
+      dsmForkLineageWatchers.delete(pid)
+      dsmLastForkSigByParent.delete(pid)
+    }
+  }
+}
+function dsmNotifyForkLineageWatchers() {
+  for (const [pid, fns] of dsmForkLineageWatchers.entries()) {
+    const sig = dsmForkChildrenSigFor(pid)
+    const prev = dsmLastForkSigByParent.get(pid)
+    if (sig === prev) continue
+    dsmLastForkSigByParent.set(pid, sig)
+    for (const fn of fns) {
+      try { fn() } catch (e) { /* watcher isolated */ }
+    }
+  }
+}
+
+// 侧栏共用浮动 toast（菜单 / 拖拽 / 分支操作复用同一通道，支持仅对 DSM_SESSION_RUNNING 挂载显式「停止并移动」按钮）。
+function dsmEnsureSidebarAugStyle() {
+  if (typeof document === 'undefined') return
+  if (document.querySelector('style[data-dsm=aug]')) return
+  const s = document.createElement('style')
+  s.dataset.dsm = 'aug'
+  s.textContent = SIDEBAR_AUG_CSS
+  document.head.appendChild(s)
+}
+function dsmShowFloatingToast(msg, kind, action) {
+  if (typeof document === 'undefined' || !document.body) return
+  dsmEnsureSidebarAugStyle()
+  const text = String(msg == null ? '' : msg)
+  const normKind = kind === 'err' ? 'err' : kind === 'warn' ? 'warn' : 'ok'
+  document.querySelectorAll('[data-dsm-move-toast]').forEach((el) => el.remove())
+  const t = document.createElement('div')
+  t.setAttribute('data-dsm-move-toast', '')
+  t.className = 'dsm-toast'
+    + (normKind === 'err' ? ' dsm-toast-err' : normKind === 'warn' ? ' dsm-toast-warn' : '')
+    + (text.length > 28 || action ? ' dsm-toast-long' : '')
+  t.setAttribute('role', normKind === 'err' ? 'alert' : 'status')
+  let killTimer = null
+  const kill = () => { if (killTimer) clearTimeout(killTimer); t.remove() }
+  const msgEl = document.createElement('span')
+  msgEl.className = 'dsm-toast-msg'
+  msgEl.textContent = text
+  t.appendChild(msgEl)
+  if (action && typeof action.onAction === 'function') {
+    const actBtn = document.createElement('button')
+    actBtn.type = 'button'
+    actBtn.className = 'dsm-toast-act'
+    actBtn.textContent = action.label || '停止并移动'
+    actBtn.addEventListener('click', async (e) => {
+      e.stopPropagation()
+      e.preventDefault()
+      if (actBtn.disabled) return
+      actBtn.disabled = true
+      actBtn.textContent = action.busyLabel || '处理中…'
+      if (killTimer) { clearTimeout(killTimer); killTimer = null }
+      try {
+        await action.onAction()
+      } finally {
+        if (t.isConnected) kill()
+      }
+    })
+    t.appendChild(actBtn)
+    const closeBtn = document.createElement('button')
+    closeBtn.type = 'button'
+    closeBtn.className = 'dsm-toast-close'
+    closeBtn.setAttribute('aria-label', '关闭提示')
+    closeBtn.textContent = '×'
+    closeBtn.addEventListener('click', (e) => { e.stopPropagation(); kill() })
+    t.appendChild(closeBtn)
+    killTimer = setTimeout(kill, Math.max(12000, toastDurationFor(text, normKind)))
+  } else {
+    t.title = '点击关闭'
+    t.addEventListener('click', kill)
+    killTimer = setTimeout(kill, toastDurationFor(text, normKind))
+  }
+  document.body.appendChild(t)
+}
+
+// 侧栏统一立即移动入口（菜单 / 拖拽共用）：无重启文案、无排队成功；仅 DSM_SESSION_RUNNING 提供「停止并移动」。
+async function dsmRunSidebarMove({ sessionId, targetPath, targetLabel, stopRunning = false, onSuccess }) {
+  const sid = String(sessionId || '')
+  try {
+    const result = await postActiveAware('/archived-sessions/move', {
+      sessionId: sid,
+      targetPath,
+      ...(stopRunning ? { stopRunning: true } : {}),
+    })
+    const destLabel = (result && result.workspaceTitle) || targetLabel || pathTail(targetPath) || '目标工作区'
+    const outcome = formatSingleMoveResult(result, { targetLabel: destLabel })
+    if (result && result.queued) {
+      dsmShowFloatingToast(outcome.text, 'err')
+      return result
+    }
+    if (typeof onSuccess === 'function') {
+      try { await onSuccess(result) } catch (e) {}
+    }
+    await dsmLoadTrashIds().catch(() => {})
+    dsmShowFloatingToast(outcome.text, outcome.kind)
+    return result
+  } catch (err) {
+    const classified = classifyMoveError(err)
+    if (classified.canStopAndMove) {
+      dsmShowFloatingToast(classified.message, 'err', {
+        label: '停止并移动',
+        busyLabel: '停止并移动中…',
+        onAction: () => dsmRunSidebarMove({
+          sessionId: sid,
+          targetPath,
+          targetLabel,
+          stopRunning: true,
+          onSuccess,
+        }),
+      })
+    } else {
+      dsmShowFloatingToast(classified.message, 'err')
+    }
+    return null
+  }
+}
 // v3.6.2：host 预热是否还在途（sidebar-state/sessions 的 warmPending 旗标）。
 // 在途 → 侧栏轮询从 32s 台阶收紧到每拍（4s），标题/血缘一补齐就浮现；
 // 完成瞬间（true→false）触发一次性回调（面板自动补刷新，见 dsmOnWarmDone）。
@@ -2892,6 +3718,7 @@ async function dsmLoadTrashIds() {
     for (const [id, info] of Object.entries((r && r.lineage) || {})) {
       if (info && typeof info === 'object') dsmLineage.set(String(id), info)
     }
+    dsmNotifyForkLineageWatchers()
     // v3.6.2：预热完成的瞬间广播一次（面板挂自动补刷新；侧栏靠节拍恢复 32s）。
     // T1：旧 host 无 refinePending 字段 → !!undefined===false，节拍/广播语义
     // 与 3.6.2 完全一致（新 client 绝不在旧 host 上疯轮询）。
@@ -2955,10 +3782,17 @@ const SIDEBAR_ADAPTER_MAX_MISSES = 200
 // 只按自己的 data-dsm-* 标记删除，绝不碰 DSH 自己的节点。
 function dsmTeardownSidebarAug() {
   if (typeof document === 'undefined') return
-  const selectors = ['[data-dsm-dot]', '[data-dsm-kids]', '[data-dsm-subs]', '[data-dsm-tag]']
+  const selectors = ['[data-dsm-dot]', '[data-dsm-kids]', '[data-dsm-subs]', '[data-dsm-tag]', '[data-dsm-forks]', '[data-dsm-fork-tree]']
   for (const sel of selectors) {
     try { document.querySelectorAll(sel).forEach((el) => el.remove()) } catch (e) { /* best-effort */ }
   }
+  try {
+    document.querySelectorAll('.dsm-row-fork-child,.dsm-row-forks-open,.dsm-row-sub,.dsm-row-open').forEach((row) => {
+      row.classList.remove('dsm-row-fork-child', 'dsm-row-forks-open', 'dsm-row-sub', 'dsm-row-open')
+      row.style.removeProperty('--dsm-fork-indent')
+      row.style.removeProperty('--dsm-indent')
+    })
+  } catch (e) { /* best-effort */ }
   try {
     // issue #16：被隐藏的会话行与展开按钮在卸载时还原——adapter 停用（上游
     // 改版）或插件停用后，不能把「看不见的会话」留在官方侧栏上。
@@ -3056,9 +3890,13 @@ function installSidebarSessionMenuAug(ctx) {
   if (sidebarMenuAugInstalled) return
   sidebarMenuAugInstalled = true
   const AUG = 'data-dsm-aug'
-  let styleInjected = false
+  let styleInjected = !!document.querySelector('style[data-dsm=aug]')
   let activeSubClose = null
+  let activeSubEl = null
+  let activeSubTrigger = null
+  let activeSubMode = null
   let hoverTimer = null
+  const movingSessionIds = new Set()
 
   // Walk the React fiber chain from the portalled menu element up to the
   // SessionNodeItem component, which carries `node.id` (the session id).
@@ -3086,86 +3924,151 @@ function installSidebarSessionMenuAug(ctx) {
     d.textContent = s == null ? '' : String(s)
     return d.innerHTML
   }
-  const toast = (msg) => {
-    const t = document.createElement('div')
-    const text = String(msg == null ? '' : msg)
-    t.className = 'dsm-toast' + (text.length > 28 ? ' dsm-toast-long' : '')
-    t.textContent = text
-    t.title = '点击关闭'
-    t.setAttribute('role', 'status')
-    document.body.appendChild(t)
-    // 停留时长按字数给（固定 2.6s 读不完排队/失败类文案），并允许点击提前关闭。
-    let killTimer = null
-    const kill = () => { if (killTimer) clearTimeout(killTimer); t.remove() }
-    killTimer = setTimeout(kill, toastDurationFor(text))
-    t.addEventListener('click', kill)
-  }
   const ensureStyle = () => {
-    if (styleInjected) return
+    if (styleInjected || document.querySelector('style[data-dsm=aug]')) { styleInjected = true; return }
     const s = document.createElement('style')
     s.dataset.dsm = 'aug'
     s.textContent = SIDEBAR_AUG_CSS
     document.head.appendChild(s)
     styleInjected = true
   }
-  const closeMoveSubmenu = () => {
-    if (activeSubClose) { const f = activeSubClose; activeSubClose = null; f() }
+  const toast = (msg, kind, action) => {
+    dsmShowFloatingToast(msg, kind, action)
   }
-  const openMoveSubmenu = (moveBtn, info) => {
+  const closeMoveSubmenu = (opts = {}) => {
+    if (hoverTimer) { clearTimeout(hoverTimer); hoverTimer = null }
+    if (activeSubClose) { const f = activeSubClose; activeSubClose = null; f(opts) }
+  }
+  const openMoveSubmenu = (moveBtn, info, mode = 'hover', { focusFirst = false } = {}) => {
     ensureStyle()
     closeMoveSubmenu()
+    let closed = false
+    let focusOnLoad = focusFirst
+    activeSubMode = mode
+    activeSubTrigger = moveBtn
+    moveBtn.setAttribute('aria-expanded', 'true')
     const sub = document.createElement('div')
+    activeSubEl = sub
     sub.className = 'dsm-sub'
     sub.setAttribute('role', 'menu')
+    sub.setAttribute('aria-label', '选择目标工作区')
     sub.setAttribute('data-dsm-sub', '')
     sub.innerHTML = '<div class="dsm-sub-loading">加载工作区…</div>'
-    const r = moveBtn.getBoundingClientRect()
     // Fixed-position card: once the async content renders it can be tall or
     // wide enough to hang past the viewport edges, so re-clamp both anchors
-    // against the rendered size.
+    // against the rendered size and flip left when right edge overflows.
     const placeSub = () => {
-      sub.style.top = Math.max(8, Math.min(Math.round(r.top - 4), window.innerHeight - sub.offsetHeight - 8)) + 'px'
-      sub.style.left = Math.max(8, Math.min(Math.round(r.right + 10), window.innerWidth - sub.offsetWidth - 8)) + 'px'
+      const r = moveBtn.getBoundingClientRect()
+      const subW = sub.offsetWidth || 200
+      const subH = sub.offsetHeight || 44
+      const spaceRight = window.innerWidth - r.right - 10
+      const preferredLeft = spaceRight >= subW || r.left - subW - 10 < 8
+        ? r.right + 10
+        : r.left - subW - 10
+      sub.style.top = Math.max(8, Math.min(Math.round(r.top - 4), window.innerHeight - subH - 8)) + 'px'
+      sub.style.left = Math.max(8, Math.min(Math.round(preferredLeft), window.innerWidth - subW - 8)) + 'px'
+    }
+    const enabledItems = () => [...sub.querySelectorAll('.dsm-sub-item:not(:disabled)')]
+    const focusSubItem = (index) => {
+      const items = enabledItems()
+      if (!items.length) return false
+      const target = items[Math.max(0, Math.min(items.length - 1, index))]
+      if (!target) return false
+      target.focus()
+      target.scrollIntoView({ block: 'nearest' })
+      return true
+    }
+    sub.__dsmFocusFirst = () => {
+      if (!focusSubItem(0)) focusOnLoad = true
     }
     document.body.appendChild(sub)
     placeSub()
-    const closeSub = () => {
+    const closeSub = ({ restoreFocus = false } = {}) => {
+      if (closed) return
+      closed = true
       activeSubClose = null
+      if (activeSubEl === sub) activeSubEl = null
+      if (activeSubTrigger === moveBtn) activeSubTrigger = null
+      activeSubMode = null
+      if (moveBtn && moveBtn.isConnected) moveBtn.setAttribute('aria-expanded', 'false')
       if (sub.parentNode) sub.remove()
       document.removeEventListener('mousedown', onDocDown, true)
-      window.removeEventListener('blur', closeSub)
+      document.removeEventListener('keydown', onDocKeyDown, true)
+      window.removeEventListener('blur', onWinBlur)
+      if (restoreFocus && moveBtn && moveBtn.isConnected && typeof moveBtn.focus === 'function') {
+        requestAnimationFrame(() => moveBtn.focus())
+      }
     }
+    const onWinBlur = () => closeSub()
     const onDocDown = (e) => {
       if (sub.contains(e.target) || moveBtn.contains(e.target)) return
       closeSub()
+    }
+    const onDocKeyDown = (e) => {
+      if (closed) return
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        e.stopPropagation()
+        if (typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation()
+        closeSub({ restoreFocus: true })
+        return
+      }
+      const inSub = sub.contains(document.activeElement)
+      if (e.key === 'ArrowLeft' && inSub) {
+        e.preventDefault()
+        e.stopPropagation()
+        if (typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation()
+        closeSub({ restoreFocus: true })
+        return
+      }
+      if (e.key === 'Tab' && inSub) {
+        closeSub({ restoreFocus: true })
+        return
+      }
+      if (inSub && (e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'Home' || e.key === 'End')) {
+        const items = enabledItems()
+        if (!items.length) return
+        e.preventDefault()
+        e.stopPropagation()
+        const idx = items.indexOf(document.activeElement)
+        if (e.key === 'ArrowDown') focusSubItem(idx < 0 ? 0 : (idx + 1) % items.length)
+        else if (e.key === 'ArrowUp') focusSubItem(idx <= 0 ? items.length - 1 : idx - 1)
+        else if (e.key === 'Home') focusSubItem(0)
+        else if (e.key === 'End') focusSubItem(items.length - 1)
+      }
     }
     // Keep DSH's own outside-click handler from closing the parent menu while
     // the pointer is over our submenu (it lives outside the portalled card).
     sub.addEventListener('mousedown', (e) => e.stopPropagation())
     // Hover bridging: moving from the trigger button across the 10px gap to
-    // the submenu must not dismiss it; entering the submenu cancels the
-    // pending close timer set on the button's mouseleave.
+    // the submenu must not dismiss it; only hover-opened submenus auto-close on leave.
     sub.addEventListener('mouseenter', () => { if (hoverTimer) { clearTimeout(hoverTimer); hoverTimer = null } })
-    sub.addEventListener('mouseleave', () => { hoverTimer = setTimeout(() => closeSub(), 160) })
+    sub.addEventListener('mouseleave', () => {
+      if (activeSubMode !== 'hover') return
+      hoverTimer = setTimeout(() => closeSub(), 160)
+    })
     setTimeout(() => document.addEventListener('mousedown', onDocDown, true), 0)
-    window.addEventListener('blur', closeSub)
+    document.addEventListener('keydown', onDocKeyDown, true)
+    window.addEventListener('blur', onWinBlur)
     activeSubClose = closeSub
     Promise.all([
       postJSON('/archived-sessions/workspaces', {}),
       postJSON('/archived-sessions/sessions', {}),
     ]).then(([ws, sess]) => {
+      if (closed || !sub.isConnected) return
       const items = ws.items || []
       const cur = (sess.items || []).find((x) => x.sessionId === info.id)
       const curPath = cur ? cur.workspacePath : (info.cwd || null)
       if (!items.length) { sub.innerHTML = '<div class="dsm-sub-empty">（暂无可用工作区）</div>'; placeSub(); return }
       sub.innerHTML = ''
       items.forEach((w) => {
-        const isCur = !!curPath && w.path === curPath
+        const isCur = !!curPath && sameWorkspacePath(w.path, curPath)
         const b = document.createElement('button')
         b.type = 'button'
         b.className = 'dsm-sub-item'
         b.setAttribute('role', 'menuitem')
         b.disabled = isCur
+        b.title = isCur ? '会话已在该工作区中' : w.path
         const name = document.createElement('span')
         name.className = 'dsm-sub-name'
         name.textContent = w.title || pathName(w.path) || w.workspaceId
@@ -3179,26 +4082,36 @@ function installSidebarSessionMenuAug(ctx) {
         b.addEventListener('click', (e) => {
           e.stopPropagation()
           e.preventDefault()
+          if (isCur || movingSessionIds.has(String(info.id))) return
+          movingSessionIds.add(String(info.id))
           closeSub()
           closeMenu()
-          postActiveAware('/archived-sessions/move', { sessionId: info.id, targetPath: w.path })
-            .then((r) => {
-              // 会话被 DSH 打开（活跃/未关闭）时服务端只登记排队：磁盘与工作区分组都没动。
-              // 这条路径原先无条件报「移动成功」——2026-09-10 用户报的「说移动成功但还在
-              // 原工作区」就是这个。必须按服务端结果如实说明。
-              const label = w.title || pathName(w.path) || '目标工作区'
-              if (r && r.queued) {
-                toast(r.notes && r.notes.length ? r.notes.join(' ') : '会话正被 DSH 打开，已排队待移动；重启 DSH 后会自动完成（请先别打开它）。')
-                return
+          const label = w.title || pathName(w.path) || '目标工作区'
+          dsmRunSidebarMove({
+            sessionId: info.id,
+            targetPath: w.path,
+            targetLabel: label,
+            onSuccess: (r) => {
+              if (!(r && r.already)) {
+                const prev = dsmSessionMetaCache.get(String(info.id)) || {}
+                dsmSessionMetaCache.set(String(info.id), {
+                  ...prev,
+                  workspacePath: (r && r.workspacePath) || w.path,
+                  workspaceTitle: (r && r.workspaceTitle) || label,
+                })
               }
-              toast(r && r.already ? `已在「${label}」` : `已移到「${label}」`)
-            })
-            .catch((ee) => toast('移动失败：' + String((ee && ee.message) || ee)))
+            },
+          }).finally(() => movingSessionIds.delete(String(info.id)))
         })
         sub.appendChild(b)
       })
       placeSub()
+      if (focusOnLoad) {
+        focusOnLoad = false
+        focusSubItem(0)
+      }
     }).catch((e) => {
+      if (closed || !sub.isConnected) return
       sub.innerHTML = '<div class="dsm-sub-err">' + escapeHtml(String((e && e.message) || e)) + '</div>'
       placeSub()
     })
@@ -3251,6 +4164,7 @@ function installSidebarSessionMenuAug(ctx) {
           postJSON('/archived-sessions/workspaces', {}),
           postJSON('/archived-sessions/sessions', {}),
         ])
+        dsmHydrateSessionMeta(sess && sess.items)
         const sessionPath = new Map()
         for (const item of (sess && sess.items) || []) {
           if (item && item.sessionId != null && typeof item.workspacePath === 'string') {
@@ -3324,24 +4238,35 @@ function installSidebarSessionMenuAug(ctx) {
           afterContent: true,
           children: snap.workspaces.map((w) => {
             const name = w.title || pathName(w.path) || w.workspaceId
-            const isCur = !!curPath && w.path === curPath
+            const isCur = !!curPath && sameWorkspacePath(w.path, curPath)
             return {
               id: 'ws:' + String(w.path),
               label: isCur ? name + '（当前）' : name,
               disabled: isCur,
               failureLabel: '移动失败',
               run: async () => {
-                const r = await postActiveAware('/archived-sessions/move', { sessionId: id, targetPath: w.path })
-                // 移动成功后会话归属变了：让下一次打开菜单重新取快照，否则「（当前）」
-                // 仍标在旧工作区上。
-                menuSnapshot = { ...menuSnapshot, at: 0 }
-                // 会话被 DSH 打开时服务端只登记排队：磁盘与工作区分组都没动，
-                // 绝不能报「已移动」（issue #18 的教训位）。
-                if (r && r.queued) {
-                  toast(r.notes && r.notes.length ? r.notes.join(' ') : '会话正被 DSH 打开，已排队待移动；重启 DSH 后会自动完成（请先别打开它）。')
-                  return
+                if (movingSessionIds.has(id)) return
+                movingSessionIds.add(id)
+                try {
+                  await dsmRunSidebarMove({
+                    sessionId: id,
+                    targetPath: w.path,
+                    targetLabel: name,
+                    onSuccess: (r) => {
+                      menuSnapshot = { ...menuSnapshot, at: 0 }
+                      if (!(r && r.already)) {
+                        const prev = dsmSessionMetaCache.get(id) || {}
+                        dsmSessionMetaCache.set(id, {
+                          ...prev,
+                          workspacePath: (r && r.workspacePath) || w.path,
+                          workspaceTitle: (r && r.workspaceTitle) || name,
+                        })
+                      }
+                    },
+                  })
+                } finally {
+                  movingSessionIds.delete(id)
                 }
-                toast(r && r.already ? `已在「${name}」` : `已移到「${name}」`)
               },
             }
           }),
@@ -3419,13 +4344,47 @@ function installSidebarSessionMenuAug(ctx) {
     chev.style.cssText = 'margin-left:auto;flex:none;color:var(--dsw-alias-label-tertiary);font-size:14px;line-height:1'
     chev.textContent = '›'
     move.btn.appendChild(chev)
+    move.btn.setAttribute('aria-haspopup', 'menu')
+    move.btn.setAttribute('aria-expanded', 'false')
     move.btn.addEventListener('mouseenter', () => {
-      if (!document.querySelector('[data-dsm-sub]')) openMoveSubmenu(move.btn, info)
+      if (move.btn.disabled) return
+      if (hoverTimer) { clearTimeout(hoverTimer); hoverTimer = null }
+      if (activeSubEl && activeSubTrigger === move.btn) return
+      openMoveSubmenu(move.btn, info, 'hover', { focusFirst: false })
     })
     move.btn.addEventListener('mouseleave', () => {
+      if (activeSubMode !== 'hover') return
       hoverTimer = setTimeout(() => closeMoveSubmenu(), 160)
     })
-    move.btn.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault() })
+    move.btn.addEventListener('click', (e) => {
+      e.stopPropagation()
+      e.preventDefault()
+      if (move.btn.disabled) return
+      if (activeSubEl && activeSubTrigger === move.btn) {
+        if (activeSubMode === 'hover') {
+          if (hoverTimer) { clearTimeout(hoverTimer); hoverTimer = null }
+          activeSubMode = 'click'
+          if (typeof activeSubEl.__dsmFocusFirst === 'function') activeSubEl.__dsmFocusFirst()
+          return
+        }
+        closeMoveSubmenu({ restoreFocus: true })
+        return
+      }
+      openMoveSubmenu(move.btn, info, 'click', { focusFirst: true })
+    })
+    move.btn.addEventListener('keydown', (e) => {
+      if (move.btn.disabled) return
+      if (e.key === 'Enter' || e.key === ' ' || e.key === 'ArrowRight') {
+        e.preventDefault()
+        e.stopPropagation()
+        if (activeSubEl && activeSubTrigger === move.btn) {
+          activeSubMode = 'keyboard'
+          if (typeof activeSubEl.__dsmFocusFirst === 'function') activeSubEl.__dsmFocusFirst()
+          return
+        }
+        openMoveSubmenu(move.btn, info, 'keyboard', { focusFirst: true })
+      }
+    })
     del.btn.addEventListener('click', (e) => {
       e.stopPropagation()
       e.preventDefault()
@@ -3458,6 +4417,7 @@ function installSidebarSessionMenuAug(ctx) {
   const seen = new WeakSet()
   const obs = new MutationObserver(() => {
     if (sidebarAdapter.disabled) return
+    if (activeSubTrigger && !activeSubTrigger.isConnected) closeMoveSubmenu()
     const menus = document.querySelectorAll('body > [role="menu"]')
     menus.forEach((menuEl) => {
       if (seen.has(menuEl)) return
@@ -3938,24 +4898,56 @@ function installSidebarStatusDots() {
       dsmSaveManual()
     }
     curActive = activeId
-    // 每次 paint 只聚合一次：父会话 id → 子代理数（O(n)，避免每行重算）。
+    // 每次 paint 只聚合一次：父会话 id → 子代理数 + 分支树索引（O(n)，避免每行重算）。
     const purgedNow = dsmLoadPurged()
+    const excludedIds = new Set(purgedNow)
+    if (dsmTrashIds) for (const tid of dsmTrashIds) excludedIds.add(tid)
+    const forkIndex = buildForkTreeIndex(dsmLineage, excludedIds)
     const kidsByParent = (() => {
       const m = new Map()
       for (const [id, info] of dsmLineage.entries()) {
         if (info.origin !== 'subagent' || !info.parentSession) continue
         // 已进回收站 / 已彻底删除的子代理不计数：否则删掉了徽标数字还挂着。
-        if ((dsmTrashIds && dsmTrashIds.has(id)) || purgedNow.has(id)) continue
+        if (excludedIds.has(id)) continue
         m.set(info.parentSession, (m.get(info.parentSession) || 0) + 1)
       }
       return m
     })()
     const rows = document.querySelectorAll('[role="treeitem"]')
-    // 兜底清理：父行被 React 移除 / 复用后残留的子代理容器立刻摘掉，
+    const rowGroupScope = (r) => {
+      if (!r) return null
+      let el = r.parentElement
+      for (let d = 0; el && el !== document.body && d < 3; d++) {
+        const role = el.getAttribute && el.getAttribute('role')
+        if (role === 'group' || role === 'tree') return el
+        if (el.tagName === 'DIV') return el
+        el = el.parentElement
+      }
+      return r.parentElement
+    }
+    const visibleRowsById = new Map()
+    const rowGroupOf = new Map()
+    rows.forEach((r) => {
+      const rid = rowId(r)
+      if (!rid || excludedIds.has(rid)) return
+      const liCheck = dsmLineage.get(rid)
+      if (liCheck && liCheck.empty && rid !== activeId) return
+      visibleRowsById.set(rid, r)
+      rowGroupOf.set(rid, rowGroupScope(r))
+    })
+    // 兜底清理：父行被 React 移除 / 复用后残留的子代理 / 分支树容器立刻摘掉，
     // 避免孤儿容器越堆越多。
     document.querySelectorAll('[data-dsm-subs]').forEach((box) => {
       const pid = box.getAttribute('data-dsm-subs')
       const prev = box.previousElementSibling
+      if (!prev || rowId(prev) !== pid) box.remove()
+    })
+    document.querySelectorAll('[data-dsm-fork-tree]').forEach((box) => {
+      const pid = box.getAttribute('data-dsm-fork-tree')
+      let prev = box.previousElementSibling
+      while (prev && prev.getAttribute && prev.getAttribute('data-dsm-subs') === pid) {
+        prev = prev.previousElementSibling
+      }
       if (!prev || rowId(prev) !== pid) box.remove()
     })
     rows.forEach((row) => {
@@ -3973,7 +4965,10 @@ function installSidebarStatusDots() {
         // attributeFilter，不会自触发重绘。
         if (row.getAttribute(DSM_HIDDEN_ATTR) !== 'trash') row.setAttribute(DSM_HIDDEN_ATTR, 'trash')
         const d = row.querySelector('[' + DOT + ']'); if (d) d.remove()
+        row.classList.remove('dsm-row-fork-child', 'dsm-row-forks-open')
+        row.style.removeProperty('--dsm-fork-indent')
         dsmDropSubList(row, id)
+        dsmDropForkTree(row, id)
         return
       }
       // ---- 血缘分层披露（issue #6）--------------------------------------
@@ -3993,11 +4988,12 @@ function installSidebarStatusDots() {
       // React 会复用行 DOM：每次先按当前 id 重置血缘视觉，再按需加回。
       // classList 的 add/remove 对已处于目标状态的行是无操作（不触发
       // MutationObserver），徽标节点只允许「缺失才创建」。
-      row.classList.remove('dsm-row-sub')
+      row.classList.remove('dsm-row-sub', 'dsm-row-fork-child')
       // 选中行标记：徽标/标签的「选中才显示」靠它驱动（CSS 侧）。
       // toggle 同值时不动 DOM 属性，不会触发 MutationObserver。
       row.classList.toggle('dsm-row-active', id === activeId)
       row.style.removeProperty('--dsm-indent')
+      row.style.removeProperty('--dsm-fork-indent')
       let hideLineage = false
       if (li && isSub) {
         row.classList.add('dsm-row-sub')
@@ -4011,7 +5007,9 @@ function installSidebarStatusDots() {
         if (row.style.display !== 'none') row.style.display = 'none'
         if (row.getAttribute(DSM_HIDDEN_ATTR) !== 'empty') row.setAttribute(DSM_HIDDEN_ATTR, 'empty')
         const d = row.querySelector('[' + DOT + ']'); if (d) d.remove()
+        row.classList.remove('dsm-row-forks-open')
         dsmDropSubList(row, id)
+        dsmDropForkTree(row, id)
         return
       }
       if (row.style.display === 'none') row.style.display = ''
@@ -4019,12 +5017,18 @@ function installSidebarStatusDots() {
       // 标记，展开计数立刻把这一条还回「可展开」的数量里。
       if (row.hasAttribute(DSM_HIDDEN_ATTR)) row.removeAttribute(DSM_HIDDEN_ATTR)
       if (!isEmpty && li && li.parentSession && li.origin !== 'subagent') {
-        // fork 分支行：绿「⑂ 分支」chip，点击滚动并高亮父会话行。
-        // v3.6.2 #3：chip 每次 paint 幂等同步（存在才不建，但 tooltip/父 id
-        // 随最新权威数据刷新）——旧实现「创建即定格」，父标题后到时 tooltip
-        // 永远停在降级文案；点击改读 dataset，React 复用行 DOM 也不会切错父。
+        // 同原生分组内父行可见时，在原位呈现轻量树级缩进（不移动任何宿主节点，保留置顶/归档/分组归属）。
+        const sameGroupParent =
+          rowGroupOf.has(li.parentSession) &&
+          rowGroupOf.get(li.parentSession) === rowGroupOf.get(id)
+        if (sameGroupParent) {
+          const fDepth = Math.min(3, Math.max(1, forkIndex.depthOf(id)))
+          row.classList.add('dsm-row-fork-child')
+          row.style.setProperty('--dsm-fork-indent', String(fDepth * 10) + 'px')
+        }
+        // fork 分支行：绿「⑂ 分支」chip，父行可见时滚动高亮，跨项目/未加载时直接打开父会话。
         const parentTitle = dsmAuthoritativeTitles.get(li.parentSession)
-        const tip = parentTitle ? '分支于：' + parentTitle : '分支会话（点击查看来源会话）'
+        const tip = parentTitle ? '分支于：' + parentTitle : '分支会话（点击定位或打开来源会话）'
         let fork = row.querySelector('[data-dsm-tag="fork"]')
         if (!fork) {
           fork = document.createElement('button')
@@ -4032,18 +5036,21 @@ function installSidebarStatusDots() {
           fork.dataset.dsmTag = 'fork'
           fork.className = 'dsm-tag dsm-tag-fork'
           fork.textContent = '⑂ 分支'
-          fork.addEventListener('click', (e) => {
+          fork.addEventListener('click', async (e) => {
             e.stopPropagation(); e.preventDefault()
             const target = e.currentTarget.dataset.dsmForkParent || ''
-            const rows = document.querySelectorAll('[role="treeitem"]')
-            for (const other of rows) {
-              if (rowId(other) === target) {
+            if (!target) return
+            const allRows = document.querySelectorAll('[role="treeitem"]')
+            for (const other of allRows) {
+              if (rowId(other) === target && other.style.display !== 'none') {
                 other.scrollIntoView({ block: 'center', behavior: 'smooth' })
                 other.classList.add('dsm-row-flash')
                 setTimeout(() => other.classList.remove('dsm-row-flash'), 1200)
-                break
+                return
               }
             }
+            const res = await dsmOpenSessionById(target)
+            if (res !== 'ok') paintToast('无法直接打开来源会话，请在会话管理中查找', 'err')
           })
           row.appendChild(fork)
         }
@@ -4093,10 +5100,47 @@ function installSidebarStatusDots() {
           if (existingKids) existingKids.remove()
           dsmDropSubList(row, id)
         }
+
+        // ---- 父会话的 fork 分支树（跨项目 / 深层未加载分支均可通过子列表直达，不破坏宿主分组）----
+        const forkDescendants = forkIndex.descendantsOf(id, 4)
+        const existingForks = row.querySelector('[data-dsm-forks]')
+        const forksOpen = dsmForksOpen.has(id)
+        row.classList.toggle('dsm-row-forks-open', forksOpen && forkDescendants.length > 0)
+        if (forkDescendants.length > 0) {
+          const forkText = (forksOpen ? '▾ ' : '▸ ') + forkDescendants.length + ' 分支'
+          let fBadge = existingForks
+          if (!fBadge) {
+            fBadge = document.createElement('button')
+            fBadge.type = 'button'
+            fBadge.dataset.dsmForks = ''
+            fBadge.className = 'dsm-forks-badge'
+            fBadge.addEventListener('click', (e) => {
+              e.stopPropagation(); e.preventDefault()
+              dsmToggleForks(fBadge)
+            })
+            row.appendChild(fBadge)
+          }
+          if (fBadge.dataset.dsmForkParentId !== id) fBadge.dataset.dsmForkParentId = id
+          if (fBadge.textContent !== forkText) fBadge.textContent = forkText
+          const fLabel = (forksOpen ? '收起' : '展开') + '该会话的 ' + forkDescendants.length + ' 个分支会话'
+          if (fBadge.getAttribute('aria-label') !== fLabel) {
+            fBadge.setAttribute('aria-label', fLabel)
+            fBadge.title = fLabel
+          }
+          if (fBadge.getAttribute('aria-expanded') !== String(forksOpen)) fBadge.setAttribute('aria-expanded', String(forksOpen))
+          if (forksOpen) dsmSyncForkTree(row, id, forkDescendants, activeId, visibleRowsById)
+          else dsmDropForkTree(row, id)
+        } else {
+          if (existingForks) existingForks.remove()
+          dsmDropForkTree(row, id)
+        }
       } else {
-        row.classList.remove('dsm-row-open')
+        row.classList.remove('dsm-row-open', 'dsm-row-forks-open')
         const staleKids = row.querySelector('[data-dsm-kids]')
         if (staleKids) staleKids.remove()
+        const staleForks = row.querySelector('[data-dsm-forks]')
+        if (staleForks) staleForks.remove()
+        dsmDropForkTree(row, id)
       }
       // DSH's cold list baseline can expose a stale header title until the
       // Session is opened. Paint the latest log-folded title from the host
@@ -4184,6 +5228,130 @@ function installSidebarStatusDots() {
   const dsmSubsOpen = new Set()
   try { for (const id of JSON.parse(localStorage.getItem(DSM_KEY_SUBS) || '[]')) if (typeof id === 'string') dsmSubsOpen.add(id) } catch (e) {}
   const dsmSaveSubsOpen = () => { try { localStorage.setItem(DSM_KEY_SUBS, JSON.stringify([...dsmSubsOpen])) } catch (e) {} }
+  const DSM_KEY_FORKS = 'dsm-forks-open-v1'
+  const dsmForksOpen = new Set()
+  try { for (const id of JSON.parse(localStorage.getItem(DSM_KEY_FORKS) || '[]')) if (typeof id === 'string') dsmForksOpen.add(id) } catch (e) {}
+  const dsmSaveForksOpen = () => { try { localStorage.setItem(DSM_KEY_FORKS, JSON.stringify([...dsmForksOpen])) } catch (e) {} }
+  const FORK_ROW_SVG = '<svg width="11" height="11" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="5" cy="3.5" r="1.6" stroke="currentColor" stroke-width="1.5"/><circle cx="5" cy="12.5" r="1.6" stroke="currentColor" stroke-width="1.5"/><circle cx="11.5" cy="7.5" r="1.6" stroke="currentColor" stroke-width="1.5"/><path d="M5 5.1v5.8M5 8.5c0-1.6 1.5-2.6 4.9-1.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>'
+  function dsmToggleForks(badge) {
+    const pid = badge && badge.dataset ? badge.dataset.dsmForkParentId : null
+    if (!pid) return
+    if (sidebarAdapter.disabled) {
+      paintToast('侧栏适配器已停用，请改从 设置 → 会话管理 查看分支会话')
+      return
+    }
+    if (dsmForksOpen.has(pid)) dsmForksOpen.delete(pid)
+    else {
+      dsmForksOpen.add(pid)
+      dsmEnsureSessionMeta()
+    }
+    dsmSaveForksOpen()
+    if (dsmRepaintDots) dsmRepaintDots()
+  }
+  function dsmDropForkTree(row, pid) {
+    const parent = row && row.parentNode
+    if (!parent) return
+    for (const el of parent.children) {
+      if (el.getAttribute && el.getAttribute('data-dsm-fork-tree') === pid) { el.remove(); break }
+    }
+  }
+  function dsmSyncForkTree(row, pid, descendants, activeId, visibleRowsById) {
+    const parent = row && row.parentNode
+    if (!parent) return
+    const open = dsmForksOpen.has(pid)
+    let box = null
+    let subsBox = null
+    for (const el of parent.children) {
+      if (!el.getAttribute) continue
+      if (el.getAttribute('data-dsm-fork-tree') === pid) box = el
+      if (el.getAttribute('data-dsm-subs') === pid) subsBox = el
+    }
+    if (!open || !Array.isArray(descendants) || !descendants.length) {
+      if (box) box.remove()
+      return
+    }
+    if (dsmSessionMetaCache.size === 0) dsmEnsureSessionMeta()
+    const anchor = subsBox || row
+    if (!box) {
+      box = document.createElement('div')
+      box.setAttribute('data-dsm-fork-tree', pid)
+      box.setAttribute('role', 'group')
+      box.setAttribute('aria-label', '分支会话列表')
+      box.className = 'dsm-fork-tree'
+      parent.insertBefore(box, anchor.nextSibling)
+    } else if (box.previousElementSibling !== anchor) {
+      parent.insertBefore(box, anchor.nextSibling)
+    }
+    const parentMeta = dsmSessionMetaCache.get(pid) || null
+    const parentCwd = parentMeta && parentMeta.workspacePath ? parentMeta.workspacePath : null
+    const sig = activeId + '|' + descendants.map((d) => {
+      const m = dsmSessionMetaCache.get(d.id)
+      const title = dsmAuthoritativeTitles.get(d.id) || (m && m.title) || ''
+      const ws = m && m.workspacePath ? m.workspacePath : ''
+      const arch = m && m.archived ? 1 : 0
+      const inView = visibleRowsById && visibleRowsById.has(d.id) ? 1 : 0
+      return [d.id, d.depth, title, ws, arch, inView].join(':')
+    }).join(';')
+    if (box.dataset.dsmSig === sig) return
+    box.dataset.dsmSig = sig
+    box.textContent = ''
+    for (const item of descendants) {
+      const cid = item.id
+      const m = dsmSessionMetaCache.get(cid) || null
+      const title = dsmAuthoritativeTitles.get(cid) || (m && m.title) || shortId(cid) || cid
+      const childCwd = m && m.workspacePath ? m.workspacePath : null
+      const crossProject = Boolean(childCwd && (!parentCwd || !sameWorkspacePath(childCwd, parentCwd)))
+      const isArchived = Boolean(m && m.archived)
+      const isActive = cid === activeId
+
+      const btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'dsm-fork-row' + (isActive ? ' dsm-fork-row--active' : '')
+      btn.style.paddingLeft = String(7 + Math.max(0, item.depth - 1) * 12) + 'px'
+      btn.title = childCwd ? `${title} · ${childCwd}` : title
+      btn.setAttribute('aria-current', isActive ? 'true' : 'false')
+      btn.addEventListener('click', async (e) => {
+        e.stopPropagation()
+        e.preventDefault()
+        const res = await dsmOpenSessionById(cid, item.parentId || pid)
+        if (res === 'ok') {
+          const nativeRow = visibleRowsById && visibleRowsById.get(cid)
+          if (nativeRow && nativeRow.isConnected) {
+            nativeRow.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+            nativeRow.classList.add('dsm-row-flash')
+            setTimeout(() => nativeRow.classList.remove('dsm-row-flash'), 900)
+          }
+          return
+        }
+        paintToast(`无法打开分支「${title}」，请在会话管理中切换`, 'err')
+      })
+
+      const ico = document.createElement('span')
+      ico.className = 'dsm-fork-ico'
+      ico.innerHTML = FORK_ROW_SVG
+      btn.appendChild(ico)
+
+      const nameEl = document.createElement('span')
+      nameEl.className = 'dsm-fork-name'
+      nameEl.textContent = title
+      btn.appendChild(nameEl)
+
+      if (crossProject) {
+        const wsEl = document.createElement('span')
+        wsEl.className = 'dsm-fork-ws'
+        wsEl.textContent = (m && m.workspaceTitle) || pathTail(childCwd) || '跨项目'
+        wsEl.title = childCwd
+        btn.appendChild(wsEl)
+      }
+      if (isArchived) {
+        const archEl = document.createElement('span')
+        archEl.className = 'dsm-fork-arch'
+        archEl.textContent = '已归档'
+        btn.appendChild(archEl)
+      }
+      box.appendChild(btn)
+    }
+  }
   const dsmSubTrees = new Map()
   const SUB_TTL_MS = 15000
   async function dsmFetchSubTree(pid) {
@@ -4402,13 +5570,8 @@ function installSidebarWorkspaceDrag() {
     }
     return event.target instanceof Element ? event.target.closest('[role="treeitem"]') : null
   }
-  const toast = (message) => {
-    const el = document.createElement('div')
-    el.className = 'dsm-toast'
-    el.setAttribute('role', 'status')
-    el.textContent = message
-    document.body.appendChild(el)
-    setTimeout(() => el.remove(), toastDurationFor(message))  // T2：并轨按字数定时
+  const toast = (message, kind, action) => {
+    dsmShowFloatingToast(message, kind, action)
   }
   const clearVisuals = () => {
     document.querySelectorAll('.dsm-drag-source,.dsm-drop-target').forEach((el) => el.classList.remove('dsm-drag-source', 'dsm-drop-target'))
@@ -4427,6 +5590,7 @@ function installSidebarWorkspaceDrag() {
   const refresh = async () => {
     try {
       const sessionResult = await postJSON('/archived-sessions/sessions', {})
+      dsmHydrateSessionMeta(sessionResult && sessionResult.items)
       sessions = new Map((sessionResult.items || []).map((item) => [String(item.sessionId), item]))
       decorateRows()
     } catch (e) { /* sidebar enhancement remains optional */ }
@@ -4480,22 +5644,20 @@ function installSidebarWorkspaceDrag() {
     clearVisuals()
     row.classList.add('dsm-drag-busy')
     try {
-      const result = await postActiveAware('/archived-sessions/move', { sessionId: item.sessionId, targetPath: target.path })
-      // 会话被 DSH 打开时服务端只登记排队：磁盘与工作区分组都没动。这条路径绝不能
-      // 本地改行 + 报成功——那会让用户以为移动已完成，而侧栏刷新后该行又跳回原工作区
-      //（用户 2026-09-10 报的「说移动成功但还在原工作区」就是这个）。排队时只如实说明。
-      if (result && result.queued) {
-        await dsmLoadTrashIds()
-        toast(result.notes && result.notes.length ? result.notes.join(' ') : '会话正被 DSH 打开，已排队待移动；重启 DSH 后会自动完成（请先别打开它）。')
-        return
-      }
-      sessions.set(item.sessionId, { ...item, workspacePath: result.workspacePath || target.path, workspaceTitle: result.workspaceTitle || target.title })
-      await dsmLoadTrashIds()
-      toast(result && result.already
-        ? `已在「${result.workspaceTitle || target.title}」`
-        : `已移到「${result.workspaceTitle || target.title}」`)
-    } catch (error) {
-      toast('移动失败：' + String((error && error.message) || error))
+      await dsmRunSidebarMove({
+        sessionId: item.sessionId,
+        targetPath: target.path,
+        targetLabel: target.title || pathTail(target.path) || '目标工作区',
+        onSuccess: (result) => {
+          if (!(result && result.already)) {
+            const nextPath = (result && result.workspacePath) || target.path
+            const nextTitle = (result && result.workspaceTitle) || target.title
+            sessions.set(item.sessionId, { ...item, workspacePath: nextPath, workspaceTitle: nextTitle })
+            const prev = dsmSessionMetaCache.get(String(item.sessionId)) || {}
+            dsmSessionMetaCache.set(String(item.sessionId), { ...prev, workspacePath: nextPath, workspaceTitle: nextTitle })
+          }
+        },
+      })
     } finally {
       moving = false
       dragging = null
@@ -4731,6 +5893,14 @@ export function apply(ctx) {
   // 注释里说的死锁）。
   const disposeDragAutoScroll = installSidebarDragAutoScroll()
   if (disposeDragAutoScroll) ctx.effect(() => disposeDragAutoScroll)
+  installBranchPointsIntegration(ctx, {
+    postJSON,
+    openSessionById: dsmOpenSessionById,
+    notify: dsmNotify,
+    subscribeLineageChange: dsmSubscribeForkLineage,
+    getAuthoritativeTitle: (id) => dsmAuthoritativeTitles.get(String(id)) || null,
+    getSessionCwd: dsmGetSessionCwd,
+  })
   const workspacesSvc = ctx.get('workspaces')
   // 设置左导航图标：id 必须与下面 `settings.section` 的贡献一致，外壳按 id 配对
   // （`renderSlot('settings.section.icon', ..., { only: row.id, fallback: navIcon(id) })`）。
