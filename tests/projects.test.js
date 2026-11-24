@@ -181,7 +181,11 @@ test('approves current-session relocation, concludes the turn, and moves only af
   const idle = new Promise(resolve => { releaseIdle = resolve })
   let idleEntered = false
   const result = await state.exec('session_move', { session_id: 's-a', target_project_id: 'project-b' }, 's-a', {
-    callId: 'self-approved', concludeTurn: () => { concluded = true },
+    callId: 'self-approved',
+    concludeTurn() {
+      assert.equal(this.callId, 'self-approved')
+      concluded = true
+    },
     agent: {
       session: { header: state.headers.get('s-a') },
       whenIdle: async () => { idleEntered = true; await idle },

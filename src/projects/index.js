@@ -83,8 +83,8 @@ export function applyProjects(ctx, moves) {
       const target = await mutate(() => resolveProject(ctx, id, signal, true), signal)
       signal.throwIfAborted()
       if (sessionId === caller.id && target.path !== directory) {
-        const { agent, callId, concludeTurn } = runtime
-        if (typeof concludeTurn !== 'function' || typeof agent.whenIdle !== 'function'
+        const { agent, callId } = runtime
+        if (typeof runtime.concludeTurn !== 'function' || typeof agent.whenIdle !== 'function'
           || typeof ctx.agents.withSessionRelocation !== 'function') {
           throw failure('HOT_MOVE_UNAVAILABLE', 'This Web runtime does not support current-session relocation.')
         }
@@ -108,7 +108,7 @@ export function applyProjects(ctx, moves) {
           throw failure('MOVE_IN_PROGRESS', 'The current session already has a move in progress.')
         }
         const status = { session_id: sessionId, project_id: target.id, state: 'switching_after_turn' }
-        concludeTurn()
+        runtime.concludeTurn()
         selfMoves.set(sessionId, status)
         void Promise.resolve().then(() => agent.whenIdle())
           .then(() => moves.moveSession(sessionId, target, { expectedCwd: directory }))
