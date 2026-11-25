@@ -25,14 +25,14 @@
 
 ## 安装
 
-下载 [`dsh-session-workbench-1.5.0.tgz`](https://github.com/MindCastlePlayground/dsh-session-workbench/releases/download/v1.5.0/dsh-session-workbench-1.5.0.tgz)，进入下载目录并执行与你使用方式对应的一条命令。
+下载 [`dsh-session-workbench-1.6.0.tgz`](https://github.com/MindCastlePlayground/dsh-session-workbench/releases/download/v1.6.0/dsh-session-workbench-1.6.0.tgz)，进入下载目录并执行与你使用方式对应的一条命令。
 
 ```sh
 # DSH Desktop
-dsh plugin --profile desktop add ./dsh-session-workbench-1.5.0.tgz
+dsh plugin --profile desktop add ./dsh-session-workbench-1.6.0.tgz
 
 # DSH Web
-dsh plugin --profile web add ./dsh-session-workbench-1.5.0.tgz
+dsh plugin --profile web add ./dsh-session-workbench-1.6.0.tgz
 ```
 
 安装后刷新页面并确认已出现工作台入口。首次安装时，未启用配置热加载的宿主需要重新启动才能加载插件。如果同一 profile 已启用 `dsh-sessions-manager` 或 `dsh-chat-search`，先停用旧插件以避免路由、菜单或快捷键重复。工作台沿用原有的管理数据和搜索设置目录，无需复制会话文件。
@@ -47,7 +47,7 @@ git clone --branch dsh-v0.2.3-alpha.2 --depth 1 https://github.com/deepseek-ai/d
 npm install --prefix ../dsh-web @deepseek-ai/dsh@0.2.3-alpha.2
 git -C ../dsh-web-source apply "$PWD/patches/dsh-session-relocation.patch"
 node patches/apply-web-relocation.mjs ../dsh-web-source ../dsh-web
-node ../dsh-web/node_modules/@deepseek-ai/dsh/lib/bin.js plugin --profile web add /path/to/dsh-session-workbench-1.5.0.tgz
+node ../dsh-web/node_modules/@deepseek-ai/dsh/lib/bin.js plugin --profile web add /path/to/dsh-session-workbench-1.6.0.tgz
 node ../dsh-web/node_modules/@deepseek-ai/dsh/lib/bin.js --profile web
 ```
 
@@ -64,7 +64,7 @@ $dshCli = Join-Path $dshApp 'resources/app.asar/dsh/node_modules/@deepseek-ai/ds
 $previousElectronMode = $env:ELECTRON_RUN_AS_NODE
 $env:ELECTRON_RUN_AS_NODE = '1'
 try {
-    & (Join-Path $dshApp 'DeepSeek Harness.exe') --expose-internals $dshCli plugin --profile desktop add ./dsh-session-workbench-1.5.0.tgz | Out-Host
+    & (Join-Path $dshApp 'DeepSeek Harness.exe') --expose-internals $dshCli plugin --profile desktop add ./dsh-session-workbench-1.6.0.tgz | Out-Host
 } finally {
     $env:ELECTRON_RUN_AS_NODE = $previousElectronMode
 }

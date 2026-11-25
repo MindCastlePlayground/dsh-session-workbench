@@ -33,6 +33,12 @@ export const DOM_ATTRS = Object.freeze({
   WS_HOST: 'data-dswb-ws-host',
   WS_ROW_FLAG: 'data-dswb-ws-ready',
   WS_ROW_PREFIX: 'workspace:',
+  STICKY_HOST: 'data-dswb-sticky-host',
+  STICKY_DIRECT: 'data-dswb-sticky-direct',
+  STICKY_STUCK: 'data-dswb-sticky-stuck',
+  STICKY_COVERED: 'data-dswb-sticky-covered',
+  STICKY_SECTION: 'data-dswb-sticky-section',
+  ENSURE_WORKSPACES_EVENT: 'dswb:ensure-workspaces-view',
   NATIVE_SCROLLPORT: '[data-sidebar-scrollport]',
   NATIVE_HEADER: '[data-sidebar-workspace-header]',
   NATIVE_LIST_AREA: '[data-sidebar-list-area]',
@@ -203,10 +209,27 @@ export const BASE_WORKBENCH_CSS = `
 .${CLS.EMPTY}{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:56px 16px;text-align:center;color:var(--dsw-alias-label-tertiary)}
 .${CLS.EMPTY_TITLE}{font-size:13px;line-height:19px}
 
+[${DOM_ATTRS.NATIVE_LIST_AREA_ATTR}]:not([${DOM_ATTRS.VIEW}="${DOM_ATTRS.VIEW_MESSAGES}"]){scroll-padding-top:38px}
+[${DOM_ATTRS.NATIVE_LIST_AREA_ATTR}]:not([${DOM_ATTRS.VIEW}="${DOM_ATTRS.VIEW_MESSAGES}"]) [${DOM_ATTRS.STICKY_HOST}="true"],
+[${DOM_ATTRS.NATIVE_LIST_AREA_ATTR}]:not([${DOM_ATTRS.VIEW}="${DOM_ATTRS.VIEW_MESSAGES}"]) [role="tree"]>div>[role="treeitem"][data-row-key^="workspace:"][aria-expanded="true"],
+[${DOM_ATTRS.NATIVE_LIST_AREA_ATTR}]:not([${DOM_ATTRS.VIEW}="${DOM_ATTRS.VIEW_MESSAGES}"]) [role="group"]>div>[role="treeitem"][data-row-key^="workspace:"][aria-expanded="true"]{display:block;position:sticky;top:0;z-index:4;transition:opacity 120ms ease}
+[${DOM_ATTRS.NATIVE_LIST_AREA_ATTR}]:not([${DOM_ATTRS.VIEW}="${DOM_ATTRS.VIEW_MESSAGES}"]) [${DOM_ATTRS.STICKY_DIRECT}="true"],
+[${DOM_ATTRS.NATIVE_LIST_AREA_ATTR}]:not([${DOM_ATTRS.VIEW}="${DOM_ATTRS.VIEW_MESSAGES}"]) [role="tree"]>div>[role="treeitem"][data-row-key^="workspace:"][aria-expanded="true"],
+[${DOM_ATTRS.NATIVE_LIST_AREA_ATTR}]:not([${DOM_ATTRS.VIEW}="${DOM_ATTRS.VIEW_MESSAGES}"]) [role="group"]>div>[role="treeitem"][data-row-key^="workspace:"][aria-expanded="true"]{display:flex}
+[${DOM_ATTRS.NATIVE_LIST_AREA_ATTR}]:not([${DOM_ATTRS.VIEW}="${DOM_ATTRS.VIEW_MESSAGES}"]) [${DOM_ATTRS.STICKY_HOST}="true"]::before{content:"";position:absolute;inset:0;z-index:-1;pointer-events:none;background:var(--dsw-specific-sidebar-fill,var(--dsw-alias-bg-layer-1));transition:box-shadow 140ms ease,background-color 140ms ease}
+[${DOM_ATTRS.NATIVE_LIST_AREA_ATTR}]:not([${DOM_ATTRS.VIEW}="${DOM_ATTRS.VIEW_MESSAGES}"]) [${DOM_ATTRS.STICKY_DIRECT}="true"]::before{inset:0 calc(-1 * var(--dsh-sidebar-paint-inset,3px))}
+html[data-platform='darwin'] [${DOM_ATTRS.NATIVE_LIST_AREA_ATTR}]:not([${DOM_ATTRS.VIEW}="${DOM_ATTRS.VIEW_MESSAGES}"]) [${DOM_ATTRS.STICKY_HOST}="true"]:not([${DOM_ATTRS.STICKY_STUCK}="true"])::before{background:transparent}
+html[data-platform='darwin'] [${DOM_ATTRS.NATIVE_LIST_AREA_ATTR}]:not([${DOM_ATTRS.VIEW}="${DOM_ATTRS.VIEW_MESSAGES}"]) [${DOM_ATTRS.STICKY_HOST}="true"][${DOM_ATTRS.STICKY_STUCK}="true"]:not([${DOM_ATTRS.STICKY_COVERED}="true"])::before{background:color-mix(in srgb,var(--dsw-specific-sidebar-fill,var(--dsw-alias-bg-layer-1)) 84%,transparent);backdrop-filter:blur(18px) saturate(145%)}
+[${DOM_ATTRS.NATIVE_LIST_AREA_ATTR}]:not([${DOM_ATTRS.VIEW}="${DOM_ATTRS.VIEW_MESSAGES}"]) [${DOM_ATTRS.STICKY_HOST}="true"][${DOM_ATTRS.STICKY_STUCK}="true"]:not([${DOM_ATTRS.STICKY_COVERED}="true"]){z-index:5}
+[${DOM_ATTRS.NATIVE_LIST_AREA_ATTR}]:not([${DOM_ATTRS.VIEW}="${DOM_ATTRS.VIEW_MESSAGES}"]) [${DOM_ATTRS.STICKY_HOST}="true"][${DOM_ATTRS.STICKY_STUCK}="true"]:not([${DOM_ATTRS.STICKY_COVERED}="true"])::before{box-shadow:0 1px 0 color-mix(in srgb,var(--dsw-alias-border-l2) 72%,transparent),0 6px 12px -6px rgb(0 0 0/.16)}
+[${DOM_ATTRS.NATIVE_LIST_AREA_ATTR}]:not([${DOM_ATTRS.VIEW}="${DOM_ATTRS.VIEW_MESSAGES}"]) [${DOM_ATTRS.STICKY_HOST}="true"][${DOM_ATTRS.STICKY_STUCK}="true"]:not([${DOM_ATTRS.STICKY_COVERED}="true"]) [role="treeitem"][data-row-key^="workspace:"],
+[${DOM_ATTRS.NATIVE_LIST_AREA_ATTR}]:not([${DOM_ATTRS.VIEW}="${DOM_ATTRS.VIEW_MESSAGES}"]) [${DOM_ATTRS.STICKY_DIRECT}="true"][${DOM_ATTRS.STICKY_STUCK}="true"]:not([${DOM_ATTRS.STICKY_COVERED}="true"]){font-weight:560;color:var(--dsw-alias-label-primary)}
+[${DOM_ATTRS.NATIVE_LIST_AREA_ATTR}]:not([${DOM_ATTRS.VIEW}="${DOM_ATTRS.VIEW_MESSAGES}"]) [${DOM_ATTRS.STICKY_HOST}="true"][${DOM_ATTRS.STICKY_COVERED}="true"]:not(:focus-within){opacity:0;pointer-events:none}
+
 @container (max-width:225px){.${CLS.MSG_ROW}{padding:6px 6px 6px 5px;gap:6px}.${CLS.MSG_TITLE}{font-size:13px}.${CLS.TAG}{padding:0 4px;font-size:10px}}
 
 @media (prefers-reduced-motion:reduce){
-  .${CLS.SEG_THUMB},.${CLS.SEG_TAB},.${CLS.MSG_ROW},.${CLS.LOAD_MORE}{transition:none}
+  .${CLS.SEG_THUMB},.${CLS.SEG_TAB},.${CLS.MSG_ROW},.${CLS.LOAD_MORE},[${DOM_ATTRS.NATIVE_LIST_AREA_ATTR}] [${DOM_ATTRS.STICKY_HOST}="true"],[${DOM_ATTRS.NATIVE_LIST_AREA_ATTR}] [${DOM_ATTRS.STICKY_HOST}="true"]::before{transition:none}
   [${DOM_ATTRS.NATIVE_LIST_AREA_ATTR}][${DOM_ATTRS.VIEW}="${DOM_ATTRS.VIEW_MESSAGES}"] [${DOM_ATTRS.MESSAGES_HOST}]{animation:none}
   .${CLS.MSG_ROW}:active{transform:none}
   .${CLS.MSG_SPINNER} g,.${CLS.MSG_SPINNER_ARC}{animation:none}

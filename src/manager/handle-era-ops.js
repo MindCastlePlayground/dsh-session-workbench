@@ -14,22 +14,17 @@
 //     （活跃写者 → 409 拒绝），然后整目录删除会话目录（basename 已由路径
 //     守卫验证），最后以官方 stat 复核该 id 已消失。
 //
-// 活跃写者策略：两个操作都拒绝「被 DSH 打开、写权限已被占用」的会话，而不是照
-// legacy 那样改写活跃对象——handle 时代的写句柄所有权在官方 tracker 内部，
-// 与其打补丁不如如实拒绝，风险面更小。
-//
-// 注意这与 legacy 时代的可用范围不同：legacy 时代没有单写者所有权，插件直接改
-// 文件 + 同步 live 对象就能移动任意会话；0.1.3 引入 handle 后，agent-loop 在
-// resume 会话时先取写所有权（core/agent-loop resumeWith: "Taking write ownership
-// FIRST"）并持有到 agent 卸载，于是「在 DSH 里点开过的会话」一律处于占用态。
-// 这是宿主机制决定的硬约束，不是插件能绕开的判定，提示必须如实说明。
+// 移动由调用方先通过宿主释放可迁移的本地 Agent。持有持久层写句柄
+// 后才接触会话文件，其他宿主的锁仍由 DSH 持久层处理。
 
 import { link, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
 import { rewriteFrame0CwdInMemory, scanZstdFrames } from './zstd-frame.js'
 import { deriveSessionDir, encodeSegmentFor, generationVersionOf, locateSessionArtifacts } from './handle-era-paths.js'
 
 const MOVE_BATCH = 400
+const MOVE_LEASE_RETRY_MS = [40, 80, 120]
 
 // 真实日志判定：官方命名是 session.vN.jsonl[.zstd]，legacy 时代是
 // session.jsonl[.zstd]——锚定结尾，其他后缀（如测试残渣 *.jsonl.zstd.test）
@@ -110,18 +105,13 @@ async function removeSourceDir(sessionDir) {
   return { cleaned: true, leftover: [] }
 }
 
-// 活跃写者（409）提示。0.1.3 起官方 session handle 是「单写者」：agent-loop
-// 在 resume 一个会话时先 open(id,'write') 取写所有权并持有到 agent 卸载，所以
-// 在 DSH 里点开过的会话都处于被占用状态。runtime 未提供任何能远程释放该所有权
-// 的公共 API（无 unloadSession / closeSession / evict），因此插件不能替用户解锁，
-// 只能如实说明可操作的自救路径，并靠「重试」让用户切走会话后原地再试一次。
-const BUSY_MOVE_MESSAGE = '会话仍由 DSH 持有。请在持有它的宿主关闭会话，再重试移动。'
+const BUSY_MOVE_MESSAGE = '会话的写入权限仍被占用。请在打开它的 DSH 宿主关闭会话后重试。'
 const BUSY_PURGE_MESSAGE = '会话仍由 DSH 持有。请在持有它的宿主关闭会话，再重试删除。'
 
-function conflictError(message) {
+function conflictError(message, code = 'DSM_SESSION_BUSY') {
   const error = new Error(message)
   error.status = 409
-  error.code = 'DSM_SESSION_BUSY'
+  error.code = code
   return error
 }
 
@@ -184,6 +174,19 @@ export async function ensureNoActiveWriter(sp, sid) {
     throw e
   }
   await closeQuietly(handle)
+}
+
+async function openMoveWriter(sp, sid) {
+  for (const wait of [...MOVE_LEASE_RETRY_MS, null]) {
+    try {
+      return await sp.open(sid, 'write')
+    } catch (error) {
+      if (!isAlreadyOwned(error)) throw error
+      if (wait === null) throw conflictError(BUSY_MOVE_MESSAGE)
+      // Give an already-closing handle time to release the kernel lock.
+      await delay(wait)
+    }
+  }
 }
 
 // 彻底删除一个会话的全部物理产物。header 必须来自官方 list/stat（携带真实 cwd）。
@@ -265,21 +268,20 @@ async function relocateRewrittenBackup({ sid, canonical, backupLogPath, artifact
 export async function moveSessionToCwd({ sp, sid, header, canonical, events = [], inheritedEventCount = 0, onRelocated }) {
   let lease
   try {
-    lease = await sp.open(sid, 'write')
+    lease = await openMoveWriter(sp, sid)
   } catch (error) {
-    if (isAlreadyOwned(error)) throw conflictError(BUSY_MOVE_MESSAGE)
-    if (!await locateSessionArtifacts(sp, header)) throw conflictError('无法定位该会话的物理日志，已停止移动。')
+    if (error?.name === 'SessionPersistenceNotFoundError' || error?.code === 'ENOENT') {
+      throw conflictError('找不到该会话的存储日志，请刷新列表后重试。', 'DSM_MOVE_LOG_NOT_FOUND')
+    }
     throw error
   }
   try {
     const artifacts = await locateSessionArtifacts(sp, lease.header ?? header)
     if (!artifacts) {
-      const error = new Error('无法定位该会话的物理日志，已停止移动')
-      error.status = 409
-      throw error
+      throw conflictError('无法定位该会话的存储日志。', 'DSM_MOVE_LOG_NOT_FOUND')
     }
     if (lease.header?.cwd !== undefined && lease.header.cwd !== header.cwd) {
-      throw conflictError('会话已移动到其他项目，请刷新列表后重试。')
+      throw conflictError('会话已移动到其他项目，请刷新列表后重试。', 'DSM_MOVE_IN_PROGRESS')
     }
     if (typeof lease.read === 'function') {
       const current = []
@@ -367,7 +369,7 @@ export async function moveSessionToCwd({ sp, sid, header, canonical, events = []
       } catch (e) {
         if (!writer && isAlreadyExists(e)) {
           if (await sp.stat(sid)) {
-            throw conflictError('另一个宿主已打开或移动该会话，请刷新列表后重试。')
+            throw conflictError('该会话在移动期间重新出现在存储中，请刷新列表后重试。', 'DSM_MOVE_IN_PROGRESS')
           }
           // 后端内存里已有同 id 记录（created-but-unmaterialized 幽灵等）：
           // 回退到 frame0 改写搬运，不再走 create。

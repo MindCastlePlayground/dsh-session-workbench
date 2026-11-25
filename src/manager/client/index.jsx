@@ -13,6 +13,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { aliveSessionCount, analyzeMoveSource, applyTagFilter, buildForkTreeIndex, canDropOnWorkspace, classifyMoveError, collapsedVisibleTotal, countRenderedVisible, dragAutoScrollStep, effectiveTitleOf, filterMoveWorkspaces, filterShapeFromSaved, filterSnapshotOf, foldBranches, foldOrphanSubagents, foldSubagents, formatSingleMoveResult, isMoveDestinationBlocked, matchWorkspaceFilter, MOVE_ERR_BUSY, MOVE_ERR_RUNNING, normalizeWorkspacePath, noticeToastPlan, openSubagentToast, overflowPlan, pathTail, remainingRows, sameWorkspacePath, sessionForNodes, shortId, shouldHideEmptyGroup, starredOf, summarizeBatchMoveResult, tagDeleteConfirm, titleBackfillDecision, toastDurationFor, workspaceForNodes, WS_GONE, WS_UNGROUPED } from './logic.js'
 import { installBranchPointsIntegration } from './branch-points.jsx'
+import { installHeaderActionsIntegration } from './header-actions.jsx'
 
 export const inject = ['slots']
 
@@ -3285,9 +3286,9 @@ const SIDEBAR_AUG_CSS = `
 .dsm-toast-warn{background:var(--dsw-alias-bg-layer-2,Canvas);color:var(--dsw-alias-label-primary,CanvasText);border:1px solid color-mix(in srgb,var(--dsw-alias-state-warn-primary,#EAB308) 65%,transparent);font-weight:500}
 .dsm-toast-err{background:#4A1D1D;color:#FFD9D9;border:1px solid var(--dsw-alias-state-error-primary)}
 .dsm-toast-msg{flex:1;min-width:0}
-.dsm-toast-act{appearance:none;flex:none;padding:4px 10px;border:1px solid rgba(255,217,217,.55);border-radius:8px;background:rgba(255,255,255,.14);color:inherit;font:inherit;font-size:11.5px;font-weight:600;cursor:pointer;white-space:nowrap;transition:background-color .14s ease}
-.dsm-toast-act:hover:not(:disabled){background:rgba(255,255,255,.24)}
-.dsm-toast-act:focus-visible{outline:2px solid #fff;outline-offset:1px}
+.dsm-toast-act{appearance:none;flex:none;padding:4px 10px;border:1px solid color-mix(in srgb,currentColor 32%,transparent);border-radius:8px;background:color-mix(in srgb,currentColor 11%,transparent);color:inherit;font:inherit;font-size:11.5px;font-weight:600;cursor:pointer;white-space:nowrap;transition:background-color .14s ease}
+.dsm-toast-act:hover:not(:disabled){background:color-mix(in srgb,currentColor 20%,transparent)}
+.dsm-toast-act:focus-visible{outline:2px solid currentColor;outline-offset:1px}
 .dsm-toast-act:disabled{opacity:.6;cursor:default}
 .dsm-toast-close{appearance:none;flex:none;width:20px;height:20px;padding:0;border:none;border-radius:6px;background:transparent;color:inherit;opacity:.75;font-size:14px;line-height:1;cursor:pointer;display:inline-flex;align-items:center;justify-content:center}
 .dsm-toast-close:hover{opacity:1;background:rgba(255,255,255,.14)}
@@ -3813,6 +3814,9 @@ function dsmTeardownSidebarAug() {
     // issue #27：隐藏规则在样式表里，必须一并撤掉——否则插件停用后
     // 「展开其余 N 个会话」会被一条孤儿规则永久藏住，那些会话再也点不开。
     document.querySelectorAll('[data-dsm-overflow-hide]').forEach((el) => el.remove())
+  } catch (e) { /* best-effort */ }
+  try {
+    document.querySelectorAll('[data-dsm-reveal]').forEach((el) => el.removeAttribute('data-dsm-reveal'))
   } catch (e) { /* best-effort */ }
   try {
     document.querySelectorAll('[data-dsm-group-hidden]').forEach((owner) => {
@@ -5900,6 +5904,13 @@ export function apply(ctx) {
     subscribeLineageChange: dsmSubscribeForkLineage,
     getAuthoritativeTitle: (id) => dsmAuthoritativeTitles.get(String(id)) || null,
     getSessionCwd: dsmGetSessionCwd,
+  })
+  installHeaderActionsIntegration(ctx, {
+    postJSON,
+    notify: dsmShowFloatingToast,
+    isTrashedOrPurged: (id) => Boolean((dsmTrashIds && dsmTrashIds.has(String(id))) || dsmLoadPurged().has(String(id))),
+    getLineage: (id) => dsmLineage.get(String(id)) || null,
+    recognizeGroupQuiet: (row) => sidebarAdapter.recognizeGroupQuiet(row),
   })
   const workspacesSvc = ctx.get('workspaces')
   // 设置左导航图标：id 必须与下面 `settings.section` 的贡献一致，外壳按 id 配对

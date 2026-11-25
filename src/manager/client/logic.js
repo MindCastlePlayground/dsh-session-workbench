@@ -653,6 +653,7 @@ export const QUEUE_RETRY_HINT = '不会自动重试，请手动重试或取消'
 
 export const MOVE_ERR_RUNNING = 'DSM_SESSION_RUNNING'
 export const MOVE_ERR_BUSY = 'DSM_SESSION_BUSY'
+export const MOVE_ERR_BUSY_FALLBACK = '会话的写入权限仍被占用，请关闭对应会话后重试。'
 export const MOVE_ERR_IN_PROGRESS = 'DSM_MOVE_IN_PROGRESS'
 
 export function classifyMoveError(err) {
@@ -671,7 +672,7 @@ export function classifyMoveError(err) {
       code,
       canStopAndMove: false,
       canRetry: true,
-      message: '该会话正被其他持有方占用，请在持有方关闭或释放后手动重试。',
+      message: raw || MOVE_ERR_BUSY_FALLBACK,
     }
   }
   if (code === MOVE_ERR_IN_PROGRESS) {
@@ -1102,4 +1103,80 @@ export function partitionBranchPoints(data, order, nodes, slotRenderedKeys) {
   }
 
   return { slotAnchored, domAnchored, unloadedPoints, unanchored }
+}
+
+// —— 会话标题栏快捷操作与侧栏定位纯判定（无 DOM，可 node --test）——
+
+/**
+ * 解析某个会话所属工作区及其在工作区树模式下的祖先路径链（外层 → 内层）。
+ * 未归属于任何已注册工作区时返回 `''`（与 DSH `UNGROUPED_KEY` 一致）。
+ */
+export function resolveWorkspaceChainForSession(workspaces, sessionId) {
+  const sid = String(sessionId || '')
+  if (!sid) return { groupKey: '', ancestorKeys: [''], found: false }
+  const list = Array.isArray(workspaces) ? workspaces : []
+  let owner = null
+  for (const ws of list) {
+    if (!ws || ws.workspaceId == null) continue
+    const ids = Array.isArray(ws.sessionIds) ? ws.sessionIds : []
+    if (ids.some((id) => String(id) === sid)) {
+      owner = ws
+      break
+    }
+  }
+  if (!owner) return { groupKey: '', ancestorKeys: [''], found: false }
+
+  const groupKey = String(owner.workspaceId)
+  const ownerPath = normalizeWorkspacePath(owner.path)
+  if (!ownerPath) return { groupKey, ancestorKeys: [groupKey], found: true }
+
+  const ancestors = []
+  for (const ws of list) {
+    if (!ws || ws.workspaceId == null) continue
+    const wid = String(ws.workspaceId)
+    if (wid === groupKey) continue
+    const wsPath = normalizeWorkspacePath(ws.path)
+    if (!wsPath) continue
+    const prefix = wsPath === '/' ? '/' : `${wsPath}/`
+    if (ownerPath.startsWith(prefix) && ownerPath !== wsPath) {
+      ancestors.push({ wid, len: wsPath.length })
+    }
+  }
+  ancestors.sort((a, b) => a.len - b.len)
+  const ancestorKeys = [...ancestors.map((a) => a.wid), groupKey]
+  return { groupKey, ancestorKeys, found: true }
+}
+
+/**
+ * 识别 DSH 原生归档拒绝错误（`workspace/session-active`）。
+ * 命中时返回正在运行的活动条目数组；否则返回 null。
+ */
+export function isActiveSessionArchiveRefusal(err) {
+  if (!err || typeof err !== 'object') return null
+  if (err.name !== 'WorkspaceArchiveError') return null
+  const rpc = err.rpcError
+  if (!rpc || rpc.code !== 'workspace/session-active') return null
+  const activity = rpc.details && rpc.details.activity
+  return Array.isArray(activity) ? activity : []
+}
+
+/**
+ * 计算侧栏定位的目标 `scrollTop`：尽量居中展示目标行，同时保证行顶不落入吸顶项目标题的遮挡区。
+ */
+export function computeRevealScrollTop({
+  rowTop,
+  rowHeight,
+  listTop,
+  listHeight,
+  currentScrollTop,
+  scrollHeight,
+  stickyClearance = 44,
+} = {}) {
+  const nums = [rowTop, rowHeight, listTop, listHeight, currentScrollTop, scrollHeight, stickyClearance].map(Number)
+  if (!nums.every((n) => Number.isFinite(n))) return 0
+  if (listHeight <= 0 || scrollHeight <= listHeight) return 0
+  const maxTop = Math.max(0, scrollHeight - listHeight)
+  const rowOffset = rowTop - listTop + currentScrollTop
+  const desiredOffset = Math.max(stickyClearance, Math.round((listHeight - rowHeight) / 2))
+  return Math.max(0, Math.min(maxTop, Math.round(rowOffset - desiredOffset)))
 }

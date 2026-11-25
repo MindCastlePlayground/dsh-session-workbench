@@ -17,6 +17,7 @@ import {
   WorkspaceRowTail,
   getMessage,
 } from './messages-view.js'
+import { createStickyProjectController, STICKY_ATTRS } from './sticky.js'
 
 export const inject = ['slots']
 
@@ -263,6 +264,11 @@ function clearInjectedNodes(scope = document) {
   for (const el of scope.querySelectorAll(`[${DOM_ATTRS.WS_ROW_FLAG}]`)) {
     el.removeAttribute(DOM_ATTRS.WS_ROW_FLAG)
   }
+  for (const attr of Object.values(STICKY_ATTRS)) {
+    for (const el of scope.querySelectorAll(`[${attr}]`)) {
+      el.removeAttribute(attr)
+    }
+  }
   for (const el of scope.querySelectorAll(`[${DOM_ATTRS.SWITCHER_HOST}],[${DOM_ATTRS.MESSAGES_HOST}],[${DOM_ATTRS.WS_HOST}]`)) {
     el.remove()
   }
@@ -340,6 +346,8 @@ function WorkspaceStatus({ wide, useWorkspaces, useSessions, useSessionStatus, u
   anchorsRef.current = anchors
   const tabRefs = React.useRef({ [VIEW_MODE.WORKSPACES]: null, [VIEW_MODE.MESSAGES]: null })
   const listContainerRef = React.useRef(null)
+  const stickyRef = React.useRef(null)
+  if (stickyRef.current === null) stickyRef.current = createStickyProjectController()
   const savedScrollRef = React.useRef({
     [VIEW_MODE.WORKSPACES]: 0,
     [VIEW_MODE.MESSAGES]: 0,
@@ -351,6 +359,17 @@ function WorkspaceStatus({ wide, useWorkspaces, useSessions, useSessionStatus, u
     if (listArea) savedScrollRef.current[modeRef.current] = listArea.scrollTop
     setMode(nextMode)
   }, [])
+
+  React.useEffect(() => {
+    if (!isWide || typeof window === 'undefined') return undefined
+    const onEnsureWorkspaces = () => {
+      handleModeChange(VIEW_MODE.WORKSPACES)
+    }
+    window.addEventListener(DOM_ATTRS.ENSURE_WORKSPACES_EVENT, onEnsureWorkspaces)
+    return () => {
+      window.removeEventListener(DOM_ATTRS.ENSURE_WORKSPACES_EVENT, onEnsureWorkspaces)
+    }
+  }, [isWide, handleModeChange])
 
   const focusMessagesList = React.useCallback(() => {
     const firstRow = listContainerRef.current?.querySelector(`.${CLS.MSG_ROW}`)
@@ -399,12 +418,14 @@ function WorkspaceStatus({ wide, useWorkspaces, useSessions, useSessionStatus, u
       if (mode === VIEW_MODE.MESSAGES) header.setAttribute(DOM_ATTRS.HEADER_HIDDEN, 'true')
       else header.removeAttribute(DOM_ATTRS.HEADER_HIDDEN)
     }
+    stickyRef.current?.sync(listArea, isWide && mode === VIEW_MODE.WORKSPACES)
   }, [isWide, mode, anchors.listArea, anchors.header])
 
   // Idempotent portal-host attachment + MutationObserver for native sidebar DOM nodes.
   React.useEffect(() => {
     if (typeof document === 'undefined') return undefined
     if (!isWide) {
+      stickyRef.current?.dispose()
       clearInjectedNodes()
       setAnchors({
         switcherHost: null,
@@ -491,6 +512,7 @@ function WorkspaceStatus({ wide, useWorkspaces, useSessions, useSessionStatus, u
         }
         return { switcherHost, messagesHost, listArea, header, workspaceRows }
       })
+      stickyRef.current?.sync(listArea, isWide && modeRef.current === VIEW_MODE.WORKSPACES)
     }
 
     const scheduleSync = () => {
@@ -528,6 +550,7 @@ function WorkspaceStatus({ wide, useWorkspaces, useSessions, useSessionStatus, u
     return () => {
       if (rafId !== 0) window.cancelAnimationFrame(rafId)
       if (observer) observer.disconnect()
+      stickyRef.current?.dispose()
       clearInjectedNodes()
     }
   }, [isWide])

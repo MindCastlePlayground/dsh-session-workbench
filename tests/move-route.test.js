@@ -305,3 +305,23 @@ test('a held session returns a conflict and only moves on an explicit retry', as
   assert.equal(retried.status, 200, JSON.stringify(retried.body))
   assert.equal(retried.body.moved, true)
 })
+
+test('a writer that finishes closing during the request can be moved immediately', async () => {
+  const sp = ctxRefs.sp
+  const open = sp.open
+  let attempts = 0
+  sp.open = async (id, access) => {
+    if (id === 'mv-2' && access === 'write' && ++attempts === 1) {
+      throw Object.assign(new Error('Session is already owned'), { name: 'SessionAlreadyOwnedError' })
+    }
+    return open(id, access)
+  }
+  try {
+    const response = await call('/archived-sessions/move', { sessionId: 'mv-2', targetPath: join(root, 'ws-old') })
+    assert.equal(response.status, 200, JSON.stringify(response.body))
+    assert.equal(response.body.moved, true)
+    assert.equal(attempts, 2)
+  } finally {
+    sp.open = open
+  }
+})

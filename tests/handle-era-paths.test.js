@@ -75,9 +75,16 @@ test('ensureNoActiveWriter translates ownership conflicts into a 409', async () 
 })
 
 test('purge/move degrade to 409 when the session cannot be located', async () => {
-  const sp = { root: '/tmp/definitely-not-here', stat: async () => undefined, open: async () => { throw new Error('nope') } }
+  const sp = {
+    root: '/tmp/definitely-not-here',
+    stat: async () => undefined,
+    open: async () => { throw Object.assign(new Error('not found'), { name: 'SessionPersistenceNotFoundError' }) },
+  }
   await assert.rejects(() => purgeSessionArtifacts(sp, 'x', { id: 'x', cwd: '/w' }), (e) => e.status === 409)
-  await assert.rejects(() => moveSessionToCwd({ sp, sid: 'x', header: { id: 'x', cwd: '/w' }, canonical: '/w2', events: [] }), (e) => e.status === 409)
+  await assert.rejects(() => moveSessionToCwd({ sp, sid: 'x', header: { id: 'x', cwd: '/w' }, canonical: '/w2', events: [] }), {
+    status: 409,
+    code: 'DSM_MOVE_LOG_NOT_FOUND',
+  })
 })
 
 test('purge refuses an actively-writing session with 409', async () => {
