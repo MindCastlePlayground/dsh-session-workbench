@@ -25,30 +25,38 @@
 
 ## 安装
 
-下载 [`dsh-session-workbench-1.7.0.tgz`](https://github.com/MindCastlePlayground/dsh-session-workbench/releases/download/v1.7.0/dsh-session-workbench-1.7.0.tgz)，进入下载目录并执行与你使用方式对应的一条命令。
+下载 [`dsh-session-workbench-1.7.1.tgz`](https://github.com/MindCastlePlayground/dsh-session-workbench/releases/download/v1.7.1/dsh-session-workbench-1.7.1.tgz)，进入下载目录并执行与你使用方式对应的一条命令。
 
 ```sh
 # DSH Desktop
-dsh plugin --profile desktop add ./dsh-session-workbench-1.7.0.tgz
+dsh plugin --profile desktop add ./dsh-session-workbench-1.7.1.tgz
 
 # DSH Web
-dsh plugin --profile web add ./dsh-session-workbench-1.7.0.tgz
+dsh plugin --profile web add ./dsh-session-workbench-1.7.1.tgz
 ```
 
 安装后刷新页面并确认已出现工作台入口。首次安装时，未启用配置热加载的宿主需要重新启动才能加载插件。如果同一 profile 已启用 `dsh-sessions-manager` 或 `dsh-chat-search`，先停用旧插件以避免路由、菜单或快捷键重复。工作台沿用原有的管理数据和搜索设置目录，无需复制会话文件。
 
-**Web 热切换**使用 [DSH Web 0.2.3-alpha.2](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.2.3-alpha.2) 和 [会话迁移宿主补丁](patches/dsh-session-relocation.patch)。未加载该补丁的宿主仍可使用离线移动。搜索索引需要 Node.js 22.13 或更高版本。
+**Web 热切换**需要给 DSH Web 安装与版本对应的宿主补丁。未加载补丁的宿主仍可使用关闭会话后的移动功能。搜索索引需要 Node.js 22.13 或更高版本。
 
-从工作台源码目录构建补丁。以下命令把 Web 安装在独立目录，并与桌面版分别运行。Node.js 24.x 请使用 24.22.3 或更新版本。
+| DSH Web 版本 | 宿主补丁 |
+| --- | --- |
+| `0.2.1-rc.5` | [dsh-session-relocation-0.2.1-rc.5.patch](patches/dsh-session-relocation-0.2.1-rc.5.patch) |
+| `0.2.2-rc.5` | [dsh-session-relocation-0.2.2-rc.5.patch](patches/dsh-session-relocation-0.2.2-rc.5.patch) |
+| `0.2.3-alpha.2` | [dsh-session-relocation.patch](patches/dsh-session-relocation.patch) |
+
+从工作台源码目录构建补丁。以下以 `0.2.3-alpha.2` 为例，使用其他版本时按表格替换版本和补丁文件。Web 使用独立安装目录和配置目录，可与桌面版分别运行。Node.js 24.x 请使用 24.22.3 或更新版本。
 
 ```sh
 npm ci
-git clone --branch dsh-v0.2.3-alpha.2 --depth 1 https://github.com/deepseek-ai/deepseek-harness.git ../dsh-web-source
-npm install --prefix ../dsh-web @deepseek-ai/dsh@0.2.3-alpha.2
-git -C ../dsh-web-source apply "$PWD/patches/dsh-session-relocation.patch"
+dsh_version=0.2.3-alpha.2
+dsh_patch=dsh-session-relocation.patch
+git clone --branch "dsh-v$dsh_version" --depth 1 https://github.com/deepseek-ai/deepseek-harness.git ../dsh-web-source
+npm install --prefix ../dsh-web "@deepseek-ai/dsh@$dsh_version"
+git -C ../dsh-web-source apply "$PWD/patches/$dsh_patch"
 node patches/apply-web-relocation.mjs ../dsh-web-source ../dsh-web
 export DSH_HOME="$PWD/../dsh-web-profile"
-node ../dsh-web/node_modules/@deepseek-ai/dsh/lib/bin.js plugin --profile web add /path/to/dsh-session-workbench-1.7.0.tgz
+node ../dsh-web/node_modules/@deepseek-ai/dsh/lib/bin.js plugin --profile web add /path/to/dsh-session-workbench-1.7.1.tgz
 node ../dsh-web/node_modules/@deepseek-ai/dsh/lib/bin.js --profile web
 ```
 
@@ -65,7 +73,7 @@ $dshCli = Join-Path $dshApp 'resources/app.asar/dsh/node_modules/@deepseek-ai/ds
 $previousElectronMode = $env:ELECTRON_RUN_AS_NODE
 $env:ELECTRON_RUN_AS_NODE = '1'
 try {
-    & (Join-Path $dshApp 'DeepSeek Harness.exe') --expose-internals $dshCli plugin --profile desktop add ./dsh-session-workbench-1.7.0.tgz | Out-Host
+    & (Join-Path $dshApp 'DeepSeek Harness.exe') --expose-internals $dshCli plugin --profile desktop add ./dsh-session-workbench-1.7.1.tgz | Out-Host
 } finally {
     $env:ELECTRON_RUN_AS_NODE = $previousElectronMode
 }

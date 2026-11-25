@@ -1,0 +1,903 @@
+diff --git a/packages/api/session-controller/src/agent.ts b/packages/api/session-controller/src/agent.ts
+index aaacc886..0498efa4 100644
+--- a/packages/api/session-controller/src/agent.ts
++++ b/packages/api/session-controller/src/agent.ts
+@@ -439,6 +439,7 @@ export class ApiSessionAgentController {
+     }
+     return (await this.ctx.agents.resume({
+       resumeSessionId: sessionId,
++      allowSessionRelocation: true,
+       agentOptions: this.agentOptions(),
+       setup: composition.setup,
+     })).agent
+@@ -493,6 +494,7 @@ export class ApiSessionAgentController {
+     try {
+       return (await this.ctx.agents.resume({
+         resumeSessionId: sessionId,
++        allowSessionRelocation: true,
+         agentOptions: this.agentOptions(),
+         setup: this.reuseSetup(composition),
+       })).agent
+@@ -568,6 +570,7 @@ export class ApiSessionAgentController {
+     }
+     return (await this.ctx.agents.create({
+       sessionId,
++      allowSessionRelocation: true,
+       agentOptions: this.agentOptions(),
+       meta: {
+         cwd,
+diff --git a/packages/api/session-controller/src/commands.ts b/packages/api/session-controller/src/commands.ts
+index 8dd38573..cb899a32 100644
+--- a/packages/api/session-controller/src/commands.ts
++++ b/packages/api/session-controller/src/commands.ts
+@@ -275,6 +275,7 @@ export class SessionCommandController {
+       const { provider, model } = this.ctx.agentDefaultModel.currentSelection()
+       await this.ctx.agents.create({
+         sessionId: childId,
++        allowSessionRelocation: true,
+         seed,
+         inheritedEventCount: SessionLogOffset(boundary + 1),
+         meta: {
+diff --git a/packages/api/session-controller/src/index.ts b/packages/api/session-controller/src/index.ts
+index 2362bce2..51c1a8da 100644
+--- a/packages/api/session-controller/src/index.ts
++++ b/packages/api/session-controller/src/index.ts
+@@ -192,7 +192,17 @@ export class SessionController extends TypertRemoteService {
+       ctx.emit('api-session/added', this.listState.summaryFor(session))
+     })
+     ctx.on('session/disposed', (session) => {
+-      ctx.emit('api-session/removed', session.id)
++      const settled = ctx.agents.sessionRelocationSettled(session.id)
++      if (settled === undefined) {
++        ctx.emit('api-session/removed', session.id)
++        return
++      }
++      // Keep the open conversation and its projection subscriptions during rebind.
++      void settled.then(() => {
++        if (ctx.fiber.uid !== null && ctx.sessions.get(session.id) === undefined) {
++          ctx.emit('api-session/removed', session.id)
++        }
++      })
+     })
+     const publishAgentAvailability = ({ agent }: { agent: Agent }): undefined => {
+       if (ctx.sessions.get(agent.id) === agent.session) {
+@@ -482,7 +492,10 @@ export class SessionController extends TypertRemoteService {
+       ...(clientTimeZone === undefined ? {} : { clientTimeZone }),
+       ...(principal === undefined ? {} : { principal }),
+     }
+-    return this.commands.prompt(request, source)
++    return this.ctx.agents.withSessionAdmission(request.sessionId, () => {
++      signal.throwIfAborted()
++      return this.commands.prompt(request, source)
++    })
+   }
+ 
+   /**
+@@ -502,7 +515,7 @@ export class SessionController extends TypertRemoteService {
+    */
+   @Remote('updateQueue')
+   updateQueue(request: SessionUpdateQueueRequest): Promise<SessionUpdateQueueValue> {
+-    return this.commands.updateQueue(request)
++    return this.ctx.agents.withSessionAdmission(request.sessionId, () => this.commands.updateQueue(request))
+   }
+ 
+   /**
+@@ -512,6 +525,7 @@ export class SessionController extends TypertRemoteService {
+    */
+   @Remote('cancel')
+   cancel(request: SessionCancelRequest): SessionCancelValue {
++    if (this.ctx.agents.cancelSessionRelocation(request.sessionId)) return { accepted: true }
+     return this.commands.cancel(request)
+   }
+ 
+diff --git a/packages/core/agent-loop/src/agent.ts b/packages/core/agent-loop/src/agent.ts
+index adf2e33d..528ba5a7 100644
+--- a/packages/core/agent-loop/src/agent.ts
++++ b/packages/core/agent-loop/src/agent.ts
+@@ -99,6 +99,8 @@ export class ReactLoopAgent implements Agent {
+   readonly inbox: ReactLoopInbox
+   private phase: Phase
+   private activityDone: Promise<void> = Promise.resolve()
++  private relocation: PromiseWithResolvers<void> | undefined
++  private preserveInboxOnClose = false
+ 
+   /** The agent-scoped registration boundary; the lifecycle owner unwinds it after the driver exits. */
+   readonly scope: Scope
+@@ -124,6 +126,7 @@ export class ReactLoopAgent implements Agent {
+     public readonly id: SessionId,
+     public readonly options: AgentOptions,
+     public readonly session: Session,
++    private readonly flushInbox?: () => Promise<void>,
+   ) {
+     this.requestSurfaceGeneration = session.surface.contentGeneration
+     this.dispatch = agentEvents(loopCtx, this)
+@@ -212,6 +215,7 @@ export class ReactLoopAgent implements Agent {
+    *   the inbox insertion so a reentrant cancel cannot reclassify it.
+    */
+   private wakeDriver(wakeAfterAbort = false): void {
++    if (this.relocation !== undefined) return
+     if (this.phase.kind !== 'idle') {
+       // Maintenance and aborted drivers cannot deliver the wake: latch it for
+       // replay at convergence. Live drivers claim queued work themselves;
+@@ -241,6 +245,36 @@ export class ReactLoopAgent implements Agent {
+     } while (activity !== this.activityDone)
+   }
+ 
++  parkForSessionRelocation(): Promise<void> {
++    if (this.phase.kind !== 'running' || this.relocation !== undefined) {
++      throw new Error(`agent "${this.id}" cannot park for relocation`)
++    }
++    const ready = Promise.withResolvers<void>()
++    this.relocation = ready
++    return ready.promise.then(() => this.whenIdle())
++  }
++
++  releaseSessionRelocation(): void {
++    this.relocation = undefined
++  }
++
++  prepareSessionRelocationClose(): void {
++    this.preserveInboxOnClose = true
++  }
++
++  get keepsInboxOnClose(): boolean {
++    return this.preserveInboxOnClose || this.relocation !== undefined
++  }
++
++  async queueSessionRelocation(message: UserMessage): Promise<void> {
++    this.inbox.prepend('next-turn', message)
++    await this.flushInbox?.()
++  }
++
++  wakeSessionInbox(): void {
++    if (this.inbox.hasPending) this.wakeDriver()
++  }
++
+   /** Report one failure at its live boundary, then preserve it for driver containment. */
+   private throwError(error: unknown): never {
+     const turn = this.phase.kind === 'running' ? this.phase.turn : this.phase.lastTurn
+@@ -259,6 +293,7 @@ export class ReactLoopAgent implements Agent {
+       if (this.phase.kind === 'running') {
+         const { turn, wakeRequested } = this.phase
+         this.setPhase({ kind: 'idle', lastTurn: turn })
++        this.relocation?.resolve()
+         if (wakeRequested && this.inbox.hasPending) this.wakeDriver()
+       }
+     }
+@@ -358,6 +393,10 @@ export class ReactLoopAgent implements Agent {
+           this.session.append('step/end', { turn, step })
+         }
+         signal.throwIfAborted()
++        if (this.relocation !== undefined) {
++          turnEnds ??= { kind: 'completed' }
++          break
++        }
+         if (turnEnds && this.inbox.nextStep.length === 0) {
+           await this.dispatch.serial('agent/turn-stopping', { turn, signal })
+           signal.throwIfAborted()
+@@ -389,7 +428,7 @@ export class ReactLoopAgent implements Agent {
+         this.throwError(error)
+       }
+     }
+-    if (!this.inbox.hasPending) return false
++    if (this.relocation !== undefined || !this.inbox.hasPending) return false
+     phase.abort = new AbortController()
+     // A fresh controller makes a latch set on the old one stale: the live driver claims the queue itself.
+     phase.wakeRequested = false
+diff --git a/packages/core/agent-loop/src/index.ts b/packages/core/agent-loop/src/index.ts
+index ca4532af..ae1afc64 100644
+--- a/packages/core/agent-loop/src/index.ts
++++ b/packages/core/agent-loop/src/index.ts
+@@ -561,7 +561,7 @@ export class AgentLoop extends Service implements AgentFactory {
+         if (machine === undefined) await machineReady.promise
+         /* v8 ignore next -- setup failure untracks this disposer before resolving without a machine. */
+         if (machine !== undefined) {
+-          machine.cancel({ kind: 'disposed' })
++          machine.cancel({ kind: 'disposed' }, { keepInbox: machine.keepsInboxOnClose })
+           await machine.whenIdle()
+         }
+       } catch (error: unknown) {
+@@ -601,7 +601,10 @@ export class AgentLoop extends Service implements AgentFactory {
+     const untrack = this.ownership.track(dispose)
+     try {
+       unfollowOwner = ownerCtx.effect(function* () {
+-        const created = machine = new ReactLoopAgent(loopCtx, id, options, session)
++        const created = machine = new ReactLoopAgent(
++          loopCtx, id, options, session,
++          handle === undefined ? undefined : async () => { await loopCtx.sessions.flush(session) },
++        )
+         machineReady.resolve()
+         // Adopt the scope on its original fiber so it cannot unload before teardown.
+         // A loop already unloading during minting owns the provisional scope itself.
+diff --git a/packages/core/agent/src/index.ts b/packages/core/agent/src/index.ts
+index dd8d09e6..22f165e2 100644
+--- a/packages/core/agent/src/index.ts
++++ b/packages/core/agent/src/index.ts
+@@ -63,6 +63,8 @@ export type AgentSetup = (
+ export interface CreateAgentOptions {
+   /** The live agent/session identity. */
+   readonly sessionId: SessionId
++  /** Recompose this agent after a workbench relocation. */
++  readonly allowSessionRelocation?: boolean
+   /** Live parent Agent for runtime ownership; omit for a root Agent. */
+   readonly parentAgent?: Agent
+   /**
+@@ -125,6 +127,8 @@ export interface CreateAgentOptions {
+ export interface ResumeAgentOptions {
+   /** The persisted session id to load and use as the live agent/session identity. */
+   readonly resumeSessionId: SessionId
++  /** Recompose this agent after a workbench relocation. */
++  readonly allowSessionRelocation?: boolean
+   /** Live parent Agent for runtime ownership; omit for a root Agent. */
+   readonly parentAgent?: Agent
+   /** Per-agent options (model, …). */
+@@ -226,6 +230,10 @@ interface InitiatorRun {
+ }
+ 
+ /** Plain holder prevents Cordis from tracing the factory field before the caller context is known. */
++function relocationConflict(code: string, message: string): Error & { status: number, code: string } {
++  return Object.assign(new Error(message), { status: 409, code })
++}
++
+ interface FactorySlot {
+   readonly target: AgentFactory
+ }
+@@ -244,6 +252,12 @@ interface FactorySlot {
+  */
+ export class AgentRegistry extends Service {
+   private store = new Map<SessionId, AgentEntry>()
++  private readonly openings = new Map<SessionId, number>()
++  private readonly relocating = new Set<SessionId>()
++  private readonly relocationHandles = new Map<SessionId, AgentHandle>()
++  private readonly relocationScope = new AsyncLocalStorage<{ id: SessionId; active: boolean }>()
++  private readonly hotRelocations = new Map<SessionId, { done: PromiseWithResolvers<void>; abort: AbortController }>()
++  private readonly sessionAdmissions = new Map<SessionId, Set<Promise<void>>>()
+   private factory: FactorySlot | undefined
+   private readonly initiators = new AsyncLocalStorage<Agent | undefined>()
+   private readonly initiatorRuns = new AsyncLocalStorage<InitiatorRun>()
+@@ -398,8 +412,9 @@ export class AgentRegistry extends Service {
+     // capability and need no Cordis tracker magic.
+     const { target } = this.requireFactory()
+     const receiver = getTraceable(ownerCtx, target)
+-    // oxlint-disable-next-line typescript/unbound-method -- Reflect.apply intentionally supplies the caller-traced receiver
+-    return Reflect.apply(target.createAgent, receiver, [ownerCtx, options])
++    return this.openForSession(options.sessionId, options.allowSessionRelocation, () =>
++      // oxlint-disable-next-line typescript/unbound-method -- Reflect.apply supplies the caller-traced receiver
++      Reflect.apply(target.createAgent, receiver, [ownerCtx, options]))
+   }
+ 
+   /**
+@@ -413,8 +428,134 @@ export class AgentRegistry extends Service {
+     const ownerCtx = this.ctx
+     const { target } = this.requireFactory()
+     const receiver = getTraceable(ownerCtx, target)
+-    // oxlint-disable-next-line typescript/unbound-method -- Reflect.apply intentionally supplies the caller-traced receiver
+-    return Reflect.apply(target.resume, receiver, [ownerCtx, options])
++    return this.openForSession(options.resumeSessionId, options.allowSessionRelocation, () =>
++      // oxlint-disable-next-line typescript/unbound-method -- Reflect.apply supplies the caller-traced receiver
++      Reflect.apply(target.resume, receiver, [ownerCtx, options]))
++  }
++
++  /** Keep reopening outside the persistence transaction and retain only opted-in owners. */
++  private async openForSession(
++    id: SessionId,
++    relocatable: boolean | undefined,
++    open: () => Promise<AgentHandle>,
++  ): Promise<AgentHandle> {
++    this.assertRelocationAccess(id)
++    this.openings.set(id, (this.openings.get(id) ?? 0) + 1)
++    try {
++      const handle = await open()
++      if (relocatable === true && this.store.get(id)?.agent === handle.agent) {
++        this.relocationHandles.set(id, handle)
++      }
++      return handle
++    } finally {
++      const count = (this.openings.get(id) ?? 1) - 1
++      if (count > 0) this.openings.set(id, count)
++      else this.openings.delete(id)
++    }
++  }
++
++  private assertRelocationAccess(id: SessionId): void {
++    const permit = this.relocationScope.getStore()
++    if ((this.relocating.has(id) || this.hotRelocations.has(id)) && !(permit?.active && permit.id === id)) {
++      throw relocationConflict('DSM_MOVE_IN_PROGRESS', '该会话正在移动。')
++    }
++  }
++
++  async withSessionAdmission<T>(id: SessionId, admit: () => Promise<T>): Promise<T> {
++    let pending: { done: PromiseWithResolvers<void> } | undefined
++    while ((pending = this.hotRelocations.get(id)) !== undefined) await pending.done.promise
++    const active = this.sessionAdmissions.get(id) ?? new Set<Promise<void>>()
++    const settled = Promise.withResolvers<void>()
++    active.add(settled.promise)
++    this.sessionAdmissions.set(id, active)
++    try {
++      return await admit()
++    } finally {
++      active.delete(settled.promise)
++      if (active.size === 0) this.sessionAdmissions.delete(id)
++      settled.resolve()
++    }
++  }
++
++  /** Let observers distinguish a hot rebind from permanent removal. */
++  sessionRelocationSettled(id: SessionId): Promise<void> | undefined {
++    return this.hotRelocations.get(id)?.done.promise
++  }
++
++  cancelSessionRelocation(id: SessionId): boolean {
++    const hot = this.hotRelocations.get(id)
++    if (hot === undefined) return false
++    hot.abort.abort(relocationConflict('DSM_MOVE_CANCELLED', '用户停止了本次会话切换。'))
++    this.store.get(id)?.agent.cancel({ kind: 'user' }, { keepInbox: true })
++    return true
++  }
++
++  supportsHotSessionRelocation(agent: Agent): boolean {
++    const persistence = this.ctx.get('sessionPersistence') as { withSessionRelocationLease?: unknown } | undefined
++    return this.relocationHandles.get(agent.id)?.agent === agent
++      && typeof agent.parkForSessionRelocation === 'function'
++      && typeof persistence?.withSessionRelocationLease === 'function'
++  }
++
++  scheduleSessionRelocation<T>(agent: Agent, relocate: (signal: AbortSignal) => Promise<T>): Promise<T> {
++    const id = agent.id
++    this.assertRelocationAccess(id)
++    if (!this.supportsHotSessionRelocation(agent)) {
++      throw relocationConflict('DSM_HOT_MOVE_UNAVAILABLE', '当前宿主未启用会话热切换。')
++    }
++    const abort = new AbortController()
++    const done = Promise.withResolvers<void>()
++    const parked = agent.parkForSessionRelocation!(abort.signal)
++    this.hotRelocations.set(id, { done, abort })
++    return parked.then(async () => {
++      await Promise.all(this.sessionAdmissions.get(id) ?? [])
++      return this.withSessionRelocation(id, { hotOwner: agent }, () => relocate(abort.signal))
++    }).finally(() => {
++      agent.releaseSessionRelocation?.()
++      this.hotRelocations.delete(id)
++      done.resolve()
++    })
++  }
++
++  /** Release one opted-in Agent and reserve the identity until relocation settles. */
++  async withSessionRelocation<T>(
++    id: SessionId,
++    options: { readonly stopRunning?: boolean; readonly hotOwner?: Agent },
++    relocate: () => Promise<T>,
++  ): Promise<T> {
++    if (this.relocating.has(id) || (this.hotRelocations.has(id) && options.hotOwner === undefined)) {
++      throw relocationConflict('DSM_MOVE_IN_PROGRESS', '该会话正在移动。')
++    }
++    if (this.openings.has(id)) throw relocationConflict('DSM_SESSION_BUSY', '此会话正在打开，请稍后重试。')
++    const entry = this.store.get(id)
++    const handle = this.relocationHandles.get(id)
++    if (options.hotOwner !== undefined && handle?.agent !== options.hotOwner) {
++      throw relocationConflict('DSM_SESSION_BUSY', '会话执行实例已变更。')
++    }
++    if (entry !== undefined) {
++      if (handle?.agent !== entry.agent) {
++        throw relocationConflict('DSM_SESSION_BUSY', '请在持有它的宿主关闭该会话，再重试。')
++      }
++      if (entry.agent.status !== 'idle' && options.stopRunning !== true) {
++        throw relocationConflict('DSM_SESSION_RUNNING', '会话正在运行。可以停止这一条会话后移动。')
++      }
++    }
++    this.relocating.add(id)
++    const permit = { id, active: true }
++    try {
++      const persistence = this.ctx.get('sessionPersistence') as {
++        withSessionRelocationLease?<V>(sessionId: SessionId, task: () => Promise<V>): Promise<V>
++      } | undefined
++      const move = () => this.relocationScope.run(permit, async () => {
++        handle?.agent.prepareSessionRelocationClose?.()
++        await handle?.dispose()
++        return relocate()
++      })
++      return await (persistence?.withSessionRelocationLease?.(id, move) ?? move())
++    } finally {
++      permit.active = false
++      this.relocating.delete(id)
++    }
+   }
+ 
+   /**
+@@ -466,6 +607,7 @@ export class AgentRegistry extends Service {
+     const carrier = scopeTarget(agent, agent)
+     // This is the authoritative collision boundary. Concurrent create/resume
+     // operations may both prepare, but only one exact entry can publish.
++    this.assertRelocationAccess(id)
+     if (this.store.has(id)) throw new Error(`agent "${id}" is already registered`)
+     const entry: AgentEntry = {
+       id,
+@@ -503,6 +645,7 @@ export class AgentRegistry extends Service {
+     /* v8 ignore next -- enter() rejects replacement while this single-shot detach capability is live. */
+     if (this.store.get(entry.id) !== entry) return
+     this.store.delete(entry.id)
++    this.relocationHandles.delete(entry.id)
+     // An insertion rolled back before announce was never externally created,
+     // so emitting disposed would invent an impossible lifecycle edge. Marking
+     // happens before the created emit: if a later created listener throws,
+diff --git a/packages/core/agent/src/runtime-types.ts b/packages/core/agent/src/runtime-types.ts
+index 0fa89afc..7ab6576f 100644
+--- a/packages/core/agent/src/runtime-types.ts
++++ b/packages/core/agent/src/runtime-types.ts
+@@ -190,6 +190,14 @@ declare module './types.ts' {
+    */
+     whenIdle(): Promise<void>
+ 
++    /** Hold inbox work after the current tool batch settles. */
++    parkForSessionRelocation?(signal: AbortSignal): Promise<void>
++    releaseSessionRelocation?(): void
++    prepareSessionRelocationClose?(): void
++    /** Queue model-facing relocation context ahead of waiting user turns. */
++    queueSessionRelocation?(message: UserMessage): Promise<void>
++    wakeSessionInbox?(): void
++
+     /**
+    * Run one non-turn maintenance task from the true idle phase. The task starts
+    * synchronously after claiming that phase; later waking input remains in the
+diff --git a/packages/session/session-persistence-jsonl/src/index.ts b/packages/session/session-persistence-jsonl/src/index.ts
+index 3c3c1358..efbedc0f 100644
+--- a/packages/session/session-persistence-jsonl/src/index.ts
++++ b/packages/session/session-persistence-jsonl/src/index.ts
+@@ -23,7 +23,7 @@ import pLimit, { type LimitFunction } from 'p-limit'
+ import {
+   SessionPersistence, SessionPersistenceRevision, SessionFormatUnsupportedError,
+   SessionPersistenceCorruptionError,
+-  SessionAlreadyExistsError, SessionPersistenceNotFoundError,
++  SessionAlreadyExistsError, SessionAlreadyOwnedError, SessionPersistenceNotFoundError,
+   assertStoredId, materializeCreateHeader, sessionFormatVersionRefusal, validateStoredEvents,
+   type SessionAccess, type SessionHandle,
+   type SessionHandleReadResult,
+@@ -33,7 +33,7 @@ import {
+   type SessionPersistenceRevision as PersistenceRevision,
+ } from '@deepseek-ai/dsh-session-persistence'
+ import { JsonlBackendTracker, JsonlSessionHandle, type StorageHandleState } from './storage.ts'
+-import { SessionWriteLease } from './lease.ts'
++import { JsonlWriteOwnership, STABLE_LEASE_DIRECTORY, type WriteLease } from './lease.ts'
+ import { SESSION_FORMAT_VERSION, SessionId as makeSessionId, SessionLogOffset } from '@deepseek-ai/dsh-session'
+ import type { SessionEvent, SessionId, SessionHeader, SessionLogOffset as SessionLogOffsetType } from '@deepseek-ai/dsh-session'
+ import {
+@@ -292,7 +292,8 @@ class JsonlSessionPersistence extends SessionPersistence {
+   /** Backend label for diagnostics and effects; shadows `Service.name` without changing the service key. */
+   override readonly name = 'session-persistence-jsonl'
+ 
+-  private root: string
++  private readonly root: string
++  private readonly writeOwnership: JsonlWriteOwnership
+   private compression: JsonlCompression
+   /**
+    * Bounds directory, header, and stat I/O across every concurrent listing of
+@@ -324,6 +325,7 @@ class JsonlSessionPersistence extends SessionPersistence {
+     }
+     // Resolve once so later process.cwd() changes cannot split one backend across roots.
+     this.root = resolve(config.root)
++    this.writeOwnership = new JsonlWriteOwnership(this.root)
+     this.compression = config.compression ?? DEFAULT_COMPRESSION
+     this.listLimit = pLimit(config.listConcurrency ?? DEFAULT_LIST_CONCURRENCY)
+     this.generationFormat = {
+@@ -348,6 +350,22 @@ class JsonlSessionPersistence extends SessionPersistence {
+ 
+   // --- SessionPersistence service API ---
+ 
++  /**
++   * Reserve this Session's write ownership across source close, relocation, and target reopen.
++   * Only the awaited relocation may claim new write handles for this id while it runs.
++   * @param id - the Session being relocated within this persistence root.
++   * @param work - the awaited close, move, and optional reopen operations.
++   * @returns the relocation result.
++   */
++  withSessionRelocationLease<T>(id: SessionId, work: () => Promise<T>): Promise<T> {
++    if (this.tracker.isClaimingWrite(id)) return Promise.reject(new SessionAlreadyOwnedError(id))
++    return this.writeOwnership.relocate(id, async () => {
++      await this.ensureRootEncoding()
++      const resolved = await this.findLog(id)
++      return resolved === undefined ? undefined : dirname(resolved.currentPath)
++    }, work)
++  }
++
+   /**
+    * Create a new stored session and take its write ownership. The session is
+    * visible to this process immediately; the physical artifact appears on the
+@@ -360,6 +378,7 @@ class JsonlSessionPersistence extends SessionPersistence {
+   async create(header: SessionHeader, options?: SessionPersistenceCreateOptions): Promise<SessionHandle> {
+     options?.signal?.throwIfAborted()
+     const snapshot = materializeCreateHeader(header)
++    this.writeOwnership.assertCanClaim(snapshot.id)
+     // Fail fast on a seeded/cut mismatch with the exact refusal the header
+     // line encoder enforces at materialization.
+     toHeaderLine(snapshot, options?.inheritedEventCount)
+@@ -370,6 +389,7 @@ class JsonlSessionPersistence extends SessionPersistence {
+       throw new SessionAlreadyExistsError(snapshot.id)
+     }
+     options?.signal?.throwIfAborted()
++    this.writeOwnership.assertCanClaim(snapshot.id)
+     // No lock yet: before materialization there is no durable artifact for
+     // another process to contend over, so the handle acquires the lock right
+     // before its first log bytes publish (ensureLease); an unmaterialized
+@@ -387,6 +407,7 @@ class JsonlSessionPersistence extends SessionPersistence {
+    */
+   async open(id: SessionId, access: SessionAccess, options?: SessionPersistenceOpenOptions): Promise<SessionHandle> {
+     options?.signal?.throwIfAborted()
++    if (access === 'write') this.writeOwnership.assertCanClaim(id)
+     await this.ensureRootEncoding()
+     options?.signal?.throwIfAborted()
+     const pending = this.tracker.pendingOf(id)
+@@ -420,12 +441,16 @@ class JsonlSessionPersistence extends SessionPersistence {
+     }
+     // A pending entry always belongs to an ACTIVE creator handle (close erases
+     // it), so the claim below rejects that case as already owned.
++    this.writeOwnership.assertCanClaim(id)
+     this.tracker.claimWrite(id)
+-    let lease: SessionWriteLease | undefined
++    let lease: WriteLease | undefined
+     try {
+-      const resolved = await this.findLog(id, options?.signal)
+-      if (resolved === undefined) throw new SessionPersistenceNotFoundError(id)
+-      lease = await this.acquireLease(id, undefined, dirname(resolved.currentPath))
++      lease = await this.writeOwnership.acquire(id, async () => {
++        const resolved = await this.findLog(id, options?.signal)
++        if (resolved === undefined) throw new SessionPersistenceNotFoundError(id)
++        return dirname(resolved.currentPath)
++      })
++      this.writeOwnership.assertCanClaim(id)
+       const prepared = await this.requireStoredLog(id, options?.signal)
+       options?.signal?.throwIfAborted()
+       let stored: CurrentStoredLog
+@@ -435,6 +460,7 @@ class JsonlSessionPersistence extends SessionPersistence {
+         stored = prepared
+       }
+       options?.signal?.throwIfAborted()
++      this.writeOwnership.assertCanClaim(id)
+       return this.tracker.adopt(new JsonlSessionHandle(this, id, stored.meta, 'write', {
+         cursor: stored.events.length,
+         materialized: true,
+@@ -963,29 +989,19 @@ class JsonlSessionPersistence extends SessionPersistence {
+     this.tracker.release(handle, materialized)
+   }
+ 
+-  /**
+-   * Acquire the session directory's kernel write lock; the kernel holds it
+-   * until the handle's close releases the descriptor, including on process death.
+-   * @param id - the session the lock guards.
+-   * @param cwd - header cwd used to derive the directory for a fresh session.
+-   * @param dir - the resolved directory of an existing artifact, when known.
+-   * @returns the held lock.
+-   */
+-  private acquireLease(id: SessionId, cwd: string | undefined, dir = sessionDir(this.root, cwd, id)): Promise<SessionWriteLease> {
+-    return SessionWriteLease.acquire(dir, id)
+-  }
+-
+   /**
+    * Acquire the cross-process write lock for a materializing created session,
+    * called by its handle immediately before the first log bytes publish.
+    * @param header - the session's stored header (its cwd derives the directory).
+    * @returns the held lock.
+    */
+-  async acquireWriteLease(header: SessionHeader): Promise<SessionWriteLease> {
+-    // Refuse an opposite-encoding artifact before the lock's mkdir publishes
+-    // the session directory — the last moment the directory can be absent.
+-    await this.rejectOppositeArtifact(header.cwd, header.id)
+-    return this.acquireLease(header.id, header.cwd)
++  async acquireWriteLease(header: SessionHeader): Promise<WriteLease> {
++    return this.writeOwnership.acquire(header.id, async () => {
++      // A different process may have materialized this id after create().
++      if (await this.findLog(header.id) !== undefined) throw new SessionAlreadyExistsError(header.id)
++      await this.rejectOppositeArtifact(header.cwd, header.id)
++      return sessionDir(this.root, header.cwd, header.id)
++    })
+   }
+ 
+   /** Decode complete frames and retain complete JSONL records from a torn final frame. */
+@@ -1671,7 +1687,7 @@ class JsonlSessionPersistence extends SessionPersistence {
+       signal?.throwIfAborted()
+       const entries = await readdir(this.root, { withFileTypes: true })
+       signal?.throwIfAborted()
+-      return entries.filter(e => e.isDirectory()).map(e => join(this.root, e.name))
++      return entries.filter(e => e.isDirectory() && e.name !== STABLE_LEASE_DIRECTORY).map(e => join(this.root, e.name))
+     } catch (error) {
+       // Only an absent root means no sessions; rethrow every other I/O failure.
+       if (isENOENT(error)) return []
+diff --git a/packages/session/session-persistence-jsonl/src/lease.ts b/packages/session/session-persistence-jsonl/src/lease.ts
+index 59dfe27f..2ec24c28 100644
+--- a/packages/session/session-persistence-jsonl/src/lease.ts
++++ b/packages/session/session-persistence-jsonl/src/lease.ts
+@@ -1,9 +1,10 @@
+ /**
+- * Cross-process write-ownership lock for one session's artifact directory,
+- * held for the whole life of a write handle. The arbiter is the kernel:
+- * POSIX takes a non-blocking `flock(2)` via native system support on `session.lock`
+- * beside the log, and Windows holds a named kernel semaphore derived from
+- * that path — never a file lock or handle, so readers, searches, and
++ * Cross-process Session write ownership uses a stable kernel lock for the
++ * persistence root and id and the original kernel lock beside the log.
++ * A write handle holds both through its final drain. Relocation retains the
++ * stable lock across artifact-directory renames and writer handoffs.
++ * POSIX takes a non-blocking `flock(2)` on each lock path. Windows holds
++ * a named kernel semaphore derived from each path, so readers, searches, and
+  * directory removal proceed freely while the lock is held. Contention maps
+  * to `SessionAlreadyOwnedError`; the kernel releases the lock when the
+  * holder's descriptor or last object handle closes, including on any process
+@@ -14,21 +15,21 @@
+  * A POSIX lock names an inode, not a path, so after locking the holder
+  * verifies the locked inode is still the file at the lock path and retries
+  * otherwise: an unlinked-and-recreated lock file carries a fresh inode, and
+- * a lock on the orphaned one proves nothing. Removing a live session's lock
+- * file therefore forfeits exclusion on POSIX (nothing in the harness does
+- * so); Windows has no lock file at all. Readers never touch the lock.
++ * a lock on the orphaned one proves nothing. Windows has no lock file.
++ * Readers never touch either lock.
+  * The lock is acquired at write-open of an existing artifact and, for a
+  * created session, only right before its first materializing write — an
+- * unmaterialized session has no filesystem footprint. Release never removes
+- * the POSIX lock file: every acquired lock belongs to a materialized or
+- * materializing session, and the surviving file keeps the stable inode later
+- * lockers verify against. The browser worker stubs the native flock entry to
++ * unmaterialized session has no filesystem footprint. Release leaves the
++ * POSIX lock files in place so later lockers can verify the same inode.
++ * The browser worker stubs the native flock entry to
+  * immediate success: it is single-process, so the in-process write claim
+  * already excludes every writer.
+  * @module @deepseek-ai/dsh-session-persistence-jsonl/lease
+  */
+ 
+-import { mkdir, open, stat } from 'node:fs/promises'
++import { AsyncLocalStorage } from 'node:async_hooks'
++import { createHash } from 'node:crypto'
++import { mkdir, open, realpath, stat } from 'node:fs/promises'
+ import type { FileHandle } from 'node:fs/promises'
+ import { join } from 'node:path'
+ import { tryLockExclusive } from '@deepseek-ai/node-addon-system/flock'
+@@ -39,6 +40,166 @@ import { acquireLockHandleWin32, releaseLockHandleWin32 } from './win32.ts'
+ /** Base name of the kernel lock file inside a session's directory. */
+ export const LEASE_FILENAME = 'session.lock'
+ 
++/** Reserved subdirectory for cwd-independent write ownership. */
++export const STABLE_LEASE_DIRECTORY = '.dsh-session-write-leases'
++
++/** One independently releasable reference to write ownership. */
++export interface WriteLease {
++  release(): Promise<void>
++}
++
++interface SharedLease {
++  readonly id: SessionId
++  readonly ready: Promise<SessionWriteLease>
++  references: number
++}
++
++interface Relocation {
++  readonly id: SessionId
++  readonly directories: Map<string, Promise<WriteLease>>
++  phase: 'preparing' | 'active' | 'closing'
++}
++
++/** Release every reference, reporting teardown errors after all releases finish. */
++async function releaseAll(leases: readonly WriteLease[]): Promise<void> {
++  const errors: unknown[] = []
++  for (const lease of leases) {
++    try { await lease.release() }
++    catch (error) { errors.push(error) }
++  }
++  if (errors.length === 1) throw errors[0]
++  if (errors.length > 1) throw new AggregateError(errors, 'JSONL write lease release failed')
++}
++
++/** The backend's stable and artifact-directory kernel locks, shared across a relocation handoff. */
++export class JsonlWriteOwnership {
++  private readonly held = new Map<string, SharedLease>()
++  private readonly relocations = new Map<SessionId, Relocation>()
++  private readonly scope = new AsyncLocalStorage<Relocation>()
++
++  /** @param root - absolute path of the configured persistence root. */
++  constructor(private readonly root: string) {}
++
++  /**
++   * Admit a new local handle claim or refuse a caller outside the active relocation.
++   * @param id - Session whose writer is being claimed.
++   */
++  assertCanClaim(id: SessionId): void {
++    const relocation = this.relocations.get(id)
++    const scoped = this.scope.getStore()
++    if (relocation !== undefined && (scoped !== relocation || relocation.phase !== 'active')
++      || scoped?.id === id && scoped !== relocation) {
++      throw new SessionAlreadyOwnedError(id)
++    }
++  }
++
++  /**
++   * Hold stable ownership and the current artifact-directory lock through a relocation.
++   * @param id - Session being moved.
++   * @param locate - resolves the current artifact directory, if one exists.
++   * @param work - awaited relocation, including any target write-handle reopen.
++   * @returns the relocation result.
++   */
++  async relocate<T>(id: SessionId, locate: () => Promise<string | undefined>, work: () => Promise<T>): Promise<T> {
++    if (this.relocations.has(id) || this.scope.getStore()?.id === id) throw new SessionAlreadyOwnedError(id)
++    const relocation: Relocation = { id, directories: new Map(), phase: 'preparing' }
++    this.relocations.set(id, relocation)
++    let stable: WriteLease | undefined
++    let failure: { readonly error: unknown } | undefined
++    try {
++      stable = await this.acquireStable(id)
++      const source = await locate()
++      if (source !== undefined) await this.pinDirectory(relocation, source)
++      relocation.phase = 'active'
++      return await this.scope.run(relocation, work)
++    } catch (error) {
++      failure = { error }
++      throw error
++    } finally {
++      relocation.phase = 'closing'
++      try {
++        const settled = await Promise.allSettled(relocation.directories.values())
++        const pinned = settled.flatMap(result => result.status === 'fulfilled' ? [result.value] : [])
++        await releaseAll(stable === undefined ? pinned : [...pinned, stable])
++      } catch (error) {
++        if (failure === undefined) throw error
++        throw new AggregateError([failure.error, error], 'JSONL relocation and write lock release failed')
++      } finally {
++        this.relocations.delete(id)
++      }
++    }
++  }
++
++  /**
++   * Acquire the stable Session lock before locating and locking its artifact directory.
++   * The caller must already own the backend's in-process write-handle claim.
++   * @param id - Session whose writer is being acquired.
++   * @param locate - resolves the artifact directory under stable ownership.
++   * @returns a reference to both locks, released on handle close.
++   */
++  async acquire(id: SessionId, locate: () => Promise<string>): Promise<WriteLease> {
++    const stable = await this.acquireStable(id)
++    let native: WriteLease | undefined
++    try {
++      const dir = await locate()
++      native = await this.retain(dir, id)
++      const relocation = this.relocations.get(id)
++      if (relocation !== undefined && relocation.phase !== 'closing') await this.pinDirectory(relocation, dir)
++      const directory = native
++      return { release: () => releaseAll([directory, stable]) }
++    } catch (error) {
++      try { await releaseAll(native === undefined ? [stable] : [native, stable]) }
++      catch (releaseError) { throw new AggregateError([error, releaseError], 'JSONL write lock acquisition and cleanup failed') }
++      throw error
++    }
++  }
++
++  private async acquireStable(id: SessionId): Promise<WriteLease> {
++    await mkdir(this.root, { recursive: true, mode: 0o700 })
++    const root = await realpath(this.root)
++    const key = process.platform === 'win32' ? id.toLowerCase() : id
++    const segment = createHash('sha256').update(Buffer.from(key, 'utf16le')).digest('hex')
++    return this.retain(join(root, STABLE_LEASE_DIRECTORY), id, segment + '.' + LEASE_FILENAME)
++  }
++
++  private pinDirectory(relocation: Relocation, dir: string): Promise<WriteLease> {
++    const existing = relocation.directories.get(dir)
++    if (existing !== undefined) return existing
++    const pinned = this.retain(dir, relocation.id)
++    relocation.directories.set(dir, pinned)
++    void pinned.catch(() => { relocation.directories.delete(dir) })
++    return pinned
++  }
++
++  private async retain(dir: string, id: SessionId, filename = LEASE_FILENAME): Promise<WriteLease> {
++    const path = join(dir, filename)
++    let entry = this.held.get(path)
++    if (entry === undefined) {
++      entry = { id, ready: SessionWriteLease.acquire(dir, id, filename), references: 0 }
++      this.held.set(path, entry)
++    } else if (entry.id !== id || entry.references === 0) {
++      throw new SessionAlreadyOwnedError(id)
++    }
++    const shared = entry
++    shared.references += 1
++    let kernel: SessionWriteLease
++    try {
++      kernel = await shared.ready
++    } catch (error) {
++      if (--shared.references === 0) this.held.delete(path)
++      throw error
++    }
++    let released = false
++    return { release: async () => {
++      if (released) return
++      released = true
++      if (--shared.references !== 0) return
++      try { await kernel.release() }
++      finally { this.held.delete(path) }
++    } }
++  }
++}
++
+ /** The held kernel lock: a POSIX descriptor or a Win32 semaphore handle. */
+ type HeldLock =
+   | { readonly kind: 'posix'; readonly handle: FileHandle }
+@@ -61,16 +222,16 @@ export class SessionWriteLease {
+   private constructor(private readonly held: HeldLock) {}
+ 
+   /**
+-   * Acquire the session directory's kernel write lock.
+-   * @param dir - the session's artifact directory (created if absent).
++   * Acquire a kernel write lock at a filesystem path.
++   * @param dir - the lock's parent directory (created if absent).
+    * @param id - the session the lock guards, for error identities.
++   * @param filename - stable lock name, or the conventional artifact-directory lock when omitted.
+    * @returns the held lock.
+    * @throws {SessionAlreadyOwnedError} while another holder keeps the lock.
+    */
+-  static async acquire(dir: string, id: SessionId): Promise<SessionWriteLease> {
+-    const path = join(dir, LEASE_FILENAME)
+-    // Owner-only like materializePosix's directories: the lock may create the
+-    // session directory first, and both creators must agree on the mode.
++  static async acquire(dir: string, id: SessionId, filename = LEASE_FILENAME): Promise<SessionWriteLease> {
++    const path = join(dir, filename)
++    // A directory lock may create its artifact directory before materializePosix.
+     await mkdir(dir, { recursive: true, mode: 0o700 })
+     /* v8 ignore start -- native Windows coverage exercises this platform branch; Linux covers the POSIX peer */
+     if (process.platform === 'win32') {
+@@ -117,9 +278,7 @@ export class SessionWriteLease {
+ 
+   /**
+    * Release the kernel lock by closing its descriptor or handle. The POSIX
+-   * lock file is never removed: every acquired lock belongs to a
+-   * materialized or materializing session, and keeping the file preserves
+-   * the stable inode later lockers verify against. Idempotent.
++   * lock file remains for later lockers to verify against. Idempotent.
+    */
+   async release(): Promise<void> {
+     if (this.released) return
+diff --git a/packages/session/session-persistence-jsonl/src/storage.ts b/packages/session/session-persistence-jsonl/src/storage.ts
+index 197dcbc2..60d93283 100644
+--- a/packages/session/session-persistence-jsonl/src/storage.ts
++++ b/packages/session/session-persistence-jsonl/src/storage.ts
+@@ -30,7 +30,7 @@ import type {
+   SessionHandleReadOptions,
+   SessionHandleReadResult,
+ } from '@deepseek-ai/dsh-session-persistence'
+-import type { SessionWriteLease } from './lease.ts'
++import type { WriteLease } from './lease.ts'
+ 
+ /** Maximum intentional wait before a routed live session batch starts writing. */
+ export const LIVE_WRITE_BATCH_MAX_DELAY_MS = 200
+@@ -54,8 +54,8 @@ export interface JsonlHandleStorage {
+   readStoredLog(path: string, expectedId: SessionId, signal?: AbortSignal): Promise<SessionHandleReadResult>
+   /** Whether the id is still a created-but-unmaterialized session here. */
+   hasPendingSession(id: SessionId): boolean
+-  /** Acquire the session's cross-process write lock in its artifact directory. */
+-  acquireWriteLease(header: SessionHeader): Promise<SessionWriteLease>
++  /** Acquire the Session's stable and artifact-directory write locks. */
++  acquireWriteLease(header: SessionHeader): Promise<WriteLease>
+   /** Drop the handle's bookkeeping on close. */
+   releaseHandle(handle: JsonlSessionHandle, materialized: boolean): void
+ }
+@@ -100,7 +100,7 @@ export class JsonlSessionHandle implements SessionHandle {
+     readonly access: SessionAccess,
+     private readonly state: StorageHandleState,
+     /** The cross-process write lock; a create handle acquires it lazily at first materialization. */
+-    private lease?: SessionWriteLease,
++    private lease?: WriteLease,
+   ) {}
+ 
+   /** Exact fork-inherited prefix length stored with this session's log. */
+@@ -431,6 +431,15 @@ export class JsonlBackendTracker {
+     this.writers.set(id, null)
+   }
+ 
++  /**
++   * Whether a writer has claimed the id and is still opening its handle.
++   * @param id - the Session to check.
++   * @returns whether its write handle has yet to be adopted.
++   */
++  isClaimingWrite(id: SessionId): boolean {
++    return this.writers.get(id) === null
++  }
++
+   /**
+    * Roll a failed write open back.
+    * @param id - the session whose claim is dropped.
