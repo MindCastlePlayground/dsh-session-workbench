@@ -1,4 +1,5 @@
 import { failure } from '../tools.js'
+import { MAX_SESSION_NOTE } from './tag-index.js'
 
 const SESSION_ID = { type: 'string', minLength: 1, maxLength: 200 }
 const SESSION_IDS = { type: 'array', items: SESSION_ID, minItems: 1, maxItems: 500 }
@@ -40,6 +41,8 @@ const ACTIONS = [
   { name: 'tag_merge', description: 'Merge one tag into another.', route: '/archived-sessions/tags/merge', method: 'POST', properties: { fromId: ID, toId: ID }, required: ['fromId', 'toId'] },
   { name: 'tag_delete', description: 'Delete a tag.', route: '/archived-sessions/tags/delete', method: 'POST', properties: { id: ID }, required: ['id'] },
   { name: 'tag_set', description: 'Set tags for one session.', route: '/archived-sessions/tags/set', method: 'POST', properties: { sessionId: SESSION_ID, tagIds: { type: 'array', items: ID, maxItems: 200 } }, required: ['sessionId', 'tagIds'] },
+  { name: 'note_get', description: 'Read a session note.', route: '/archived-sessions/note', method: 'GET', properties: { sessionId: SESSION_ID }, required: ['sessionId'] },
+  { name: 'note_set', description: 'Set a session note. Pass an empty string to clear it.', route: '/archived-sessions/note', method: 'POST', properties: { sessionId: SESSION_ID, note: { type: 'string', minLength: 0, maxLength: MAX_SESSION_NOTE } }, required: ['sessionId', 'note'] },
   { name: 'filter_save', description: 'Save a named filter.', route: '/archived-sessions/filters/save', method: 'POST', properties: { name: NAME, filters: { type: 'object' } }, required: ['name', 'filters'] },
   { name: 'filter_delete', description: 'Delete saved filters by ID.', route: '/archived-sessions/filters/delete', method: 'POST', properties: { ids: { type: 'array', items: ID, minItems: 1, maxItems: 100 } }, required: ['ids'] },
   { name: 'trash_settings', description: 'Read or update recycle-bin retention days.', route: '/archived-sessions/trash/settings', method: 'POST', properties: { retentionDays: { type: 'integer', enum: [0, 7, 30, 90] } }, required: [], approval: 'mutating' },
@@ -83,7 +86,7 @@ export function registerManagerAgentTools(ctx, routes, { approve } = {}) {
           if (permitted !== true) throw failure('APPROVAL_DENIED', 'The action was not approved.')
         }
         signal?.throwIfAborted()
-        return invoke(handler, action.method, args, signal)
+        return invoke(handler, action, args, signal)
       },
     }
     disposers.push(ctx.tools.register(tool))
@@ -93,12 +96,15 @@ export function registerManagerAgentTools(ctx, routes, { approve } = {}) {
 
 export const managerAgentActionNames = Object.freeze(ACTIONS.map((action) => action.name))
 
-async function invoke(handler, method, body, signal) {
+async function invoke(handler, { method, route }, body, signal) {
   const headers = new Map()
   let status = 200
   let payload
   const req = method === 'GET' ? emptyRequest() : jsonRequest(body)
+  req.method = method
+  req.url = method === 'GET' ? route + '?' + new URLSearchParams(body) : route
   const res = {
+    setHeader(key, value) { headers.set(key.toLowerCase(), value) },
     writeHead(code, values = {}) { status = code; for (const [key, value] of Object.entries(values)) headers.set(key.toLowerCase(), value) },
     end(text = '') { payload = text },
   }

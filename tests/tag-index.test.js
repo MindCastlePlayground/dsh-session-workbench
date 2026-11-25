@@ -22,6 +22,22 @@ async function tempIndex() {
   return { index: createTagIndex({ dir }), dir, file: join(dir, 'tags.json') }
 }
 
+test('session notes preserve concurrent tag edits and can be cleared', async () => {
+  const { index } = await tempIndex()
+  const tag = await index.create('待跟进')
+  await Promise.all([
+    index.setTags('s-1', [tag.id]),
+    index.setNote('s-1', '  发布前确认迁移  '),
+  ])
+  const saved = await index.read()
+  assert.deepEqual(saved.assignments['s-1'], [tag.id])
+  assert.equal(saved.notes['s-1'], '发布前确认迁移')
+  assert.equal((await index.list()).notes, undefined)
+  await assert.rejects(index.setNote('s-1', 'x'.repeat(2001)), /2000/)
+  await index.setNote('s-1', '')
+  assert.equal((await index.read()).notes, undefined)
+})
+
 // —— normalize：脏数据逐条丢弃，绝不猜 —— //
 
 test('normalizeTagStore fabricates a valid v4 store from nothing', () => {

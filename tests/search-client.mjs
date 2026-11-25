@@ -376,14 +376,16 @@ let lastSearchBody = null
 globalThis.fetch = async (url, init) => {
   const body = init === undefined || init.body === undefined ? {} : JSON.parse(init.body)
   if (body.action === 'search') lastSearchBody = body
-  /* The progress probe must terminate: an already-built index stops the page's polling. */
-  if (body.action === 'status') {
+  if (['status', 'start', 'activity'].includes(body.action)) {
     return {
       ok: true,
       status: 200,
       json: async () => ({
         ok: true,
-        value: { sessions: 3, builtAt: 1000, buildMs: 12, progress: { active: false, done: 3, total: 3 } },
+        value: {
+          ...(body.action === 'status' ? { sessions: 3, builtAt: 1000, buildMs: 12, dbBytes: 4096, maxBytes: null } : {}),
+          progress: { active: false, done: 3, total: 3 }, error: null,
+        },
       }),
     }
   }
@@ -1045,6 +1047,8 @@ if (openerEntry !== undefined) {
 }
 
 // #endregion
+
+for (const cleanup of cleanups.values()) cleanup?.()
 
 if (failures.length > 0) {
   console.error('FAILURES:\n - ' + failures.join('\n - '))

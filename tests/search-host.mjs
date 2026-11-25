@@ -7,7 +7,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { apply, inject } from '../src/search/host.js'
+import { apply, inject, registerSearchTools } from '../src/search/host.js'
 
 /* History lives under the profile; point the plugin at a throwaway one for this run. */
 const profileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cs-recent-'))
@@ -174,7 +174,12 @@ const ctx = {
 }
 
 check('inject lists the required Host services', Array.isArray(inject) && inject.includes('sessionQuery') && inject.includes('webServer'))
-apply(ctx)
+const metadata = {
+  notes: { s1: 'note-only metadata beacon', s2: 'other private annotation' },
+  tags: [{ id: 'tag-one', name: 'tag-only metadata beacon' }],
+  assignments: { s2: ['tag-one'] },
+}
+const searchApi = apply(ctx, { readMetadata: async () => metadata })
 check('one route registered', registered.length === 1, String(registered.length))
 check('route path', registered[0] && registered[0].path === '/conversation-search/api', registered[0] && registered[0].path)
 check('route kind', registered[0] && registered[0].kind === 'prefix')
@@ -209,6 +214,17 @@ async function post(body) {
 
 // #region scope semantics ------------------------------------------------------
 
+const noIndex = await post({ action: 'status' })
+check('fresh index reports zero size and unlimited capacity', noIndex.body.value.dbBytes === 0 && noIndex.body.value.maxBytes === null)
+const invalidCapacity = await post({ action: 'capacity', maxBytes: 42 })
+check('sub-MiB capacity rejected', invalidCapacity.status === 400 && invalidCapacity.body.error.code === 'index-capacity-invalid')
+const configured = await post({ action: 'capacity', maxBytes: 1024 * 1024 })
+check('capacity saved', configured.status === 200 && configured.body.value.maxBytes === 1024 * 1024)
+const startedIndex = await post({ action: 'start' })
+check('start acknowledges a background build', startedIndex.status === 202 && startedIndex.body.value.progress.active)
+const activity = await post({ action: 'activity' })
+check('activity carries only in-memory build state', activity.status === 200 && !Object.hasOwn(activity.body.value, 'dbBytes'))
+
 const all = await post({ action: 'search', query: '侧边栏', scope: 'all' })
 check('all: 200', all.status === 200, String(all.status))
 check('all: ok envelope', all.body.ok === true)
@@ -229,6 +245,12 @@ check(
   JSON.stringify(allValue.sessions[0].questions[0].paragraphs.map((p) => [p.kind, p.outputFiles])),
 )
 check('all: stats counted', allValue.stats.sessions === 1 && allValue.stats.questions === 2, JSON.stringify(allValue.stats))
+
+const indexTools = new Map()
+registerSearchTools({ tools: { register: tool => indexTools.set(tool.name, tool) } }, searchApi)
+const agentRuntime = { agent: { session: { header: { id: 's1' } } }, signal: new AbortController().signal }
+const unlimited = await indexTools.get('workbench_search_index_capacity').execute({ max_bytes: null }, agentRuntime)
+check('Agent can remove the capacity limit', unlimited.maxBytes === null)
 
 const sessionOnly = await post({ action: 'search', query: '侧边栏', scope: 'session' })
 check('session scope: only the title hit', sessionOnly.body.value.sessions.length === 1)
@@ -264,6 +286,29 @@ check(
 
 const miss = await post({ action: 'search', query: '绝对不存在的词', scope: 'all' })
 check('miss: empty list', miss.body.value.sessions.length === 0)
+
+const noteHit = (await post({ action: 'search', query: 'note-only', scope: 'note' })).body.value
+check('note scope returns a metadata-only session', noteHit.sessions.length === 1 && noteHit.sessions[0].id === 's1')
+check('note scope carries the matching note without message rows', noteHit.sessions[0]?.noteMatch?.includes('note-only') && noteHit.sessions[0]?.questions.length === 0)
+const tagHit = (await post({ action: 'search', query: 'tag-only', scope: 'tag' })).body.value
+check('tag scope resolves assignments to matching tag names', tagHit.sessions.length === 1 && tagHit.sessions[0].id === 's2' && tagHit.sessions[0].tagMatches?.includes('tag-only metadata beacon'))
+check('tag scope has no message rows', tagHit.sessions[0]?.questions.length === 0)
+const noteAsTag = await post({ action: 'search', query: 'note-only', scope: 'tag' })
+check('tag scope excludes note-only hits', noteAsTag.body.value.sessions.length === 0)
+const metadataAll = (await post({ action: 'search', query: 'metadata beacon', scope: 'all', includeMetadata: true })).body.value
+check('all scope includes note and tag hits absent from session text', metadataAll.sessions.length === 2 && metadataAll.sessions.some(row => row.id === 's1') && metadataAll.sessions.some(row => row.id === 's2'))
+const legacyWeb = (await post({ action: 'search', query: 'metadata beacon', scope: 'all' })).body.value
+check('clients without metadata rendering can keep the original all scope', legacyWeb.sessions.length === 0)
+metadata.notes.s1 = 'updated annotation'
+const changedNote = await post({ action: 'search', query: 'note-only', scope: 'note' })
+check('metadata edits invalidate cached note hits without rebuilding', changedNote.body.value.sessions.length === 0)
+
+const projectHit = (await post({ action: 'search', query: '文件树', scope: 'all', filters: { turns: 0, workspacePath: 'c:\\work\\demo\\' } })).body.value
+check('workspace filter normalizes Windows case and separators', projectHit.sessions.length === 1 && projectHit.sessions[0].id === 's1')
+const outsideProject = await post({ action: 'search', query: 'tag-only', scope: 'tag', filters: { turns: 0, workspacePath: 'C:/work/demo' } })
+check('workspace filter also scopes metadata-only matches', outsideProject.body.value.sessions.length === 0)
+const allProjects = await post({ action: 'search', query: '文件树', scope: 'all', filters: { turns: 0 } })
+check('clearing the workspace filter restores other project matches', allProjects.body.value.sessions.some(row => row.id === 's2'))
 
 const blank = await post({ action: 'search', query: '   ', scope: 'all' })
 check('blank: empty result', blank.body.value.sessions.length === 0 && blank.body.value.stats.indexed === 0)

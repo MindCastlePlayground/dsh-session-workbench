@@ -1,5 +1,7 @@
-import { createDiskIndex } from './disk-index.js'
+import { createDiskIndex, MIN_INDEX_BYTES } from './disk-index.js'
 import { register } from '../tools.js'
+import { normalizeWorkspacePath } from '../manager/client/logic.js'
+import { createHash } from 'node:crypto'
 import { promises as fsPromises } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -31,11 +33,13 @@ const ANCHOR_CHARS = 80
 
 /** Which fields each scope matches. */
 const SCOPES = {
-  all: { session: true, question: true, paragraph: true },
+  all: { session: true, question: true, paragraph: true, note: true, tag: true },
   'session-question': { session: true, question: true, paragraph: false },
   session: { session: true, question: false, paragraph: false },
   question: { session: false, question: true, paragraph: false },
   paragraph: { session: false, question: false, paragraph: true },
+  note: { note: true },
+  tag: { tag: true },
 }
 
 /** Tool-argument keys that name a file. `name` is deliberately absent: tools use it for labels. */
@@ -51,24 +55,25 @@ export const inject = ['webServer', 'sessionQuery']
  * Register the one route and keep the index in this plugin's own effect scope.
  * @param ctx - Host plugin context carrying the webserver and the session query service.
  */
-export function apply(ctx, { deletedSessionIds } = {}) {
+export function apply(ctx, { deletedSessionIds, readMetadata } = {}) {
   const directory = dataDir(ctx)
   const index = createIndex(ctx, directory, deletedSessionIds)
   const recent = createRecentStore(directory)
   const filters = createFilterStore(directory)
   /** Identical search results, keyed by query/scope/filters/index version. */
   const responseCache = new Map()
+  const search = (payload, started) => executeSearch(index, recent, filters, responseCache, readMetadata, payload, started)
   ctx.effect(
     () =>
       ctx.webServer.register({
         kind: 'prefix',
         path: ROUTE_PATH,
-        handler: (req, res) => handleRequest(ctx, index, recent, filters, responseCache, req, res),
+        handler: (req, res) => handleRequest(ctx, index, recent, filters, search, req, res),
       }),
     'conversation-search: api route',
   )
   return {
-    search: (payload) => executeSearch(index, recent, filters, responseCache, payload),
+    search,
     preferences: async (update) => {
       const current = await filters.read()
       return {
@@ -77,6 +82,8 @@ export function apply(ctx, { deletedSessionIds } = {}) {
       }
     },
     warm: index.warm,
+    start: () => index.start(),
+    setCapacity: index.setCapacity,
     status: index.status,
   }
 }
@@ -90,11 +97,11 @@ export function apply(ctx, { deletedSessionIds } = {}) {
  * @param index - the corpus index.
  * @param recent - the recent-query store.
  * @param filters - the saved filter store.
- * @param responseCache - the TTL cache for identical searches.
+ * @param search - the shared query handler.
  * @param req - the request face (async-iterable body).
  * @param res - the response face.
  */
-async function handleRequest(ctx, index, recent, filters, responseCache, req, res) {
+async function handleRequest(ctx, index, recent, filters, search, req, res) {
   const connection = ctx.get('connection')
   if (connection !== undefined && typeof connection.requestRejection === 'function') {
     let rejection
@@ -125,12 +132,24 @@ async function handleRequest(ctx, index, recent, filters, responseCache, req, re
   const started = Date.now()
   try {
     if (payload.action === 'status') {
-      sendJson(res, 200, { ok: true, value: index.status() })
+      sendJson(res, 200, { ok: true, value: await index.status() })
+      return
+    }
+    if (payload.action === 'activity') {
+      sendJson(res, 200, { ok: true, value: index.activity() })
+      return
+    }
+    if (payload.action === 'start') {
+      sendJson(res, 202, { ok: true, value: index.start() })
+      return
+    }
+    if (payload.action === 'capacity') {
+      sendJson(res, 200, { ok: true, value: await index.setCapacity(payload.maxBytes) })
       return
     }
     if (payload.action === 'warm') {
       await index.warm()
-      sendJson(res, 200, { ok: true, value: index.status() })
+      sendJson(res, 200, { ok: true, value: await index.status() })
       return
     }
     if (payload.action === 'recent') {
@@ -142,16 +161,22 @@ async function handleRequest(ctx, index, recent, filters, responseCache, req, re
       sendJson(res, 200, { ok: true, value: { filters: saved } })
       return
     }
-    const value = await executeSearch(index, recent, filters, responseCache, payload, started)
+    const value = await search(payload, started)
     if (!res.destroyed) sendJson(res, 200, { ok: true, value })
   } catch (error) {
+    if (error.code === 'index-busy' || error.code === 'index-capacity-below-size' || error.code === 'index-capacity-invalid') {
+      sendJson(res, error.code === 'index-capacity-invalid' ? 400 : 409, {
+        ok: false, error: { code: error.code, message: messageOf(error) },
+      })
+      return
+    }
     ctx.logger?.warn?.(`conversation-search: ${messageOf(error)}`)
     sendJson(res, 500, { ok: false, error: { code: 'search-failed', message: messageOf(error) } })
   }
 }
 
 /** Write one JSON envelope. */
-async function executeSearch(index, recent, filters, responseCache, payload, started = Date.now()) {
+async function executeSearch(index, recent, filters, responseCache, readMetadata, payload, started = Date.now()) {
   const query = typeof payload.query === 'string' ? payload.query : ''
   const scope = typeof payload.scope === 'string' && Object.hasOwn(SCOPES, payload.scope) ? payload.scope : 'all'
   const active = normalizeFilters(payload.filters)
@@ -165,14 +190,23 @@ async function executeSearch(index, recent, filters, responseCache, payload, sta
   const pageSize = Number.isSafeInteger(payload.pageSize) && payload.pageSize > 0
     ? Math.min(payload.pageSize, MAX_RESULT_SESSIONS)
     : DEFAULT_RESULT_SESSIONS
-  const snapshot = await index.snapshot()
+  const words = normalizeWords(query)
+  // Existing Web clients only render title/body matches and a final empty state.
+  const showMetadata = scope !== 'all' || payload.agent || payload.includeMetadata === true
+  const matches = showMetadata ? await metadataMatches(readMetadata, SCOPES[scope], words) : new Map()
+  const snapshot = await index.snapshot({ partial: !payload.agent && payload.allowPartial === true })
   const { revision, buildMs } = snapshot
+  const { progress, error: indexError } = await index.status()
+  const partial = progress.active || indexError !== null
   /* An identical search inside the TTL reuses the folded result; the index version keys it. */
-  const cacheKey = JSON.stringify([revision, query, scope, active.since, active.until, active.turns, active.includeDeleted, pageSize])
+  const metadataKey = matches.size ? createHash('sha256').update(JSON.stringify([...matches])).digest('hex') : ''
+  const cacheKey = JSON.stringify([revision, progress.active, progress.done, query, scope, active, pageSize, metadataKey])
   let cached = responseCache.get(cacheKey)
   const fresh = cached === undefined || Date.now() - cached.at >= RESPONSE_TTL_MS
   if (fresh) {
-    cached = { at: Date.now(), snapshot, pending: searchCorpus(snapshot.scan(normalizeWords(query), active.includeDeleted), query, scope, started, active, pageSize) }
+    const metadataOnly = scope === 'note' || scope === 'tag'
+    const candidates = snapshot.scan(words, active.includeDeleted, undefined, [...matches.keys()], metadataOnly)
+    cached = { at: Date.now(), snapshot, pending: searchCorpus(candidates, query, scope, started, active, pageSize, matches) }
     responseCache.set(cacheKey, cached)
     if (responseCache.size > MAX_RESPONSE_CACHE) {
       responseCache.delete(responseCache.keys().next().value)
@@ -189,7 +223,7 @@ async function executeSearch(index, recent, filters, responseCache, payload, sta
   let sessions = base.sessions
   if (offset > 0) {
     const pageIds = base.ids.slice(offset, offset + pageSize)
-    const page = await searchCorpus(cached.snapshot.scan([], active.includeDeleted, pageIds), query, scope, started, active, pageSize)
+    const page = await searchCorpus(cached.snapshot.scan([], active.includeDeleted, pageIds), query, scope, started, active, pageSize, matches)
     sessions = page.sessions
   }
   const value = {
@@ -201,7 +235,11 @@ async function executeSearch(index, recent, filters, responseCache, payload, sta
     offset,
     pageSize,
     revision,
-    coverage: { ...base.coverage, indexed: snapshot.indexed, total: snapshot.indexed + snapshot.unreadable, unreadable: snapshot.unreadable },
+    coverage: {
+      ...base.coverage, indexed: snapshot.indexed,
+      total: Math.max(snapshot.indexed + snapshot.unreadable, progress.total),
+      unreadable: snapshot.unreadable, partial, progress, ...(indexError ? { error: indexError } : {}),
+    },
     stats: {
       ...base.stats,
       tookMs: Date.now() - started,
@@ -219,27 +257,37 @@ async function executeSearch(index, recent, filters, responseCache, payload, sta
 
 const SEARCH_QUERY = { type: 'string', minLength: 1, maxLength: 512 }
 const DATE = { type: 'string', minLength: 1, maxLength: 10 }
+const WORKSPACE_PATH = { anyOf: [{ type: 'string', minLength: 0, maxLength: 4096 }, { type: 'null' }] }
 
 export function registerSearchTools(ctx, search) {
   register(ctx, 'session_search',
-    'Search titles, user messages and assistant replies. Opens the local search index on demand. Set include_deleted to search retained snapshots of deleted sessions.',
+    'Search titles, notes, tags, user messages and assistant replies. Scope note or tag to search that field only. Set workspace_path to a path from workbench_project_list, or include_deleted to search retained snapshots.',
     { query: SEARCH_QUERY, scope: { type: 'string', minLength: 1, maxLength: 32 },
       since: DATE, until: DATE, last_turns: { type: 'integer', minimum: 0, maximum: 5000 },
       offset: { type: 'integer', minimum: 0 }, page_size: { type: 'integer', minimum: 1, maximum: 30 },
-      include_deleted: { type: 'boolean' }, revision: { type: 'integer', minimum: 1 },
+      include_deleted: { type: 'boolean' }, workspace_path: WORKSPACE_PATH, revision: { type: 'integer', minimum: 1 },
     }, ['query'], async (args, _caller, signal) => {
-      if (!args.offset && !args.revision) await search.warm()
+      if (!args.offset && !args.revision) {
+        const status = await search.status()
+        if (status.error?.code !== 'index-full') {
+          try {
+            await search.warm()
+          } catch (error) {
+            if (error.code !== 'index-full') throw error
+          }
+        }
+      }
       signal.throwIfAborted()
       return search.search({
         agent: true, query: args.query, scope: args.scope, offset: args.offset,
         pageSize: args.page_size, revision: args.revision,
-        filters: { since: args.since, until: args.until, turns: args.last_turns ?? 0, includeDeleted: args.include_deleted },
+        filters: { since: args.since, until: args.until, turns: args.last_turns ?? 0, includeDeleted: args.include_deleted, workspacePath: args.workspace_path },
       })
     })
   register(ctx, 'search_preferences', 'Read the Web search history and saved filters. Supply filters to update the Web search defaults.',
     { since: { ...DATE, minLength: 0 }, until: { ...DATE, minLength: 0 },
       last_turns: { type: 'integer', minimum: 0, maximum: 5000 }, rolling: { type: 'boolean' },
-      include_deleted: { type: 'boolean' },
+      include_deleted: { type: 'boolean' }, workspace_path: WORKSPACE_PATH,
     }, [], (args) => {
       const update = {}
       if (args.since !== undefined) update.since = args.since
@@ -247,11 +295,20 @@ export function registerSearchTools(ctx, search) {
       if (args.last_turns !== undefined) update.turns = args.last_turns
       if (args.rolling !== undefined) update.rolling = args.rolling
       if (args.include_deleted !== undefined) update.includeDeleted = args.include_deleted
+      if (args.workspace_path !== undefined) update.workspacePath = args.workspace_path
       return search.preferences(Object.keys(update).length ? update : undefined)
     })
-  register(ctx, 'search_index_status', 'Read search-index status without opening it.', {}, [], () => search.status())
-  register(ctx, 'search_index_update', 'Update the local search index from changed sessions and mark deleted snapshots.', {}, [],
-    async () => { await search.warm(); return search.status() })
+  register(ctx, 'search_index_status', 'Read the index size, storage limit, and update progress without scanning sessions.', {}, [], () => search.status())
+  register(ctx, 'search_index_update', 'Update the local search index from changed sessions and mark deleted snapshots. Set background to return immediately.', {
+    background: { type: 'boolean' },
+  }, [], async ({ background }) => {
+    if (background) return search.start()
+    await search.warm()
+    return search.status()
+  })
+  register(ctx, 'search_index_capacity', 'Set the main search database storage limit in bytes. Pass null for unlimited. Existing snapshots are preserved.', {
+    max_bytes: { anyOf: [{ type: 'integer', minimum: MIN_INDEX_BYTES }, { type: 'null' }] },
+  }, ['max_bytes'], ({ max_bytes }) => search.setCapacity(max_bytes))
 }
 
 function sendJson(res, status, body) {
@@ -411,6 +468,7 @@ function rollFilters(filters) {
   const delta = daysBetween(filters.savedOn, today)
   if (delta <= 0) return { ...filters, savedOn: today }
   return {
+    ...filters,
     since: filters.since === '' ? '' : shiftDay(filters.since, delta),
     until: filters.until === '' ? '' : shiftDay(filters.until, delta),
     turns: filters.turns,
@@ -456,7 +514,9 @@ function normalizeFilters(input) {
       savedOn = until
     }
   }
-  return rollFilters({ since, until, turns: input.turns === 0 ? 0 : turnCount(input.turns), rolling, savedOn, includeDeleted: input.includeDeleted === true })
+  const workspacePath = input.workspacePath === null ? null
+    : typeof input.workspacePath === 'string' && input.workspacePath.length <= 4096 ? input.workspacePath.trim() : ''
+  return rollFilters({ since, until, turns: input.turns === 0 ? 0 : turnCount(input.turns), rolling, savedOn, includeDeleted: input.includeDeleted === true, ...(workspacePath !== '' ? { workspacePath } : {}) })
 }
 
 function dayStartMs(value) {
@@ -882,6 +942,27 @@ function containsAll(text, words) {
   return true
 }
 
+async function metadataMatches(readMetadata, spec, words) {
+  const matches = new Map()
+  if (!readMetadata || (!spec.note && !spec.tag) || words.length === 0) return matches
+  const { notes, tags, assignments } = await readMetadata()
+  if (spec.note) {
+    for (const [id, note] of Object.entries(notes ?? {})) {
+      if (containsAll(note, words)) matches.set(id, { noteMatch: snippetOf(note, words, SNIPPET_CHARS) })
+    }
+  }
+  if (spec.tag) {
+    const names = new Map(tags.filter(tag => containsAll(tag.name, words)).map(tag => [tag.id, tag.name]))
+    if (names.size) {
+      for (const [id, ids] of Object.entries(assignments)) {
+        const tagMatches = ids.map(tag => names.get(tag)).filter(Boolean)
+        if (tagMatches.length) matches.set(id, { ...matches.get(id), tagMatches })
+      }
+    }
+  }
+  return matches
+}
+
 /** The file names that satisfy every keyword on their own. */
 function matchesFiles(files, words) {
   const out = []
@@ -945,13 +1026,14 @@ function emptyResult(query, scope, started) {
  * Every returned Session keeps only the questions and paragraphs that matched (plus the
  * containers needed to place them), each flagged with which layer actually hit the keywords.
  */
-async function searchCorpus(corpus, query, scope, started, filters, pageSize) {
+async function searchCorpus(corpus, query, scope, started, filters, pageSize, metadata) {
   const matchStarted = Date.now()
   const words = normalizeWords(query)
   const spec = SCOPES[scope]
   const sinceMs = dayStartMs(filters.since)
   const untilMs = dayEndMs(filters.until)
   const turnLimit = filters.turns > 0 ? filters.turns : 0
+  const workspace = normalizeWorkspacePath(filters.workspacePath)
   const contentPage = []
   const titlePage = []
   const contentIds = []
@@ -966,16 +1048,18 @@ async function searchCorpus(corpus, query, scope, started, filters, pageSize) {
   if (words.length > 0) {
     for await (const entry of corpus) {
       if (!entry) { unreadable++; continue }
+      if ((workspace || filters.workspacePath === null) && normalizeWorkspacePath(entry.cwd) !== workspace) continue
       indexed++
       if (entry.limited) limited++
-      const sessionMatched = spec.session && containsAll(entry.title, words)
+      const titleMatched = Boolean(spec.session && containsAll(entry.title, words))
+      const fieldsMatched = metadata.get(entry.id)
       const questions = []
       /* Only the last N Turns of each Session are candidates; the date window narrows further.
          The window is computed from Turn NUMBERS, exactly like the panel's maxTurn - N + 1, so a
          Turn gap (an aborted Turn yields no row) cannot shift the two windows apart. */
       const lastTurn = entry.questions.length === 0 ? -1 : entry.questions[entry.questions.length - 1].turn
       const minTurn = turnLimit > 0 && lastTurn >= 0 ? lastTurn - turnLimit + 1 : Number.NEGATIVE_INFINITY
-      for (const question of entry.questions) {
+      for (const question of (spec.question || spec.paragraph ? entry.questions : [])) {
         if (question.turn < minTurn) continue
         if (!inWindow(question.time, sinceMs, untilMs)) continue
         /* The Turn number DSH itself shows; the panel reads the same number off its Chat nodes. */
@@ -1046,7 +1130,7 @@ async function searchCorpus(corpus, query, scope, started, filters, pageSize) {
         })
         questionCount += 1
       }
-      if (!sessionMatched && questions.length === 0) continue
+      if (!titleMatched && !fieldsMatched && questions.length === 0) continue
       const hasContent = questions.length > 0
       const ids = hasContent ? contentIds : titleIds
       const page = hasContent ? contentPage : titlePage
@@ -1060,7 +1144,8 @@ async function searchCorpus(corpus, query, scope, started, filters, pageSize) {
         displayTitle: entry.displayTitle === '' ? entry.title : entry.displayTitle,
         cwd: entry.cwd,
         createdAt: entry.createdAt,
-        matched: sessionMatched,
+        matched: titleMatched,
+        ...fieldsMatched,
         questionTotal: entry.questions.length,
         paragraphTotal: entry.questions.reduce((sum, question) => sum + question.paragraphs.length, 0),
         questions: questions.slice(0, MAX_RESULT_QUESTIONS),

@@ -25,6 +25,7 @@ export const TAG_SCHEMA_VERSION = 4
 export const MAX_TAGS = 200
 export const MAX_TAGS_PER_SESSION = 10
 export const MAX_TAG_NAME = 24
+export const MAX_SESSION_NOTE = 2000
 
 // Same state directory (and same env override) as the star index: all
 // plugin-owned user marks live together in ~/.dsh/sessions-manager.
@@ -118,7 +119,17 @@ export function normalizeTagStore(raw) {
       if (kept.length) assignments[sid] = kept
     }
   }
-  return { schemaVersion: TAG_SCHEMA_VERSION, tags, assignments }
+  const notes = Object.create(null)
+  const rawNotes = source?.notes
+  if (rawNotes && typeof rawNotes === 'object' && !Array.isArray(rawNotes)) {
+    for (const [sid, note] of Object.entries(rawNotes)) {
+      if (isSafeSessionId(sid) && typeof note === 'string' && note.length <= MAX_SESSION_NOTE && !note.includes('\0')) {
+        const trimmed = note.trim()
+        if (trimmed) notes[sid] = trimmed
+      }
+    }
+  }
+  return { schemaVersion: TAG_SCHEMA_VERSION, tags, assignments, ...(Object.keys(notes).length ? { notes } : {}) }
 }
 
 /**
@@ -304,5 +315,19 @@ export function createTagIndex(options = {}) {
     return { tags: store.tags, assignments: store.assignments }
   }
 
-  return { read, write, mutate, list, create, rename, merge, removeTag, setTags, removeIds, indexPath, dir }
+  async function setNote(sessionId, value) {
+    if (!isSafeSessionId(sessionId)) tagError('无效的 sessionId', 400, 'DSM_TAG_SESSION_INVALID')
+    if (typeof value !== 'string' || value.length > MAX_SESSION_NOTE || value.includes('\0')) {
+      tagError(`备注必须是最多 ${MAX_SESSION_NOTE} 字符的文本`, 400, 'DSM_NOTE_INVALID')
+    }
+    const note = value.trim()
+    return mutate((store) => {
+      store.notes ??= Object.create(null)
+      if (note) store.notes[sessionId] = note
+      else delete store.notes[sessionId]
+      return note
+    })
+  }
+
+  return { read, write, mutate, list, create, rename, merge, removeTag, setTags, setNote, removeIds, indexPath, dir }
 }

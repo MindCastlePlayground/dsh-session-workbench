@@ -1,9 +1,35 @@
-import { mkdir } from 'node:fs/promises'
-import { dirname } from 'node:path'
+import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
 
 const SIGNATURE_VERSION = 1
 const BATCH_SIZE = 8
 const SCAN_BATCH_SIZE = 32
+export const MIN_INDEX_BYTES = 1024 * 1024
+const CAPACITY_FILE = 'index-capacity.json'
+const ErrorCode = {
+  full: 'index-full',
+  failed: 'index-failed',
+  busy: 'index-busy',
+  invalid: 'index-capacity-invalid',
+  belowSize: 'index-capacity-below-size',
+}
+
+function indexError(code, message) {
+  return Object.assign(new Error(message), { code })
+}
+
+function capacityError() {
+  return indexError(ErrorCode.full, 'The search index has reached its storage limit.')
+}
+
+async function existingSize(filename) {
+  try {
+    return (await stat(filename)).size
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error
+    return 0
+  }
+}
 
 function searchableText(entry) {
   const parts = [entry.title]
@@ -25,7 +51,70 @@ export function createDiskIndex({ filename, catalog, read, readLive, reportError
   let revision = 0
   let buildMs = 0
   let size = 0
+  let dbBytes = 0
+  let error = null
+  let blockedAt = 0
   let progress = { active: false, done: 0, total: 0 }
+  let settings
+  let saving
+  let inspected = false
+  let readable = false
+  let ready
+  const capacityFile = join(dirname(filename), CAPACITY_FILE)
+
+  function capacity() {
+    settings ??= readFile(capacityFile, 'utf8').then(text => {
+      const { maxBytes } = JSON.parse(text)
+      validateCapacity(maxBytes)
+      return maxBytes
+    }).catch(error => {
+      if (error.code === 'ENOENT') return null
+      settings = undefined
+      throw error
+    })
+    return settings
+  }
+
+  function validateCapacity(maxBytes) {
+    if (maxBytes !== null && (!Number.isSafeInteger(maxBytes) || maxBytes < MIN_INDEX_BYTES)) {
+      throw indexError(ErrorCode.invalid, 'Index capacity must be at least 1 MiB or unlimited.')
+    }
+  }
+
+  function usage(db) {
+    return db.prepare('PRAGMA page_count').get().page_count * db.prepare('PRAGMA page_size').get().page_size
+  }
+
+  async function inspect() {
+    if (inspected || building) return
+    if (await existingSize(filename) > 0 && !building) {
+      const db = await open({ readOnly: true })
+      try {
+        if (building) return
+        dbBytes = usage(db)
+        size = db.prepare('SELECT count(*) AS count FROM sessions').get().count
+        revision = db.prepare("SELECT value FROM metadata WHERE key='revision'").get()?.value || 0
+        blockedAt = db.prepare("SELECT value FROM metadata WHERE key='limited_capacity'").get()?.value || 0
+        readable = true
+      } finally {
+        db.close()
+      }
+    }
+    if (!building) inspected = true
+  }
+
+  function activity() {
+    return { progress: { ...progress }, error }
+  }
+
+  async function status() {
+    const maxBytes = await capacity()
+    await inspect()
+    if (!progress.active && !error && blockedAt === maxBytes) {
+      error = { code: ErrorCode.full, message: capacityError().message }
+    }
+    return { sessions: size, builtAt: revision, buildMs, dbBytes, maxBytes, ...activity() }
+  }
 
   async function open({ readOnly = false } = {}) {
     const { DatabaseSync } = await import('node:sqlite')
@@ -55,18 +144,20 @@ export function createDiskIndex({ filename, catalog, read, readLive, reportError
       write()
       db.exec('COMMIT')
     } catch (error) {
-      db.exec('ROLLBACK')
+      try { db.exec('ROLLBACK') } catch { /* SQLite can already have rolled back. */ }
       throw error
     }
   }
 
-  async function rebuild(force) {
+  async function rebuild(force, markReadable) {
     const started = Date.now()
-    progress = { active: true, done: 0, total: 0 }
     let db
     try {
+      if (saving) await saving
+      const maxBytes = await capacity()
       const records = await catalog()
       db = await open()
+      dbBytes = usage(db)
       progress.total = records.length
       const previous = new Map(db.prepare('SELECT id, signature FROM sessions').all().map(row => [row.id, row.signature]))
       const put = db.prepare([
@@ -76,8 +167,32 @@ export function createDiskIndex({ filename, catalog, read, readLive, reportError
       ].join(' '))
       const removeText = db.prepare('DELETE FROM body WHERE rowid=?')
       const putText = db.prepare('INSERT INTO body (rowid,text) VALUES (?,?)')
+      const writeEntry = ({ entry, signature }) => {
+        const { rowid } = put.get(entry.id, entry.createdAt, signature, JSON.stringify(entry))
+        removeText.run(rowid)
+        putText.run(rowid, searchableText(entry))
+      }
       let unreadable = 0
+      let full = null
+      // Update deletion flags even when the capacity prevents adding new content.
+      transaction(db, () => {
+        db.exec('CREATE TEMP TABLE known_sessions (id TEXT PRIMARY KEY, deleted INTEGER NOT NULL)')
+        const addKnown = db.prepare('INSERT INTO known_sessions VALUES (?,?)')
+        for (const record of records) addKnown.run(record.header.id, Number(record.deleted === true))
+        db.exec([
+          'UPDATE sessions SET deleted=COALESCE((SELECT k.deleted FROM known_sessions k WHERE k.id=sessions.id),1)',
+          'WHERE deleted<>COALESCE((SELECT k.deleted FROM known_sessions k WHERE k.id=sessions.id),1)',
+        ].join(' '))
+        db.exec("INSERT OR IGNORE INTO metadata VALUES ('revision',0),('unreadable',0),('limited_capacity',0)")
+      })
+      readable = true
+      markReadable()
+      const use = db.prepare('PRAGMA page_count')
+      const pageSize = db.prepare('PRAGMA page_size').get().page_size
+      const fits = () => maxBytes === null || use.get().page_count * pageSize <= maxBytes
+      if (!fits()) full = capacityError()
       for (let offset = 0; offset < records.length; offset += BATCH_SIZE) {
+        if (full) break
         const batch = records.slice(offset, offset + BATCH_SIZE)
         const entries = await Promise.all(batch.map(async record => {
           const { header } = record
@@ -94,36 +209,49 @@ export function createDiskIndex({ filename, catalog, read, readLive, reportError
             unreadable++
             reportError?.(header.id, error)
             return null
-          } finally {
-            progress.done++
           }
         }))
-        transaction(db, () => {
-          for (const item of entries) {
-            if (!item) continue
-            const { entry, signature } = item
-            const { rowid } = put.get(entry.id, entry.createdAt, signature, JSON.stringify(entry))
-            removeText.run(rowid)
-            putText.run(rowid, searchableText(entry))
+        if (maxBytes === null) {
+          transaction(db, () => {
+            for (const item of entries) if (item) writeEntry(item)
+          })
+          dbBytes = use.get().page_count * pageSize
+          progress.done += batch.length
+          await new Promise(resolve => setImmediate(resolve))
+          continue
+        }
+        for (const item of entries) {
+          if (item) {
+            try {
+              transaction(db, () => {
+                writeEntry(item)
+                if (!fits()) throw capacityError()
+              })
+              dbBytes = use.get().page_count * pageSize
+            } catch (error) {
+              if (error.code !== ErrorCode.full) throw error
+              full = error
+              break
+            }
           }
-        })
+          progress.done++
+        }
+        await new Promise(resolve => setImmediate(resolve))
       }
       transaction(db, () => {
-        db.exec('CREATE TEMP TABLE IF NOT EXISTS known_sessions (id TEXT PRIMARY KEY, deleted INTEGER NOT NULL)')
-        const addKnown = db.prepare('INSERT INTO known_sessions VALUES (?,?)')
-        for (const record of records) addKnown.run(record.header.id, Number(record.deleted === true))
-        db.exec([
-          'UPDATE sessions SET deleted=COALESCE((SELECT k.deleted FROM known_sessions k WHERE k.id=sessions.id),1)',
-          'WHERE deleted<>COALESCE((SELECT k.deleted FROM known_sessions k WHERE k.id=sessions.id),1)',
-        ].join(' '))
         const putMeta = db.prepare('INSERT INTO metadata VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value')
         const lastRevision = Number(db.prepare("SELECT value FROM metadata WHERE key='revision'").get()?.value || 0)
         revision = Math.max(Date.now(), revision + 1, lastRevision + 1)
         buildMs = Date.now() - started
         putMeta.run('revision', revision)
         putMeta.run('unreadable', unreadable)
+        putMeta.run('limited_capacity', full ? maxBytes : 0)
         size = Number(db.prepare('SELECT count(*) AS count FROM sessions').get().count)
       })
+      dbBytes = usage(db)
+      blockedAt = full ? maxBytes : 0
+      inspected = true
+      if (full) throw full
       return { size }
     } finally {
       progress = { ...progress, active: false }
@@ -131,7 +259,7 @@ export function createDiskIndex({ filename, catalog, read, readLive, reportError
     }
   }
 
-  async function* scan(words, includeDeleted, ids) {
+  async function* scan(words, includeDeleted, ids, metadataIds = [], metadataOnly = false) {
     const db = await open({ readOnly: true })
     // Use a single read snapshot and bounded payload batches. Only lightweight IDs
     // are materialized before hit verification and result shaping.
@@ -153,11 +281,22 @@ export function createDiskIndex({ filename, catalog, read, readLive, reportError
           args.push(word)
         }
         const sql = [
-          'SELECT s.id FROM body JOIN sessions s ON s.rowid=body.rowid',
+          'SELECT s.id,s.created FROM body JOIN sessions s ON s.rowid=body.rowid',
           where.length ? 'WHERE ' + where.join(' AND ') : '',
           'ORDER BY s.created DESC, s.id',
         ].join(' ')
-        found = db.prepare(sql).all(...args).map(row => row.id)
+        const matches = metadataOnly ? [] : db.prepare(sql).all(...args)
+        if (metadataIds.length) {
+          const seen = new Set(matches.map(row => row.id))
+          const lookup = db.prepare('SELECT id,created FROM sessions WHERE id=?' + (includeDeleted ? '' : ' AND deleted=0'))
+          for (const id of metadataIds) {
+            if (seen.has(id)) continue
+            const row = lookup.get(id)
+            if (row) matches.push(row)
+          }
+          matches.sort((a, b) => b.created - a.created || (a.id < b.id ? -1 : Number(a.id > b.id)))
+        }
+        found = matches.map(row => row.id)
       }
       for (let offset = 0; offset < found.length; offset += SCAN_BATCH_SIZE) {
         for (const id of found.slice(offset, offset + SCAN_BATCH_SIZE)) {
@@ -174,12 +313,59 @@ export function createDiskIndex({ filename, catalog, read, readLive, reportError
 
   return {
     warm(force = false) {
-      building ??= rebuild(force).finally(() => { building = null })
+      if (building) return building
+      progress = { active: true, done: 0, total: 0 }
+      error = null
+      const readiness = Promise.withResolvers()
+      ready = readiness.promise
+      building = rebuild(force, readiness.resolve).catch(failure => {
+        error = {
+          code: failure.code === ErrorCode.full ? ErrorCode.full : ErrorCode.failed,
+          message: failure.message || String(failure),
+        }
+        inspected = false
+        throw failure
+      }).finally(() => { building = null })
       return building
     },
-    async snapshot() {
-      if (building) await building
-      if (revision === 0) await this.warm()
+    start() {
+      this.warm().catch(() => {})
+      return activity()
+    },
+    async setCapacity(maxBytes) {
+      validateCapacity(maxBytes)
+      if (building || saving) throw indexError(ErrorCode.busy, 'Wait for the current index operation to finish.')
+      saving = (async () => {
+        await inspect()
+        if (maxBytes !== null && maxBytes < dbBytes) {
+          throw indexError(ErrorCode.belowSize, 'Index capacity cannot be lower than its current size.')
+        }
+        await mkdir(dirname(filename), { recursive: true, mode: 0o700 })
+        const pending = capacityFile + '.tmp'
+        await writeFile(pending, JSON.stringify({ maxBytes }), { mode: 0o600 })
+        await rename(pending, capacityFile)
+        settings = Promise.resolve(maxBytes)
+        if (error?.code === ErrorCode.full && maxBytes !== blockedAt) error = null
+      })()
+      try {
+        await saving
+      } finally {
+        saving = undefined
+      }
+      return status()
+    },
+    async snapshot({ partial = false } = {}) {
+      if (saving) await saving
+      await inspect()
+      if (building || revision === 0) {
+        try {
+          const pending = building ?? this.warm()
+          if (!partial) await pending
+          else if (!readable) await Promise.race([ready, pending])
+        } catch (error) {
+          if (!readable || (!partial && revision === 0)) throw error
+        }
+      }
       const db = await open({ readOnly: true })
       try {
         return {
@@ -191,6 +377,7 @@ export function createDiskIndex({ filename, catalog, read, readLive, reportError
         db.close()
       }
     },
-    status: () => ({ sessions: size, builtAt: revision, buildMs, progress }),
+    activity,
+    status,
   }
 }

@@ -11,7 +11,7 @@ export const inject = [...new Set([...managerServices, ...searchServices])]
 
 export function apply(ctx) {
   const moves = applyManager(ctx)
-  const search = applySearch(ctx, { deletedSessionIds: moves.deletedSessionIds })
+  const search = applySearch(ctx, { deletedSessionIds: moves.deletedSessionIds, readMetadata: moves.searchMetadata })
   ctx.inject(['tools'], (scope) => {
     registerSearchTools(scope, search)
     scope.effect(() => registerManagerAgentTools(scope, moves.routeHandlers, {

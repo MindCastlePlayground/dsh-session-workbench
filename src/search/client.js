@@ -2573,9 +2573,102 @@ export function createSearchClient(React) {
   }
 
   /** Non-blocking index state: `progress` reports the first build while it is still running. */
-  function fetchIndexStatus(signal) {
-    return postGlobal({ action: 'status' }, signal)
+  function fetchIndexStatus(signal) { return postGlobal({ action: 'status' }, signal) }
+  function fetchIndexActivity(signal) { return postGlobal({ action: 'activity' }, signal) }
+  function startIndexUpdate(signal) { return postGlobal({ action: 'start' }, signal) }
+  function saveIndexCapacity(maxBytes, signal) { return postGlobal({ action: 'capacity', maxBytes }, signal) }
+
+  const MIN_INDEX_BYTES = 1048576
+  let capacityInputSequence = 0
+  const INDEX_I18N = {
+    zh: {
+      indexReady: '索引就绪', indexUpdating: '索引更新中', indexFull: '容量已达上限', indexIdle: '待构建',
+      indexUnlimited: '不限', indexLimitLabel: '上限', indexLimitAria: '索引容量上限（MiB）',
+      indexBlankHint: '留空不限', indexSave: '保存', indexSaving: '保存中',
+      indexUpdate: '更新索引', indexSaved: '已保存', indexMinErr: '请输入 ≥ 1 MiB，或留空不限',
+    },
+    en: {
+      indexReady: 'Ready', indexUpdating: 'Updating', indexFull: 'Limit reached', indexIdle: 'Not built',
+      indexUnlimited: 'Unlimited', indexLimitLabel: 'Limit', indexLimitAria: 'Index capacity limit in MiB',
+      indexBlankHint: 'Blank = unlimited', indexSave: 'Save', indexSaving: 'Saving',
+      indexUpdate: 'Update index', indexSaved: 'Saved', indexMinErr: 'Enter at least 1 MiB, or leave blank',
+    },
   }
+  const indexStore = { active: false, searchMounts: 0, listeners: new Set() }
+  function notifyIndexStore() {
+    const snap = { active: indexStore.active, searchMounts: indexStore.searchMounts }
+    indexStore.listeners.forEach((fn) => fn(snap))
+  }
+  function setSharedIndexActive(active) {
+    const next = Boolean(active)
+    if (indexStore.active === next) return
+    indexStore.active = next
+    notifyIndexStore()
+  }
+  function trackSearchMount(delta) {
+    indexStore.searchMounts = Math.max(0, indexStore.searchMounts + delta)
+    notifyIndexStore()
+  }
+  function subscribeIndexActivity(fn) {
+    indexStore.listeners.add(fn)
+    fn({ active: indexStore.active, searchMounts: indexStore.searchMounts })
+    return () => indexStore.listeners.delete(fn)
+  }
+  function isIndexFull(st) {
+    return st?.error?.code === 'index-full'
+  }
+  function formatIndexBytes(bytes) {
+    if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes < 0) return '—'
+    if (bytes === 0) return '0 MiB'
+    return bytes < MIN_INDEX_BYTES ? Math.max(1, Math.round(bytes / 1024)) + ' KiB' : (bytes / MIN_INDEX_BYTES).toFixed(1) + ' MiB'
+  }
+  function formatMibInput(maxBytes) {
+    if (typeof maxBytes !== 'number' || !Number.isFinite(maxBytes) || maxBytes <= 0) return ''
+    const mib = maxBytes / MIN_INDEX_BYTES
+    return maxBytes % MIN_INDEX_BYTES === 0 ? String(mib) : String(Number(mib.toFixed(2)))
+  }
+  function readIndexError(err) {
+    if (!err) return ''
+    return typeof err === 'object' && typeof err.message === 'string' ? err.message : String(err)
+  }
+  function parseMibInput(text) {
+    const s = String(text || '').trim()
+    if (s === '') return { ok: true, value: null }
+    const n = Number(s)
+    return !Number.isFinite(n) || n < 1 ? { ok: false, value: null } : { ok: true, value: Math.round(n * MIN_INDEX_BYTES) }
+  }
+  const INDEX_CSS = [
+    '.dsh-cg-icon-wrap{position:relative;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0}',
+    '.dsh-cg-index-marker{position:absolute;top:-1px;right:-1px;width:6px;height:6px;border-radius:999px;background:var(--dsh-cg-accent,#0284c7);box-shadow:0 0 0 1.5px var(--dsh-cg-surface,#fff);animation:dsh-cg-idx-pulse 1.5s ease-in-out infinite}',
+    '.dsh-cg-index-controls{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px 12px;margin:8px 0 10px;padding:7px 10px;border-radius:8px;border:1px solid color-mix(in srgb,currentColor 13%,transparent);background:color-mix(in srgb,currentColor 3.5%,transparent);font-size:12px;line-height:1.35;font-variant-numeric:tabular-nums}',
+    '.dsh-cg-index-meta{display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px;min-width:0}',
+    '.dsh-cg-index-dot{width:6px;height:6px;border-radius:999px;flex-shrink:0;background:color-mix(in srgb,currentColor 35%,transparent)}',
+    '.dsh-cg-index-dot--active{background:var(--dsh-cg-accent,#0284c7);animation:dsh-cg-idx-pulse 1.4s ease-in-out infinite}',
+    '.dsh-cg-index-dot--full{background:#d97706}.dsh-cg-index-dot--ready{background:#16a34a}.dsh-cg-index-dot--err{background:#dc2626}',
+    '.dsh-cg-index-stat{font-weight:500;letter-spacing:-0.01em}',
+    '.dsh-cg-index-size{opacity:.72;font-weight:400}',
+    '.dsh-cg-index-msg{font-size:11px;padding:1px 6px;border-radius:999px}',
+    '.dsh-cg-index-msg--err{color:#dc2626;background:color-mix(in srgb,#dc2626 10%,transparent)}',
+    '.dsh-cg-index-msg--ok{color:#15803d;background:color-mix(in srgb,#16a34a 11%,transparent)}',
+    '.dsh-cg-index-actions{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-left:auto}',
+    '.dsh-cg-index-label{font-size:11px;opacity:.74;font-weight:500}',
+    '.dsh-cg-index-field{display:inline-flex;align-items:center;height:26px;padding:0 7px;border-radius:6px;border:1px solid color-mix(in srgb,currentColor 16%,transparent);background:color-mix(in srgb,currentColor 2%,transparent);transition:border-color 140ms ease}',
+    '.dsh-cg-index-field:focus-within{border-color:var(--dsh-cg-accent,#0284c7);outline:2px solid color-mix(in srgb,var(--dsh-cg-accent,#0284c7) 25%,transparent);outline-offset:1px}',
+    '.dsh-cg-index-input{width:84px;border:0;outline:0;background:transparent;color:inherit;font:inherit;font-size:12px;padding:0;min-width:0;font-variant-numeric:tabular-nums}',
+    '.dsh-cg-index-input::placeholder{opacity:.5;font-size:11px}',
+    '.dsh-cg-index-unit{font-size:10.5px;opacity:.6;margin-left:4px;user-select:none;letter-spacing:.02em}',
+    '.dsh-cg-index-btn{height:26px;padding:0 9px;border-radius:6px;border:1px solid color-mix(in srgb,currentColor 16%,transparent);background:transparent;color:inherit;font:inherit;font-size:11.5px;font-weight:500;cursor:pointer;transition:background-color 140ms ease,border-color 140ms ease,transform 80ms ease}',
+    '.dsh-cg-index-btn:hover:not(:disabled){background:color-mix(in srgb,currentColor 7%,transparent)}',
+    '.dsh-cg-index-btn:active:not(:disabled){transform:translateY(.5px)}',
+    '.dsh-cg-index-btn:focus-visible{outline:2px solid var(--dsh-cg-accent,#0284c7);outline-offset:1px}',
+    '.dsh-cg-index-btn--primary{border-color:color-mix(in srgb,var(--dsh-cg-accent,#0284c7) 45%,transparent);background:color-mix(in srgb,var(--dsh-cg-accent,#0284c7) 12%,transparent)}',
+    '.dsh-cg-index-btn--primary:hover:not(:disabled){background:color-mix(in srgb,var(--dsh-cg-accent,#0284c7) 20%,transparent)}',
+    '.dsh-cg-index-btn:disabled{opacity:.48;cursor:not-allowed}',
+    '@keyframes dsh-cg-idx-pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.45;transform:scale(.85)}}',
+    '@media (prefers-reduced-motion:reduce){.dsh-cg-index-marker,.dsh-cg-index-dot,.dsh-cg-index-controls *{animation:none!important;transition:none!important}}',
+    '@media (max-width:520px){.dsh-cg-index-actions{margin-left:0;width:100%}.dsh-cg-index-input{width:76px}}',
+  ].join('')
+
 
   /** Ask the Host for the persisted query history. */
   async function fetchRecent(signal) {
@@ -2921,12 +3014,44 @@ export function createSearchClient(React) {
   /** The left rail's glyph: a magnifier over message lines. */
   function GlobalSearchIcon(props) {
     const size = typeof props.size === 'number' ? props.size : 18
+    const [active, setActive] = useState(() => indexStore.active)
+    const [inSearch, setInSearch] = useState(() => indexStore.searchMounts > 0)
+    useEffect(() => {
+      return subscribeIndexActivity((snap) => { setActive(snap.active); setInSearch(snap.searchMounts > 0) })
+    }, [])
+    useEffect(() => {
+      if (inSearch) return undefined
+      let cancelled = false, timer = null, controller = null
+      const poll = () => {
+        controller = new AbortController()
+        fetchIndexActivity(controller.signal).then(
+          (val) => {
+            if (cancelled) return
+            setSharedIndexActive(Boolean(val && (val.progress ? val.progress.active : val.active)))
+            timer = setTimeout(poll, 2500)
+          },
+          () => { if (!cancelled) timer = setTimeout(poll, 4000) },
+        )
+      }
+      poll()
+      return () => { cancelled = true; if (controller) controller.abort(); if (timer !== null) clearTimeout(timer) }
+    }, [inSearch])
     return h(
-      'svg',
-      { viewBox: '0 0 20 20', width: size, height: size, fill: 'none', 'aria-hidden': 'true' },
-      h('circle', { cx: '8.5', cy: '8.5', r: '5.2', stroke: 'currentColor', strokeWidth: 1.5 }),
-      h('path', { d: 'M12.4 12.4 17 17', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round' }),
-      h('path', { d: 'M6.2 8.7h4.6M6.2 6.3h2.6', stroke: 'currentColor', strokeWidth: 1.1, strokeLinecap: 'round', opacity: '0.7' }),
+      'span',
+      { className: 'dsh-cg-icon-wrap', style: { width: size, height: size } },
+      h(
+        'svg',
+        { viewBox: '0 0 20 20', width: size, height: size, fill: 'none', 'aria-hidden': 'true' },
+        h('circle', { cx: '8.5', cy: '8.5', r: '5.2', stroke: 'currentColor', strokeWidth: 1.5 }),
+        h('path', { d: 'M12.4 12.4 17 17', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round' }),
+        h('path', { d: 'M6.2 8.7h4.6M6.2 6.3h2.6', stroke: 'currentColor', strokeWidth: 1.1, strokeLinecap: 'round', opacity: '0.7' }),
+      ),
+      active ? h('span', {
+        className: 'dsh-cg-index-marker',
+        title: props.t?.('indexUpdating'),
+        role: 'status',
+        'aria-label': props.t?.('indexUpdating'),
+      }) : null,
     )
   }
 
@@ -3570,13 +3695,24 @@ export function createSearchClient(React) {
     const [filters, setFilters] = useState(() => defaultFilters())
     const [tick, setTick] = useState(0)
     const [indexAttempt, setIndexAttempt] = useState(0)
-    const [refreshing, setRefreshing] = useState(true)
     const [indexError, setIndexError] = useState('')
+    const [indexStatus, setIndexStatus] = useState(null)
+    const [capInput, setCapInput] = useState('')
+    const [capNotice, setCapNotice] = useState('')
+    const [capError, setCapError] = useState('')
+    const [savingCap, setSavingCap] = useState(false)
+    const [startingUpdate, setStartingUpdate] = useState(false)
+    const [pollSeq, setPollSeq] = useState(0)
+    const capDirtyRef = useRef(false)
+    const actionAbortRef = useRef(null)
+    const noticeTimerRef = useRef(null)
+    const capInputId = useMemo(() => 'dsh-search-capacity-' + ++capacityInputSequence, [])
     const [includeDeleted, setIncludeDeleted] = useState(false)
     const [revisionUpdated, setRevisionUpdated] = useState(false)
     /* First-build progress, polled from the Host while the corpus is still being assembled. */
     const [build, setBuild] = useState(null)
     const [indexBuilt, setIndexBuilt] = useState(null)
+    const refreshing = startingUpdate || build?.active === true
     /* One-shot confirmation after the first build, then it disappears again. */
     const [readyNotice, setReadyNotice] = useState(null)
     /* The row whose jump is in flight: it spins in place, so feedback never depends on the overlay. */
@@ -3594,56 +3730,128 @@ export function createSearchClient(React) {
     const lastQuery = useRef(query)
     const debouncedQueryRef = useRef(query)
 
-    useEffect(() => {
-      const controller = new AbortController()
-      setRefreshing(true)
-      setIndexError('')
-      postGlobal({ action: 'warm' }, controller.signal).then(
-        () => { if (!controller.signal.aborted) setRefreshing(false) },
-        (failure) => {
-          if (controller.signal.aborted) return
-          setIndexError(String(failure.message ?? failure))
-          setRefreshing(false)
-        },
-      )
-      return () => controller.abort()
-    }, [indexAttempt])
+    const applyIndexStatus = useCallback((st, syncCap) => {
+      setIndexStatus(st)
+      const next = st && st.progress !== undefined ? st.progress : null
+      setBuild(next)
+      const built = Boolean(st && typeof st.builtAt === 'number' && st.builtAt > 0)
+      setIndexBuilt(built)
+      setSharedIndexActive(Boolean(next && next.active === true))
+      if (syncCap && !capDirtyRef.current) setCapInput(formatMibInput(st && st.maxBytes))
+      setIndexError(!built ? readIndexError(st?.error) : '')
+      setCapError(built && !isIndexFull(st) ? readIndexError(st?.error) : '')
+      return { next, built, full: isIndexFull(st) }
+    }, [])
 
-    /* The marker belongs to the search that produced it: a new query clears it. */
+    useEffect(() => {
+      trackSearchMount(1)
+      return () => {
+        trackSearchMount(-1)
+        if (actionAbortRef.current) actionAbortRef.current.abort()
+        if (noticeTimerRef.current !== null) clearTimeout(noticeTimerRef.current)
+      }
+    }, [])
+
+    useEffect(() => {
+      let cancelled = false
+      const controller = new AbortController()
+      setIndexError('')
+      setCapError('')
+      fetchIndexStatus(controller.signal).then(
+        (st) => {
+          if (cancelled) return
+          const info = applyIndexStatus(st, true)
+          if (info.next && info.next.active === true) { setPollSeq((n) => n + 1); return }
+          if (info.full) return
+          setStartingUpdate(true)
+          startIndexUpdate(controller.signal).then(
+            (res) => {
+              if (cancelled) return
+              setStartingUpdate(false)
+              if (res && res.progress) { setBuild(res.progress); setSharedIndexActive(res.progress.active === true) }
+              if (res && res.error) setCapError(readIndexError(res.error))
+              if (res && res.progress && res.progress.active === true) setPollSeq((n) => n + 1)
+            },
+            (err) => {
+              if (cancelled) return
+              setStartingUpdate(false)
+              if (!info.built) setIndexError(String(err.message ?? err))
+              else setCapError(String(err.message ?? err))
+            },
+          )
+        },
+          (failure) => {
+            if (cancelled) return
+            setIndexBuilt(false)
+            setIndexError(String(failure.message ?? failure))
+          },
+      )
+      return () => { cancelled = true; controller.abort() }
+    }, [indexAttempt, applyIndexStatus])
+
     useEffect(() => {
       if (lastQuery.current === query) return
       lastQuery.current = query
       clearHighlight()
     }, [query])
 
-    /* Poll the non-blocking status while a build runs: it answers with `done / total` session
-       counts, which is what the progress bar shows. A manual refresh restarts the same poll. */
     useEffect(() => {
-      let cancelled = false
+      if (pollSeq === 0) return undefined
+      let cancelled = false, timer = null
       const controller = new AbortController()
-      let timer = null
-      const tick = () => {
+      const poll = () => {
         fetchIndexStatus(controller.signal).then(
           (value) => {
             if (cancelled) return
-            const next = value !== null && value !== undefined && value.progress !== undefined ? value.progress : null
-            setBuild(next)
-            const built = typeof value.builtAt === 'number' && value.builtAt > 0
-            setIndexBuilt(built)
-            if (refreshing || (next !== null && next.active === true) || !built) timer = setTimeout(tick, 500)
+            const info = applyIndexStatus(value, false)
+            if (info.next !== null && info.next.active === true) timer = setTimeout(poll, 500)
           },
-          () => {
-            /* A failed probe leaves the page on its normal states. */
-          },
+          () => { if (!cancelled) timer = setTimeout(poll, 1600) },
         )
       }
-      if (!indexError) tick()
-      return () => {
-        cancelled = true
-        controller.abort()
-        if (timer !== null) clearTimeout(timer)
-      }
-    }, [refreshing, indexError])
+      timer = setTimeout(poll, 450)
+      return () => { cancelled = true; controller.abort(); if (timer !== null) clearTimeout(timer) }
+    }, [pollSeq, applyIndexStatus])
+
+    function startActionController() {
+      if (actionAbortRef.current) actionAbortRef.current.abort()
+      const c = new AbortController()
+      actionAbortRef.current = c
+      return c
+    }
+    function handleSaveCapacity(event) {
+      event.preventDefault()
+      const parsed = parseMibInput(capInput)
+      if (!parsed.ok) { setCapNotice(''); setCapError(t('indexMinErr')); return }
+      const c = startActionController()
+      setSavingCap(true); setCapError(''); setCapNotice('')
+      saveIndexCapacity(parsed.value, c.signal).then(
+        (st) => {
+          if (c.signal.aborted) return
+          setSavingCap(false); capDirtyRef.current = false
+          applyIndexStatus(st, true)
+          setCapNotice(t('indexSaved'))
+          if (noticeTimerRef.current !== null) clearTimeout(noticeTimerRef.current)
+          noticeTimerRef.current = setTimeout(() => setCapNotice(''), 2000)
+        },
+        (err) => { if (!c.signal.aborted) { setSavingCap(false); setCapError(String(err.message ?? err)) } },
+      )
+    }
+    function handleManualUpdate() {
+      const c = startActionController()
+      setStartingUpdate(true); setCapError(''); setCapNotice('')
+      setIndexError('')
+      startIndexUpdate(c.signal).then(
+        (res) => {
+          if (c.signal.aborted) return
+          setStartingUpdate(false)
+          if (res && res.progress) { setBuild(res.progress); setSharedIndexActive(res.progress.active === true) }
+          if (res && res.error) setCapError(readIndexError(res.error))
+          setPollSeq((n) => n + 1)
+        },
+        (err) => { if (!c.signal.aborted) { setStartingUpdate(false); setCapError(String(err.message ?? err)) } },
+      )
+    }
 
     /* One-shot "index ready" confirmation: only on the false -> true edge, never on remount. */
     const builtBefore = useRef(null)
@@ -4277,7 +4485,7 @@ export function createSearchClient(React) {
     /* Before the first status answer we do not know whether an index exists, so start in the
        building shape instead of flashing the idle page (and its hint) for one frame. */
     const indexUnknown = indexBuilt === null && build === null
-    const firstBuild = indexUnknown || (indexBuilt !== true && (building || status === 'loading'))
+    const firstBuild = indexUnknown || (indexBuilt !== true && (refreshing || status === 'loading'))
     const refreshingNow = indexBuilt === true && (building || refreshing)
     const indeterminateBar = h(
       'div',
@@ -4438,6 +4646,43 @@ export function createSearchClient(React) {
           h('p', { className: 'dsh-cg-sub' }, t('global.subtitle')),
         ),
       ),
+      h(
+        'div',
+        { className: 'dsh-cg-index-controls' },
+        h(
+          'div',
+          { className: 'dsh-cg-index-meta' },
+          h('span', {
+            className: 'dsh-cg-index-dot ' + (building || startingUpdate ? 'dsh-cg-index-dot--active' : capError ? 'dsh-cg-index-dot--err' : isIndexFull(indexStatus) ? 'dsh-cg-index-dot--full' : indexBuilt ? 'dsh-cg-index-dot--ready' : ''),
+            'aria-hidden': 'true',
+          }),
+          h(
+            'span',
+            { className: 'dsh-cg-index-stat' },
+            building || startingUpdate ? t('indexUpdating') : isIndexFull(indexStatus) ? t('indexFull') : indexBuilt ? t('indexReady') : t('indexIdle'),
+            indexStatus ? h('span', { className: 'dsh-cg-index-size' }, ' · ' + formatIndexBytes(indexStatus.dbBytes) + ' / ' + (indexStatus.maxBytes === null ? t('indexUnlimited') : formatIndexBytes(indexStatus.maxBytes))) : null,
+          ),
+          capError ? h('span', { className: 'dsh-cg-index-msg dsh-cg-index-msg--err', role: 'alert' }, capError) : capNotice ? h('span', { className: 'dsh-cg-index-msg dsh-cg-index-msg--ok', role: 'status' }, capNotice) : null,
+        ),
+        h(
+          'form',
+          { className: 'dsh-cg-index-actions', onSubmit: handleSaveCapacity },
+          h('label', { className: 'dsh-cg-index-label', htmlFor: capInputId }, t('indexLimitLabel')),
+          h(
+            'span',
+            { className: 'dsh-cg-index-field' },
+            h('input', {
+              id: capInputId, className: 'dsh-cg-index-input', type: 'number', inputMode: 'numeric', min: 1, step: 'any',
+              value: capInput, placeholder: t('indexBlankHint'), title: t('indexBlankHint'),
+              'aria-label': t('indexLimitAria'), disabled: savingCap || building || startingUpdate,
+              onChange: (e) => { capDirtyRef.current = true; setCapError(''); setCapNotice(''); setCapInput(e.target.value) },
+            }),
+            h('span', { className: 'dsh-cg-index-unit', 'aria-hidden': 'true' }, 'MiB'),
+          ),
+          h('button', { type: 'submit', className: 'dsh-cg-index-btn', disabled: building || startingUpdate || savingCap || indexStatus === null }, t(savingCap ? 'indexSaving' : 'indexSave')),
+          h('button', { type: 'button', className: 'dsh-cg-index-btn dsh-cg-index-btn--primary', disabled: building || startingUpdate || savingCap || indexStatus === null, onClick: handleManualUpdate }, t('indexUpdate')),
+        ),
+      ),
       firstBuild
         ? null
         : h(
@@ -4565,7 +4810,7 @@ export function createSearchClient(React) {
               h('span', { className: 'dsh-cg-error-text' }, indexError),
               h('button', { type: 'button', className: 'dsh-cg-submit', onClick: () => setIndexAttempt(attempt => attempt + 1) }, t('global.retry')),
             )
-          : refreshing || firstBuild ? progressBlock : body,
+          : firstBuild ? progressBlock : body,
       ),
     )
   }
@@ -4709,7 +4954,7 @@ export function createSearchClient(React) {
     }
     const tag = document.createElement('style')
     tag.dataset.dshPlugin = TAB_ID
-    tag.textContent = CSS + '\n' + CSS_RESULTS
+    tag.textContent = CSS + '\n' + CSS_RESULTS + '\n' + INDEX_CSS
     document.head.appendChild(tag)
     return () => tag.remove()
   }
@@ -4717,7 +4962,7 @@ export function createSearchClient(React) {
   function apply(ctx) {
     const t = ctx.locale.bind(NS)
 
-    ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'conversation-search: dictionaries')
+    ctx.effect(() => ctx.locale.register(NS, { zh: { ...zh, ...INDEX_I18N.zh }, en: { ...en, ...INDEX_I18N.en } }), 'conversation-search: dictionaries')
     ctx.effect(() => insertStyles(), 'conversation-search: styles')
     ctx.effect(() => installProbe(), 'conversation-search: probe')
     /* A reader scrolling right after a jump takes over: the landing replays stop moving the view. */

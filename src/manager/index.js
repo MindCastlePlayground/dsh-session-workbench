@@ -2649,6 +2649,30 @@ export function apply(ctx) {
       },
     }))
 
+    disposers.push(registerRoute({
+      kind: 'exact',
+      path: '/archived-sessions/note',
+      handler: async (req, res) => {
+        try {
+          if (req.method === 'GET') {
+            const url = new URL(req.url, 'http://localhost')
+            const sid = requireSessionId(url.searchParams.get('sessionId'))
+            const { notes } = await tags.read()
+            return json(res, { ok: true, note: notes?.[sid] ?? '' })
+          }
+          if (req.method !== 'POST') {
+            res.setHeader('allow', 'GET, POST')
+            return json(res, { ok: false, error: 'GET or POST only' }, 405)
+          }
+          const body = await readJsonBody(req)
+          const sid = requireSessionId(body?.sessionId)
+          json(res, { ok: true, note: await tags.setNote(sid, body?.note) })
+        } catch (error) {
+          json(res, { ok: false, code: error.code, error: String(error.message || error) }, errorStatus(error))
+        }
+      },
+    }))
+
     // ---- Saved filters (保存筛选, schema v1) --------------------------------
     disposers.push(registerRoute({
       kind: 'exact',
@@ -3185,6 +3209,7 @@ export function apply(ctx) {
     },
     pendingMove: pendingMoves.get,
     routeHandlers,
+    searchMetadata: tags.read,
     async deletedSessionIds() {
       const trash = await readTrashStore()
       return new Set(trash.items.map(item => String(item.sessionId)))

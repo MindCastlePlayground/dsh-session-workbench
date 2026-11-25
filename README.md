@@ -25,14 +25,14 @@
 
 ## 安装
 
-下载 [`dsh-session-workbench-1.4.0.tgz`](https://github.com/MindCastlePlayground/dsh-session-workbench/releases/download/v1.4.0/dsh-session-workbench-1.4.0.tgz)，进入下载目录并执行与你使用方式对应的一条命令。
+下载 [`dsh-session-workbench-1.5.0.tgz`](https://github.com/MindCastlePlayground/dsh-session-workbench/releases/download/v1.5.0/dsh-session-workbench-1.5.0.tgz)，进入下载目录并执行与你使用方式对应的一条命令。
 
 ```sh
 # DSH Desktop
-dsh plugin --profile desktop add ./dsh-session-workbench-1.4.0.tgz
+dsh plugin --profile desktop add ./dsh-session-workbench-1.5.0.tgz
 
 # DSH Web
-dsh plugin --profile web add ./dsh-session-workbench-1.4.0.tgz
+dsh plugin --profile web add ./dsh-session-workbench-1.5.0.tgz
 ```
 
 安装后刷新页面并确认已出现工作台入口。首次安装时，未启用配置热加载的宿主需要重新启动才能加载插件。如果同一 profile 已启用 `dsh-sessions-manager` 或 `dsh-chat-search`，先停用旧插件以避免路由、菜单或快捷键重复。工作台沿用原有的管理数据和搜索设置目录，无需复制会话文件。
@@ -47,7 +47,7 @@ git clone --branch dsh-v0.2.3-alpha.2 --depth 1 https://github.com/deepseek-ai/d
 npm install --prefix ../dsh-web @deepseek-ai/dsh@0.2.3-alpha.2
 git -C ../dsh-web-source apply "$PWD/patches/dsh-session-relocation.patch"
 node patches/apply-web-relocation.mjs ../dsh-web-source ../dsh-web
-node ../dsh-web/node_modules/@deepseek-ai/dsh/lib/bin.js plugin --profile web add /path/to/dsh-session-workbench-1.4.0.tgz
+node ../dsh-web/node_modules/@deepseek-ai/dsh/lib/bin.js plugin --profile web add /path/to/dsh-session-workbench-1.5.0.tgz
 node ../dsh-web/node_modules/@deepseek-ai/dsh/lib/bin.js --profile web
 ```
 
@@ -64,7 +64,7 @@ $dshCli = Join-Path $dshApp 'resources/app.asar/dsh/node_modules/@deepseek-ai/ds
 $previousElectronMode = $env:ELECTRON_RUN_AS_NODE
 $env:ELECTRON_RUN_AS_NODE = '1'
 try {
-    & (Join-Path $dshApp 'DeepSeek Harness.exe') --expose-internals $dshCli plugin --profile desktop add ./dsh-session-workbench-1.4.0.tgz | Out-Host
+    & (Join-Path $dshApp 'DeepSeek Harness.exe') --expose-internals $dshCli plugin --profile desktop add ./dsh-session-workbench-1.5.0.tgz | Out-Host
 } finally {
     $env:ELECTRON_RUN_AS_NODE = $previousElectronMode
 }
@@ -80,7 +80,9 @@ try {
 
 > 创建一个名为「发布核对」的项目，在里面开一个会话核对发布步骤。等那个会话完成后，读它的回复并汇总。最后把那个会话迁移到默认聊天工作区，并告诉我移动结果。
 
-首次打开全文搜索时，工作台在当前 DSH 配置目录创建 SQLite 索引。再次打开时只读取新增和变化的会话。普通聊天时索引保持关闭。回收站或已彻底删除的会话保留最后一次索引的副本；勾选「包含已删除会话」可查询副本。已经建索引的内容仍保存在本机搜索数据库中。
+首次打开全文搜索时，工作台在当前 DSH 配置目录创建 SQLite 索引。再次打开时只读取新增和变化的会话。普通聊天不会触发更新。回收站或已彻底删除的会话保留最后一次索引的副本；勾选「包含已删除会话」可查询副本。已经建索引的内容仍保存在本机搜索数据库中。
+
+搜索页可查看索引主库占用、设置容量上限或手动发起更新。更新由 DSH 后台执行，切回聊天后可在全局搜索按钮查看运行标记。上限默认不限，最小可设为 1 MiB；无法设得低于现有主库大小。达到上限时，已提交的索引和已删除会话的副本可继续查询。调高或取消上限后，再次更新即可继续处理。构建期间 SQLite 可能另用临时日志空间。
 
 默认搜索最近 14 天和每个会话最近 30 轮。清空日期、把轮次设为 0 可查全量历史。结果显示正文片段、命中数量和分页入口。
 
@@ -107,8 +109,9 @@ Agent 可以把当前会话移入选定项目。工作区写入模式通过 DSH 
 
 | 工具 | 用途 |
 | --- | --- |
-| `workbench_session_search` | 按范围和日期查询全文，返回片段、分页位置、索引版本。可用 `include_deleted` 包含删除快照。 |
-| `workbench_search_index_status`、`workbench_search_index_update` | 查询索引状态或主动进行增量同步。 |
+| `workbench_session_search` | 按范围、日期和 `workspace_path` 查询，返回片段、命中备注与标签、分页位置及索引版本。可用 `include_deleted` 包含删除快照。 |
+| `workbench_manager_note_get` / `workbench_manager_note_set` | 读取或编辑会话备注。传空字符串可清空备注。 |
+| `workbench_search_index_status`、`workbench_search_index_update`、`workbench_search_index_capacity` | 查看占用与进度，启动增量同步（可后台执行），或设置主库容量上限。 |
 | `workbench_manager_*` | 查询会话和分支、批量移动和归档、标星、处理标签及保存筛选、管理回收站、导出 Markdown。归档、删除和批量移动等操作通过原生审批。 |
 
 ### 跨会话协作

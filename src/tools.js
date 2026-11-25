@@ -47,7 +47,10 @@ function validate(args, properties, required) {
 }
 
 function isValidArgument(value, spec) {
+  if (spec?.anyOf) return spec.anyOf.some(option => isValidArgument(value, option))
   switch (spec?.type) {
+    case 'null':
+      return value === null
     case 'string':
       return typeof value === 'string' && value.trim().length >= spec.minLength && value.length <= spec.maxLength
     case 'boolean':

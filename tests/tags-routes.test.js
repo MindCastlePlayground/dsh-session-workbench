@@ -50,16 +50,32 @@ async function boot(opts = {}) {
   }
   const { apply } = await import(`../src/manager/index.js?tags-routes=${Date.now()}-${Math.random()}`)
   apply(ctx)
-  const call = async (path, body = {}) => {
+  const call = async (path, body = {}, method = 'POST') => {
     const req = Readable.from([Buffer.from(JSON.stringify(body))])
+    req.method = method
+    req.url = path
     let status = 200
     let text = ''
     const res = { writeHead: (v) => { status = v }, end: (v) => { text += v || '' } }
-    await routes.get(path)(req, res)
+    await routes.get(path.split('?')[0])(req, res)
     return { status, body: JSON.parse(text) }
   }
   return { root, call, stateDir: process.env.DSH_SESSIONS_MANAGER_STAR_DIR }
 }
+
+test('note route writes, reads and clears a session note', async () => {
+  const b = await boot()
+  const route = '/archived-sessions/note'
+  const get = () => b.call(`${route}?sessionId=s1`, {}, 'GET')
+  try {
+    assert.deepEqual((await get()).body, { ok: true, note: '' })
+    assert.deepEqual((await b.call(route, { sessionId: 's1', note: ' 跨项目测试 ' })).body, { ok: true, note: '跨项目测试' })
+    assert.deepEqual((await get()).body, { ok: true, note: '跨项目测试' })
+    assert.equal((await b.call(route, { sessionId: 's1', note: '\0' })).status, 400)
+    await b.call(route, { sessionId: 's1', note: '' })
+    assert.deepEqual((await get()).body, { ok: true, note: '' })
+  } finally { await cleanup(b) }
+})
 
 // 后台预热会浮动落盘 title-index.json（本仓库已知 teardown 竞态，见 index.js
 // persistDecoded 注释）——重试式清理。
