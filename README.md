@@ -14,7 +14,8 @@
 
 ## 功能
 
-- **项目状态** — 左侧栏的工作区折叠后仍会标记运行中、等待处理和完成未读。子 Agent 的运行状态计入所属项目。
+- **消息列表** — 在左侧栏切换到「消息列表」，先看运行中的会话，再按最近活动浏览其他会话。未读状态沿用 DSH 的原生规则。
+- **项目状态** — 左侧栏的工作区即使折叠，也会显示运行中和未读的会话数，并保留待处理提示。多个子 Agent 同时运行时，所属父会话只计一次。
 - **会话整理** — 在「设置 → 会话管理」和侧栏菜单中归档、恢复、迁移会话，管理星标、标签和回收站。
 - **全文搜索** — 从左侧栏打开全文搜索页，搜索标题、用户消息、助手回复和文件名，默认优先显示正文命中，结果按页浏览，可点中片段回到原文。全局搜索默认是 `Ctrl/Cmd+Alt+Q`，会话内搜索默认是 `Ctrl/Cmd+F`。
 - **会话分支** — 在对话原位置查看从该处创建的所有分支，从左侧会话树打开父会话或子会话。
@@ -24,14 +25,14 @@
 
 ## 安装
 
-下载 [`dsh-session-workbench-1.3.2.tgz`](https://github.com/MindCastlePlayground/dsh-session-workbench/releases/download/v1.3.2/dsh-session-workbench-1.3.2.tgz)，进入下载目录并执行与你使用方式对应的一条命令。
+下载 [`dsh-session-workbench-1.4.0.tgz`](https://github.com/MindCastlePlayground/dsh-session-workbench/releases/download/v1.4.0/dsh-session-workbench-1.4.0.tgz)，进入下载目录并执行与你使用方式对应的一条命令。
 
 ```sh
 # DSH Desktop
-dsh plugin --profile desktop add ./dsh-session-workbench-1.3.2.tgz
+dsh plugin --profile desktop add ./dsh-session-workbench-1.4.0.tgz
 
 # DSH Web
-dsh plugin --profile web add ./dsh-session-workbench-1.3.2.tgz
+dsh plugin --profile web add ./dsh-session-workbench-1.4.0.tgz
 ```
 
 安装后刷新页面并确认已出现工作台入口。首次安装时，未启用配置热加载的宿主需要重新启动才能加载插件。如果同一 profile 已启用 `dsh-sessions-manager` 或 `dsh-chat-search`，先停用旧插件以避免路由、菜单或快捷键重复。工作台沿用原有的管理数据和搜索设置目录，无需复制会话文件。
@@ -46,7 +47,7 @@ git clone --branch dsh-v0.2.3-alpha.2 --depth 1 https://github.com/deepseek-ai/d
 npm install --prefix ../dsh-web @deepseek-ai/dsh@0.2.3-alpha.2
 git -C ../dsh-web-source apply "$PWD/patches/dsh-session-relocation.patch"
 node patches/apply-web-relocation.mjs ../dsh-web-source ../dsh-web
-node ../dsh-web/node_modules/@deepseek-ai/dsh/lib/bin.js plugin --profile web add /path/to/dsh-session-workbench-1.3.2.tgz
+node ../dsh-web/node_modules/@deepseek-ai/dsh/lib/bin.js plugin --profile web add /path/to/dsh-session-workbench-1.4.0.tgz
 node ../dsh-web/node_modules/@deepseek-ai/dsh/lib/bin.js --profile web
 ```
 
@@ -63,7 +64,7 @@ $dshCli = Join-Path $dshApp 'resources/app.asar/dsh/node_modules/@deepseek-ai/ds
 $previousElectronMode = $env:ELECTRON_RUN_AS_NODE
 $env:ELECTRON_RUN_AS_NODE = '1'
 try {
-    & (Join-Path $dshApp 'DeepSeek Harness.exe') --expose-internals $dshCli plugin --profile desktop add ./dsh-session-workbench-1.3.2.tgz | Out-Host
+    & (Join-Path $dshApp 'DeepSeek Harness.exe') --expose-internals $dshCli plugin --profile desktop add ./dsh-session-workbench-1.4.0.tgz | Out-Host
 } finally {
     $env:ELECTRON_RUN_AS_NODE = $previousElectronMode
 }
