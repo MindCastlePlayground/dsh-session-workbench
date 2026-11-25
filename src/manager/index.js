@@ -1178,7 +1178,7 @@ export function apply(ctx) {
     return Object.assign(new Error(message), { status: 409, code })
   }
 
-  async function moveOne(sid, targetPath, scope, { stopRunning, callerId }) {
+  async function moveOne(sid, targetPath, scope, { stopRunning, callerId, transaction }) {
     requireCapability(capabilities, 'move')
     requireSessionId(sid)
     const registered = scope && w.get(scope.targetWorkspaceId)
@@ -1203,6 +1203,7 @@ export function apply(ctx) {
       try { oldCanon = await realpath(oldCwd) } catch (e) { oldCanon = null }
       if (oldCanon === canonical) {
         if (scope) await assignWorkspace(sid, meta, target)
+        await transaction?.commit()
         return { ok: true, already: true, workspaceId: target.id, workspaceTitle: target.title }
       }
     }
@@ -1216,8 +1217,9 @@ export function apply(ctx) {
       if (!current?.meta || current.meta.cwd !== meta.cwd) {
         throw moveConflict('DSM_MOVE_IN_PROGRESS', '会话工作目录已变更，请重新选择。')
       }
-      return commitMove(sid, current.meta, current.events, current.inheritedEventCount, canonical, target)
+      return commitMove(sid, current.meta, current.events, current.inheritedEventCount, canonical, target, transaction)
     }
+    if (transaction) return relocate()
     if (callerId === sid && agent) {
       throw moveConflict('DSM_SESSION_SELF_MOVE', '请从另一会话或界面发起移动。')
     }
@@ -1225,7 +1227,14 @@ export function apply(ctx) {
       throw moveConflict('DSM_SESSION_BUSY', '当前宿主仍持有此会话。请关闭该会话后重试。')
     }
     if (typeof withRelocation === 'function') {
-      return withRelocation.call(agentRegistry, sid, { stopRunning }, relocate)
+      try {
+        return await withRelocation.call(agentRegistry, sid, { stopRunning }, relocate)
+      } catch (error) {
+        if (error?.name === 'SessionAlreadyOwnedError') {
+          throw moveConflict('DSM_SESSION_BUSY', '另一个 DSH 宿主仍持有此会话，请在持有端关闭这一条会话后重试。')
+        }
+        throw error
+      }
     }
     if (persistence.kind === 'legacy' && getActiveSessionIds(ctx, activeTracker).has(sid)) {
       throw moveConflict('DSM_SESSION_BUSY', '请先关闭当前会话，再重新移动。')
@@ -1233,7 +1242,7 @@ export function apply(ctx) {
     return relocate()
   }
 
-  async function commitMove(sid, meta, events, inheritedEventCount, canonical, target) {
+  async function commitMove(sid, meta, events, inheritedEventCount, canonical, target, transaction) {
     const newHeader = Object.assign({}, meta, { cwd: canonical })
 
   // 移动过程的非致命提示（如源目录仍有旧代日志未能清理），随成功结果一并
@@ -1338,7 +1347,7 @@ export function apply(ctx) {
       let assigning = false
       try {
         const movedHandle = await moveSessionToCwd({
-          sp, sid, header: meta, canonical, events, inheritedEventCount,
+          sp, sid, header: meta, canonical, events, inheritedEventCount, transaction,
           async onRelocated(header) {
             assigning = true
             await assignWorkspace(sid, header, target)
@@ -1362,7 +1371,7 @@ export function apply(ctx) {
           }
         }
         if (e && e.status) throw e
-        throw new Error('移动会话日志失败：' + String((e && e.message) || e))
+        throw Object.assign(new Error('移动会话日志失败：' + String((e && e.message) || e), { cause: e }), { code: e?.code })
       }
     } else if (isOpen) {
       // Live session: relocate the on-disk log (rewriting frame0's cwd to the
@@ -1462,14 +1471,14 @@ export function apply(ctx) {
   }
 
   const moveOperations = new Set()
-  async function moveNow(sid, targetPath, { scope, stopRunning = false, callerId } = {}) {
+  async function moveNow(sid, targetPath, { scope, stopRunning = false, callerId, transaction } = {}) {
     requireSessionId(sid)
     if (moveOperations.has(sid)) {
       throw moveConflict('DSM_MOVE_IN_PROGRESS', '该会话已有一项移动正在进行。')
     }
     moveOperations.add(sid)
     try {
-      const result = await moveOne(sid, targetPath, scope, { stopRunning, callerId })
+      const result = await moveOne(sid, targetPath, scope, { stopRunning, callerId, transaction })
       metaCache.invalidate(sid)
       try {
         if (await pendingMoves.has(sid)) await pendingMoves.remove([sid])
@@ -3198,14 +3207,22 @@ export function apply(ctx) {
   }, 'dsh-sessions-manager: routes')
 
   return {
-    async moveSession(sid, target, { expectedCwd, stopRunning, callerId }) {
+    async moveSession(sid, target, { expectedCwd, stopRunning, callerId, transaction }) {
       const result = await moveNow(sid, target.path, {
         scope: { expectedCwd, targetWorkspaceId: target.id },
         stopRunning,
         callerId,
+        transaction,
       })
       if (result.moved) await reindexRegistry()
       return result
+    },
+    async restoreMoveMembership(sid, cwd, projectId) {
+      const { header } = await sp.stat(sid) ?? {}
+      const target = (projectId ? w.get(projectId) : null) ?? w.list().find(workspace => workspace.path === cwd)
+      if (header?.cwd !== cwd || target?.path !== cwd) throw new Error('Cannot reconcile the session with its project.')
+      await assignWorkspace(sid, header, target)
+      metaCache.invalidate(sid)
     },
     pendingMove: pendingMoves.get,
     routeHandlers,

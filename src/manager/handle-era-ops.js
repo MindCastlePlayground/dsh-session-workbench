@@ -265,7 +265,7 @@ async function relocateRewrittenBackup({ sid, canonical, backupLogPath, artifact
 //   获取并持有写句柄（可能发布新代）→ 定位 → 同 id 残留清理
 //   → **把整个源会话目录改名移开**（对官方彻底不可见，而不是只搬单个文件）
 //   → 目标侧 create+append+校验 → 成功则删除移开的源目录，失败则整体改回。
-export async function moveSessionToCwd({ sp, sid, header, canonical, events = [], inheritedEventCount = 0, onRelocated }) {
+export async function moveSessionToCwd({ sp, sid, header, canonical, events = [], inheritedEventCount = 0, onRelocated, transaction }) {
   let lease
   try {
     lease = await openMoveWriter(sp, sid)
@@ -353,6 +353,7 @@ export async function moveSessionToCwd({ sp, sid, header, canonical, events = []
     const backupDir = join(backupRoot, `${encodeSegmentFor(sid)}-${process.pid}-${Date.now()}`)
     await mkdir(backupRoot, { recursive: true })
     const backupLogPath = join(backupDir, basename(artifacts.logPath))
+    await transaction?.prepare(basename(backupDir), events.length)
     await rename(artifacts.sessionDir, backupDir)
     let writer = null
     let installedTarget = false
@@ -388,9 +389,12 @@ export async function moveSessionToCwd({ sp, sid, header, canonical, events = []
       if (Number.isSafeInteger(after.eventCount) && events.length > 0 && after.eventCount !== events.length) {
         throw new Error(`移动后校验失败：事件数不一致（源 ${events.length}，副本 ${after.eventCount}）`)
       }
-      await onRelocated?.(after.header)
       await writer?.close()
       writer = null
+      transaction?.signal.throwIfAborted()
+      await onRelocated?.(after.header)
+      transaction?.signal.throwIfAborted()
+      await transaction?.commit()
     } catch (e) {
       // 回滚：清掉目标目录里的半成品，把整个源目录移回原位（多代日志一起复原）。
       await closeQuietly(writer)
@@ -400,8 +404,9 @@ export async function moveSessionToCwd({ sp, sid, header, canonical, events = []
       try { await mkdir(dirname(artifacts.sessionDir), { recursive: true }) } catch (_) {}
       try { await rename(backupDir, artifacts.sessionDir) } catch (_) {}
       if (e && e.status) throw e
-      const error = new Error('移动会话日志失败：' + String((e && e.message) || e))
+      const error = new Error('移动会话日志失败：' + String((e && e.message) || e), { cause: e })
       error.status = 500
+      error.code = e?.code
       throw error
     }
     // 4) 成功：删掉移开的源目录（含全部旧代日志）。留着它等于让同一个 id 出现在

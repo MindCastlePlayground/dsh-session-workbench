@@ -28,6 +28,7 @@ async function setup() {
   let approvalDecision = 'allowed-once'
   let defaultWorkspace
   let nextId = 0
+  const continuation = []
   const ctx = {
     tools: { register: tool => tools.set(tool.name, tool) },
     workspaceRegistry: {
@@ -63,17 +64,30 @@ async function setup() {
         return { sessionId }
       },
       rename: async () => {},
-      resolveAgent: async id => ({ agent: { session: { header: headers.get(id) }, followup: () => {} } }),
+      resolveAgent: async id => ({ agent: {
+        session: { header: headers.get(id), snapshotEvents: () => [] },
+        inbox: { nextTurn: [] },
+        followup() {},
+        queueSessionRelocation: async message => { continuation.push(message) },
+        wakeSessionInbox() {},
+        whenIdle: async () => {},
+      } }),
     },
     agents: {
       withSessionRelocation: async (_id, _options, relocate) => relocate(),
+      supportsHotSessionRelocation: () => true,
+      async scheduleSessionRelocation(agent, relocate) {
+        await agent.whenIdle()
+        return relocate(new AbortController().signal)
+      },
     },
     get: key => key === 'approval'
       ? { request: async request => { approvalRequests.push(request); return approvalDecision } }
-      : key === 'sandboxPolicy' ? { resolve: () => ({ mode: 'workspace-write' }) } : undefined,
+      : key === 'sandboxPolicy' ? { resolve: () => ({ mode: 'workspace-write' }) }
+      : key === 'sessionPersistence' ? { root: join(root, 'sessions') } : undefined,
   }
   const moveApi = {
-    moveSession: async (id, target, { expectedCwd } = {}) => {
+    moveSession: async (id, target, { expectedCwd, transaction } = {}) => {
       moveCalls.push({ id, target: target.id, expectedCwd })
       const result = moves.get(id) || { moved: true }
       if (result.moved) {
@@ -82,6 +96,7 @@ async function setup() {
         if (old) old.sessionIds = old.sessionIds.filter(item => item !== id)
         target.sessionIds.push(id)
         headers.set(id, { ...headers.get(id), cwd: target.path })
+        await transaction?.commit()
       }
       return result
     },
@@ -95,7 +110,7 @@ async function setup() {
       concludeTurn: runtime.concludeTurn || (() => {}),
     })
   }
-  return { root, projects, projectAPath, projectBPath, headers, tools, created, renamed, moves, moveCalls, approvalRequests, exec, setApproval: value => { approvalDecision = value }, setDefault: value => { defaultWorkspace = value } }
+  return { root, projects, projectAPath, projectBPath, headers, tools, created, renamed, moves, moveCalls, continuation, approvalRequests, exec, setApproval: value => { approvalDecision = value }, setDefault: value => { defaultWorkspace = value } }
 }
 
 test('lists projects and the default chat', async t => {
@@ -173,7 +188,7 @@ test('denies current-session relocation before ending the turn', async t => {
   assert.equal(state.approvalRequests[0].callId, 'self-denied')
 })
 
-test('approves current-session relocation, concludes the turn, and moves only after whenIdle', async t => {
+test('moves the current session after the host boundary and schedules continuation in the destination', async t => {
   const state = await setup()
   t.after(() => rm(state.root, { recursive: true, force: true }))
   let concluded = false
@@ -187,18 +202,24 @@ test('approves current-session relocation, concludes the turn, and moves only af
       concluded = true
     },
     agent: {
-      session: { header: state.headers.get('s-a') },
+      id: 's-a',
+      session: { header: state.headers.get('s-a'), snapshotEvents: () => [] },
       whenIdle: async () => { idleEntered = true; await idle },
     },
   })
-  assert.deepEqual(result, { session_id: 's-a', project_id: 'project-b', state: 'switching_after_turn' })
+  assert.deepEqual(result, { session_id: 's-a', project_id: 'project-b', state: 'switching_after_step' })
   assert.equal(concluded, true)
   await new Promise(resolve => setImmediate(resolve))
   assert.equal(idleEntered, true)
   assert.equal(state.moveCalls.length, 0)
-  assert.equal((await state.exec('session_move_status', { session_id: 's-a', project_id: 'project-b' })).state, 'switching_after_turn')
+  assert.equal((await state.exec('session_move_status', { session_id: 's-a', project_id: 'project-b' })).state, 'switching_after_step')
   releaseIdle()
-  await new Promise(resolve => setImmediate(resolve))
+  const status = () => state.exec('session_move_status', { session_id: 's-a', project_id: 'project-b' })
+  for (let count = 0; count < 100 && (await status()).state !== 'moved'; count++) {
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  assert.equal(state.continuation.length, 1)
+  assert.match(state.continuation[0].content[0].text, /"state":"moved"/)
   assert.deepEqual(state.moveCalls, [{ id: 's-a', target: 'project-b', expectedCwd: state.projectAPath }])
-  assert.equal((await state.exec('session_move_status', { session_id: 's-a', project_id: 'project-b' })).state, 'moved')
+  assert.equal((await status()).state, 'moved')
 })

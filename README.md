@@ -25,19 +25,19 @@
 
 ## 安装
 
-下载 [`dsh-session-workbench-1.6.0.tgz`](https://github.com/MindCastlePlayground/dsh-session-workbench/releases/download/v1.6.0/dsh-session-workbench-1.6.0.tgz)，进入下载目录并执行与你使用方式对应的一条命令。
+下载 [`dsh-session-workbench-1.7.0.tgz`](https://github.com/MindCastlePlayground/dsh-session-workbench/releases/download/v1.7.0/dsh-session-workbench-1.7.0.tgz)，进入下载目录并执行与你使用方式对应的一条命令。
 
 ```sh
 # DSH Desktop
-dsh plugin --profile desktop add ./dsh-session-workbench-1.6.0.tgz
+dsh plugin --profile desktop add ./dsh-session-workbench-1.7.0.tgz
 
 # DSH Web
-dsh plugin --profile web add ./dsh-session-workbench-1.6.0.tgz
+dsh plugin --profile web add ./dsh-session-workbench-1.7.0.tgz
 ```
 
 安装后刷新页面并确认已出现工作台入口。首次安装时，未启用配置热加载的宿主需要重新启动才能加载插件。如果同一 profile 已启用 `dsh-sessions-manager` 或 `dsh-chat-search`，先停用旧插件以避免路由、菜单或快捷键重复。工作台沿用原有的管理数据和搜索设置目录，无需复制会话文件。
 
-**Web 热切换。** 使用 [DSH Web 0.2.3-alpha.2](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.2.3-alpha.2) 和 [会话释放补丁](patches/dsh-session-relocation.patch)。标准宿主可继续移动已关闭的会话；热切换需要宿主支持释放单个会话。搜索索引需要 Node.js 22.13 或更高版本。
+**Web 热切换**使用 [DSH Web 0.2.3-alpha.2](https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.2.3-alpha.2) 和 [会话迁移宿主补丁](patches/dsh-session-relocation.patch)。未加载该补丁的宿主仍可使用离线移动。搜索索引需要 Node.js 22.13 或更高版本。
 
 从工作台源码目录构建补丁。以下命令把 Web 安装在独立目录，并与桌面版分别运行。Node.js 24.x 请使用 24.22.3 或更新版本。
 
@@ -47,11 +47,12 @@ git clone --branch dsh-v0.2.3-alpha.2 --depth 1 https://github.com/deepseek-ai/d
 npm install --prefix ../dsh-web @deepseek-ai/dsh@0.2.3-alpha.2
 git -C ../dsh-web-source apply "$PWD/patches/dsh-session-relocation.patch"
 node patches/apply-web-relocation.mjs ../dsh-web-source ../dsh-web
-node ../dsh-web/node_modules/@deepseek-ai/dsh/lib/bin.js plugin --profile web add /path/to/dsh-session-workbench-1.6.0.tgz
+export DSH_HOME="$PWD/../dsh-web-profile"
+node ../dsh-web/node_modules/@deepseek-ai/dsh/lib/bin.js plugin --profile web add /path/to/dsh-session-workbench-1.7.0.tgz
 node ../dsh-web/node_modules/@deepseek-ai/dsh/lib/bin.js --profile web
 ```
 
-补丁安装脚本将官方模块备份为各自的 `index.js.upstream`。启动新版 Web 后，移动空闲会话时只切换目标会话，其他会话可继续运行。
+补丁安装脚本将官方模块备份为各自的 `index.js.upstream`。首次启用时从更新后的前缀启动 Web。日常切换只重新绑定被移动的会话，整个 Web 服务和其他会话继续运行。
 
 <details>
 <summary>Windows 找不到 <code>dsh</code> 命令</summary>
@@ -64,7 +65,7 @@ $dshCli = Join-Path $dshApp 'resources/app.asar/dsh/node_modules/@deepseek-ai/ds
 $previousElectronMode = $env:ELECTRON_RUN_AS_NODE
 $env:ELECTRON_RUN_AS_NODE = '1'
 try {
-    & (Join-Path $dshApp 'DeepSeek Harness.exe') --expose-internals $dshCli plugin --profile desktop add ./dsh-session-workbench-1.6.0.tgz | Out-Host
+    & (Join-Path $dshApp 'DeepSeek Harness.exe') --expose-internals $dshCli plugin --profile desktop add ./dsh-session-workbench-1.7.0.tgz | Out-Host
 } finally {
     $env:ELECTRON_RUN_AS_NODE = $previousElectronMode
 }
@@ -78,7 +79,7 @@ try {
 
 安装后，从一个独立的 DSH 会话向 Agent 提出任务。
 
-> 创建一个名为「发布核对」的项目，在里面开一个会话核对发布步骤。等那个会话完成后，读它的回复并汇总。最后把那个会话迁移到默认聊天工作区，并告诉我移动结果。
+> 在我指定的外部路径创建目录并登记「发布核对」项目，把当前会话迁移过去，再在新目录创建 README.md。
 
 首次打开全文搜索时，工作台在当前 DSH 配置目录创建 SQLite 索引。再次打开时只读取新增和变化的会话。普通聊天不会触发更新。回收站或已彻底删除的会话保留最后一次索引的副本；勾选「包含已删除会话」可查询副本。已经建索引的内容仍保存在本机搜索数据库中。
 
@@ -93,7 +94,7 @@ try {
 | 工具 | 参数与行为 |
 | --- | --- |
 | `workbench_project_list` | 列出项目 ID、名称和目录，并返回当前项目与默认聊天工作区。 |
-| `workbench_project_create` | 传入 `name`。可用 `path` 指定宿主上的绝对路径，省略时从 DSH 数据目录分配独立目录。 |
+| `workbench_project_create` | 传入 `name`。可用 `path` 指定宿主上的绝对路径，省略时从 DSH 数据目录分配独立目录。相同规范路径和名称返回已有项目。超出当前目录写入授权的操作走 DSH 审批。 |
 | `workbench_project_rename` | 传入 `project_id` 和新 `name`。保留目录和会话。 |
 | `workbench_session_create` | 传入 `project_id`。可用 `title` 命名，或用 `message` 投递初始任务。 |
 | `workbench_session_move` | 传入 `session_id` 和 `target_project_id`。原会话位于其他项目时，带上 `source_project_id`。宿主支持关闭单个会话时，可用 `stop_running: true` 停止目标会话并立即移动。 |
@@ -103,7 +104,9 @@ try {
 
 迁移保留会话 ID 和历史，同时更新工作目录。Web 中打开的空闲会话也可以直接切换。运行中的目标会话会返回运行状态，由用户决定是否停止该会话。仍由其他宿主持有的会话需要先在原宿主关闭。
 
-Agent 可以把当前会话移入选定项目。工作区写入模式通过 DSH 原生审批确认目标目录，允许后工具返回 `switching_after_turn`。当轮结果保存后立即切换，并可用 `workbench_session_move_status` 查看结果。
+Agent 可以把当前会话移入选定项目。工作区写入模式通过 DSH 原生审批确认目标项目和目录。获批后工具返回 `switching_after_step`，当前工具批次保存后宿主切换工作目录，再自动接续原请求。切换期间已入队的消息随会话迁移，新提交消息在新的会话运行环境接收。无需补发提示，可以用 `workbench_session_move_status` 查看进度。
+
+宿主按会话 ID 保留迁移期间的写入权，并在宿主退出后按恢复记录核对日志归属。一个共享数据目录内，使用补丁的宿主会遵守同一写入锁。旧宿主仍在持有原始写入权时，请在持有端关闭这一条会话，再重试。
 
 ### 搜索与会话管理
 

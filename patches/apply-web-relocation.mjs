@@ -10,6 +10,8 @@ const VERSION = '0.2.3-alpha.2'
 const BASE = '4b399c39a6d1479cd84ca591b4d7c88e24d38a96'
 const packages = {
   'dsh-agent': 'packages/core/agent/src/index.ts',
+  'dsh-agent-loop': 'packages/core/agent-loop/src/index.ts',
+  'dsh-session-persistence-jsonl': 'packages/session/session-persistence-jsonl/src/index.ts',
   'dsh-api-session-controller': 'packages/api/session-controller/src/index.ts',
 }
 const [, , upstream, installation] = process.argv
@@ -23,6 +25,23 @@ const revisions = execFileSync('git', ['-C', source, 'rev-parse', 'HEAD'], { enc
 if (revisions !== BASE) throw new Error('Use the DSH 0.2.3-alpha.2 source checkout.')
 const patch = fileURLToPath(new URL('./dsh-session-relocation.patch', import.meta.url))
 execFileSync('git', ['-C', source, 'apply', '--reverse', '--check', patch], { stdio: 'inherit' })
+
+// Cordis exposes FiberState only as a TypeScript const enum in this release.
+// Compile those constants without bundling a second copy of the runtime.
+const cordisSource = await readFile(join(source, 'vendor', 'cordis', 'src', 'fiber.ts'), 'utf8')
+const fiberState = cordisSource.match(/export const enum FiberState \{[^}]*\}/)?.[0]
+if (!fiberState) throw new Error('Cannot find the pinned Cordis FiberState declaration.')
+const cordisEnums = {
+  name: 'cordis-const-enums',
+  setup(builder) {
+    builder.onResolve({ filter: /^@deepseek-ai\/cordis$/ }, ({ namespace, path }) =>
+      namespace === 'cordis-const-enums' ? { path, external: true } : { path, namespace: 'cordis-const-enums' })
+    builder.onLoad({ filter: /.*/, namespace: 'cordis-const-enums' }, () => ({
+      contents: 'export * from "@deepseek-ai/cordis";\n' + fiberState.replace('const enum', 'enum'),
+      loader: 'ts',
+    }))
+  },
+}
 
 const scratch = await mkdtemp(join(tmpdir(), 'dsh-web-relocation-'))
 const compiled = []
@@ -39,6 +58,8 @@ try {
       outfile: output,
       bundle: true,
       packages: 'external',
+      tsconfigRaw: {},
+      plugins: [cordisEnums],
       platform: 'node',
       format: 'esm',
       target: 'es2022',

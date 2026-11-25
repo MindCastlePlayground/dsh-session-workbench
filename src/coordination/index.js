@@ -99,17 +99,21 @@ export function applyCoordination(ctx) {
     { session_id: SESSION_ID, message: MESSAGE, project_id: PROJECT_ID },
     ['session_id', 'message'],
     async ({ session_id: id, message, project_id: project }, caller, signal) => {
-      const directory = await peerDirectory(ctx, caller, id, project, signal)
-      await findSession(ctx, id, directory, signal)
-      if (archived(ctx, id)) throw failure('SESSION_ARCHIVED', 'Unarchive the session before sending to it.')
-      const found = await ctx.sessionController.resolveAgent(id)
-      signal.throwIfAborted()
-      if ('error' in found) throw found.error
-      assertSession(id, found.agent.session.header, directory)
-      if (archived(ctx, id)) throw failure('SESSION_ARCHIVED', 'Unarchive the session before sending to it.')
-      const input = relay(caller.id, message, senderProject(ctx, caller, directory))
-      found.agent.followup(input)
-      return { session_id: id, message_id: input.id, state: 'queued' }
+      const admit = async () => {
+        signal.throwIfAborted()
+        const directory = await peerDirectory(ctx, caller, id, project, signal)
+        await findSession(ctx, id, directory, signal)
+        if (archived(ctx, id)) throw failure('SESSION_ARCHIVED', 'Unarchive the session before sending to it.')
+        const found = await ctx.sessionController.resolveAgent(id)
+        signal.throwIfAborted()
+        if ('error' in found) throw found.error
+        assertSession(id, found.agent.session.header, directory)
+        if (archived(ctx, id)) throw failure('SESSION_ARCHIVED', 'Unarchive the session before sending to it.')
+        const input = relay(caller.id, message, senderProject(ctx, caller, directory))
+        found.agent.followup(input)
+        return { session_id: id, message_id: input.id, state: 'queued' }
+      }
+      return ctx.agents.withSessionAdmission?.(id, admit) ?? admit()
     })
 
   register(ctx, 'session_history',
