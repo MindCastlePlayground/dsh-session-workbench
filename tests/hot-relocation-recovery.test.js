@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { test } from 'node:test'
@@ -8,7 +9,7 @@ import { deriveSessionDir, encodeSegmentFor } from '../src/manager/handle-era-pa
 import { createHotRelocation } from '../src/projects/hot-relocation.js'
 
 async function recover(t, phase, { admitted = false, externalWrite = false } = {}) {
-  const home = await mkdtemp(join(process.cwd(), '.test-hot-move-'))
+  const home = await mkdtemp(join(tmpdir(), 'workbench-hot-move-'))
   t.after(() => rm(home, { recursive: true, force: true }))
   const id = 'session-test'
   const root = join(home, 'sessions')

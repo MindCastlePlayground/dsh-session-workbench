@@ -2,6 +2,7 @@ import { apply as applyManager, inject as managerServices } from './manager/inde
 import { apply as applySearch, inject as searchServices, registerSearchTools } from './search/host.js'
 import { applyCoordination, coordinationServices } from './coordination/index.js'
 import { applyProjects, projectServices } from './projects/index.js'
+import { registerTimestampsProjection } from './workspace-status/timestamps-projection.js'
 
 import { registerManagerAgentTools } from './manager/agent-tools.js'
 import { requestApproval } from './projects/approval.js'
@@ -10,6 +11,7 @@ export const name = 'dsh-session-workbench'
 export const inject = [...new Set([...managerServices, ...searchServices])]
 
 export function apply(ctx) {
+  registerTimestampsProjection(ctx)
   const moves = applyManager(ctx)
   const search = applySearch(ctx, { deletedSessionIds: moves.deletedSessionIds, readMetadata: moves.searchMetadata })
   ctx.inject(['tools'], (scope) => {

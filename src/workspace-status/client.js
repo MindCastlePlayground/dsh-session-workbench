@@ -12,6 +12,7 @@ import {
   rowFallbackCss,
 } from './styles.js'
 import {
+  HeaderGlobalSearchButton,
   MessagesView,
   ViewSwitcher,
   WorkspaceRowTail,
@@ -20,6 +21,8 @@ import {
 import { createStickyProjectController, STICKY_ATTRS } from './sticky.js'
 
 export const inject = ['slots']
+
+const GLOBAL_SEARCH_PANEL_ID = 'global-search'
 
 const EMPTY_ITEMS = []
 const EMPTY_SESSIONS = {}
@@ -226,6 +229,22 @@ function openNativeSession(ctx, sessionId) {
   } catch { /* host selection unavailable */ }
 }
 
+function toggleGlobalSearchPanel(ctx, currentlyActive) {
+  if (!ctx || typeof ctx.get !== 'function') return
+  try {
+    const layout = ctx.get('layout')
+    if (layout && typeof layout.selectPanel === 'function') {
+      layout.selectPanel(currentlyActive ? null : GLOBAL_SEARCH_PANEL_ID)
+    }
+  } catch {
+    if (currentlyActive) {
+      try {
+        ctx.get('layout')?.selectPanel?.(null)
+      } catch { /* ignore */ }
+    }
+  }
+}
+
 function findDirectChild(parent, attrName) {
   for (const child of parent.children) {
     if (child.hasAttribute && child.hasAttribute(attrName)) return child
@@ -233,9 +252,68 @@ function findDirectChild(parent, attrName) {
   return null
 }
 
+function findNativeSearchSlot(header) {
+  if (!header) return null
+  for (const child of header.children) {
+    if (child.tagName === 'DIV' && child.querySelector('input')) return child
+  }
+  return null
+}
+
+function syncLiveTimestamps(liveMap, sessions, statuses, archivedIds) {
+  const now = Date.now()
+  const archived = new Set(Array.isArray(archivedIds) ? archivedIds : [])
+  const statusMap = statuses instanceof Map ? statuses : EMPTY_STATUSES
+  const safeSessions = sessions && typeof sessions === 'object' ? sessions : EMPTY_SESSIONS
+
+  for (const id of liveMap.keys()) {
+    if (!safeSessions[id] || archived.has(id)) liveMap.delete(id)
+  }
+
+  for (const [id, session] of Object.entries(safeSessions)) {
+    if (!session || archived.has(id)) continue
+    const status = statusMap.get(id)
+    const running = status?.running ?? session.running === true
+    const pending = status?.pendingInteraction
+    const pendingKey = pending == null
+      ? null
+      : (pending.key || pending.callId || pending.kind || 'pending')
+
+    let entry = liveMap.get(id)
+    if (!entry) {
+      liveMap.set(id, {
+        running,
+        pendingKey,
+        userObservedAt: 0,
+        finishedObservedAt: 0,
+        pendingObservedAt: pendingKey !== null ? now : 0,
+      })
+      continue
+    }
+
+    if (pendingKey !== null && pendingKey !== entry.pendingKey) {
+      entry.pendingObservedAt = now
+    } else if (pendingKey === null) {
+      entry.pendingObservedAt = 0
+    }
+    entry.pendingKey = pendingKey
+
+    if (!entry.running && running) {
+      entry.userObservedAt = now
+    } else if (entry.running && !running && pendingKey === null) {
+      entry.finishedObservedAt = now
+    }
+    entry.running = running
+  }
+
+  return liveMap
+}
+
 function isManagedNode(node) {
   if (!node || typeof node.closest !== 'function') return false
-  return node.closest(`[${DOM_ATTRS.SWITCHER_HOST}],[${DOM_ATTRS.MESSAGES_HOST}],[${DOM_ATTRS.WS_HOST}]`) !== null
+  return node.closest(
+    `[${DOM_ATTRS.SWITCHER_HOST}],[${DOM_ATTRS.MESSAGES_HOST}],[${DOM_ATTRS.WS_HOST}],[${DOM_ATTRS.GLOBAL_SEARCH_HOST}]`,
+  ) !== null
 }
 
 function isManagedMutation(mutation) {
@@ -251,6 +329,14 @@ function sameWorkspaceRows(a, b) {
     if (a[i].key !== b[i].key || a[i].hostEl !== b[i].hostEl) return false
   }
   return true
+}
+
+function readInitialCollapsed() {
+  try {
+    return typeof localStorage !== 'undefined' && localStorage.getItem(DOM_ATTRS.READ_COLLAPSED_KEY) === 'true'
+  } catch {
+    return false
+  }
 }
 
 function clearInjectedNodes(scope = document) {
@@ -269,18 +355,30 @@ function clearInjectedNodes(scope = document) {
       el.removeAttribute(attr)
     }
   }
-  for (const el of scope.querySelectorAll(`[${DOM_ATTRS.SWITCHER_HOST}],[${DOM_ATTRS.MESSAGES_HOST}],[${DOM_ATTRS.WS_HOST}]`)) {
+  for (const el of scope.querySelectorAll(
+    `[${DOM_ATTRS.SWITCHER_HOST}],[${DOM_ATTRS.MESSAGES_HOST}],[${DOM_ATTRS.WS_HOST}],[${DOM_ATTRS.GLOBAL_SEARCH_HOST}]`,
+  )) {
     el.remove()
   }
 }
 
-function WorkspaceStatus({ wide, useWorkspaces, useSessions, useSessionStatus, usePanelInfo, openSession }) {
+export function WorkspaceStatus({
+  wide,
+  useWorkspaces,
+  useSessions,
+  useSessionStatus,
+  usePanelInfo,
+  openSession,
+  onToggleGlobalSearch,
+}) {
   const isWide = wide !== false
   const items = useStandard(useWorkspaces, state => state?.items, EMPTY_ITEMS)
   const archived = useStandard(useWorkspaces, state => state?.archivedSessionIds, EMPTY_ITEMS)
   const sessions = useStandard(useSessions, state => state?.byId, EMPTY_SESSIONS)
   const statuses = useStandard(useSessionStatus, state => state, EMPTY_STATUSES)
-  const panelActive = useStandard(usePanelInfo, info => info?.activePanelId !== null, false)
+  const activePanelId = useStandard(usePanelInfo, info => info?.activePanelId ?? null, null)
+  const panelActive = activePanelId !== null
+  const globalSearchActive = activePanelId === GLOBAL_SEARCH_PANEL_ID
 
   const currentId = React.useMemo(() => {
     if (panelActive) return undefined
@@ -304,9 +402,13 @@ function WorkspaceStatus({ wide, useWorkspaces, useSessions, useSessionStatus, u
   const watch = React.useRef(undefined)
   if (watch.current === undefined) watch.current = { running: new Set(), stoppedAt: new Map() }
 
+  const liveTimestampsRef = React.useRef(undefined)
+  if (liveTimestampsRef.current === undefined) liveTimestampsRef.current = new Map()
+
   const projected = React.useMemo(() => {
+    const liveMap = syncLiveTimestamps(liveTimestampsRef.current, sessions, statuses, archived)
     const result = typeof projectActivity === 'function'
-      ? projectActivity(items, sessions, statuses, archived)
+      ? projectActivity(items, sessions, statuses, archived, liveMap)
       : null
     return {
       counts: result?.counts instanceof Map ? result.counts : EMPTY_MAP,
@@ -331,10 +433,12 @@ function WorkspaceStatus({ wide, useWorkspaces, useSessions, useSessionStatus, u
 
   const [mode, setMode] = React.useState(VIEW_MODE.WORKSPACES)
   const [visibleLimit, setVisibleLimit] = React.useState(LIMITS.INITIAL_PAGE_SIZE)
+  const [readCollapsed, setReadCollapsed] = React.useState(readInitialCollapsed)
   const [clockNow, setClockNow] = React.useState(() => Date.now())
   const [anchors, setAnchors] = React.useState(() => ({
     switcherHost: null,
     messagesHost: null,
+    globalSearchHost: null,
     listArea: null,
     header: null,
     workspaceRows: EMPTY_ITEMS,
@@ -347,16 +451,20 @@ function WorkspaceStatus({ wide, useWorkspaces, useSessions, useSessionStatus, u
   const tabRefs = React.useRef({ [VIEW_MODE.WORKSPACES]: null, [VIEW_MODE.MESSAGES]: null })
   const listContainerRef = React.useRef(null)
   const stickyRef = React.useRef(null)
-  if (stickyRef.current === null) stickyRef.current = createStickyProjectController()
+  if (stickyRef.current === null && typeof createStickyProjectController === 'function') {
+    stickyRef.current = createStickyProjectController()
+  }
   const savedScrollRef = React.useRef({
     [VIEW_MODE.WORKSPACES]: 0,
     [VIEW_MODE.MESSAGES]: 0,
   })
+  const switchingScrollRef = React.useRef(false)
 
   const handleModeChange = React.useCallback((nextMode) => {
     if (nextMode === modeRef.current) return
     const listArea = anchorsRef.current.listArea
     if (listArea) savedScrollRef.current[modeRef.current] = listArea.scrollTop
+    switchingScrollRef.current = true
     setMode(nextMode)
   }, [])
 
@@ -371,6 +479,26 @@ function WorkspaceStatus({ wide, useWorkspaces, useSessions, useSessionStatus, u
     }
   }, [isWide, handleModeChange])
 
+  // Redirect collapsed-rail native search clicks to Global Search so there is one unified search entry.
+  React.useEffect(() => {
+    if (isWide || typeof document === 'undefined') return undefined
+    const onRailSearchClick = (event) => {
+      const target = event.target instanceof Element ? event.target.closest('button') : null
+      if (!target) return
+      const header = document.querySelector(DOM_ATTRS.NATIVE_HEADER)
+      const listArea = document.querySelector(DOM_ATTRS.NATIVE_LIST_AREA)
+      const railSearch = listArea?.previousElementSibling
+      if (!railSearch || railSearch === header || !railSearch.contains(target)) return
+      event.preventDefault()
+      event.stopPropagation()
+      onToggleGlobalSearch?.(globalSearchActive)
+    }
+    document.addEventListener('click', onRailSearchClick, true)
+    return () => {
+      document.removeEventListener('click', onRailSearchClick, true)
+    }
+  }, [isWide, globalSearchActive, onToggleGlobalSearch])
+
   const focusMessagesList = React.useCallback(() => {
     const firstRow = listContainerRef.current?.querySelector(`.${CLS.MSG_ROW}`)
     if (firstRow && typeof firstRow.focus === 'function') firstRow.focus()
@@ -384,6 +512,22 @@ function WorkspaceStatus({ wide, useWorkspaces, useSessions, useSessionStatus, u
   const handleLoadMore = React.useCallback(() => {
     setVisibleLimit(limit => limit + LIMITS.PAGE_STEP)
   }, [])
+
+  const handleToggleReadCollapsed = React.useCallback(() => {
+    setReadCollapsed((prev) => {
+      const next = !prev
+      try {
+        if (typeof localStorage !== 'undefined') {
+          localStorage.setItem(DOM_ATTRS.READ_COLLAPSED_KEY, next ? 'true' : 'false')
+        }
+      } catch { /* ignore storage errors */ }
+      return next
+    })
+  }, [])
+
+  const handleTriggerGlobalSearch = React.useCallback(() => {
+    onToggleGlobalSearch?.(globalSearchActive)
+  }, [onToggleGlobalSearch, globalSearchActive])
 
   // Keep relative timestamps accurate only while the Messages list is visible.
   React.useEffect(() => {
@@ -400,25 +544,67 @@ function WorkspaceStatus({ wide, useWorkspaces, useSessions, useSessionStatus, u
     }
   }, [isWide, mode])
 
-  // Non-destructive view toggle: hides/reveals native tree rows and restores saved scroll offset.
+  // Track active tab scroll position continuously while settled in that tab.
+  React.useEffect(() => {
+    const { listArea } = anchors
+    if (!isWide || !listArea) return undefined
+    const onListScroll = () => {
+      if (switchingScrollRef.current) return
+      savedScrollRef.current[modeRef.current] = listArea.scrollTop
+    }
+    listArea.addEventListener('scroll', onListScroll, { passive: true })
+    return () => {
+      listArea.removeEventListener('scroll', onListScroll)
+    }
+  }, [isWide, anchors.listArea])
+
+  // Non-destructive view toggle: hides/reveals native tree rows and restores saved scroll offset per tab.
   React.useLayoutEffect(() => {
     const { listArea, header } = anchors
     if (!isWide) {
       if (listArea) listArea.removeAttribute(DOM_ATTRS.VIEW)
       if (header) header.removeAttribute(DOM_ATTRS.HEADER_HIDDEN)
-      return
+      switchingScrollRef.current = false
+      return undefined
     }
-    if (listArea) {
-      if (mode === VIEW_MODE.MESSAGES) listArea.setAttribute(DOM_ATTRS.VIEW, DOM_ATTRS.VIEW_MESSAGES)
-      else listArea.removeAttribute(DOM_ATTRS.VIEW)
-      const targetTop = savedScrollRef.current[mode] ?? 0
-      if (listArea.scrollTop !== targetTop) listArea.scrollTop = targetTop
+
+    const scrollport = typeof document !== 'undefined' ? document.querySelector(DOM_ATTRS.NATIVE_SCROLLPORT) : null
+    if (scrollport && scrollport.scrollTop !== 0) {
+      scrollport.scrollTop = 0
     }
+
     if (header) {
       if (mode === VIEW_MODE.MESSAGES) header.setAttribute(DOM_ATTRS.HEADER_HIDDEN, 'true')
       else header.removeAttribute(DOM_ATTRS.HEADER_HIDDEN)
     }
+    const targetTop = savedScrollRef.current[mode] ?? 0
+    if (listArea) {
+      if (mode === VIEW_MODE.MESSAGES) listArea.setAttribute(DOM_ATTRS.VIEW, DOM_ATTRS.VIEW_MESSAGES)
+      else listArea.removeAttribute(DOM_ATTRS.VIEW)
+      if (listArea.scrollTop !== targetTop) listArea.scrollTop = targetTop
+    }
     stickyRef.current?.sync(listArea, isWide && mode === VIEW_MODE.WORKSPACES)
+
+    let rafId = 0
+    if (listArea && typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
+      rafId = window.requestAnimationFrame(() => {
+        rafId = 0
+        if (modeRef.current === mode && targetTop > 0 && listArea.scrollTop === 0 && listArea.scrollHeight > listArea.clientHeight) {
+          listArea.scrollTop = targetTop
+          stickyRef.current?.sync(listArea, mode === VIEW_MODE.WORKSPACES)
+        }
+        switchingScrollRef.current = false
+      })
+    } else {
+      switchingScrollRef.current = false
+    }
+
+    return () => {
+      if (rafId !== 0 && typeof window !== 'undefined' && typeof window.cancelAnimationFrame === 'function') {
+        window.cancelAnimationFrame(rafId)
+      }
+      switchingScrollRef.current = false
+    }
   }, [isWide, mode, anchors.listArea, anchors.header])
 
   // Idempotent portal-host attachment + MutationObserver for native sidebar DOM nodes.
@@ -430,6 +616,7 @@ function WorkspaceStatus({ wide, useWorkspaces, useSessions, useSessionStatus, u
       setAnchors({
         switcherHost: null,
         messagesHost: null,
+        globalSearchHost: null,
         listArea: null,
         header: null,
         workspaceRows: EMPTY_ITEMS,
@@ -446,18 +633,6 @@ function WorkspaceStatus({ wide, useWorkspaces, useSessions, useSessionStatus, u
       const listArea = rootScope.querySelector(DOM_ATTRS.NATIVE_LIST_AREA) || document.querySelector(DOM_ATTRS.NATIVE_LIST_AREA)
       region = rootScope === document ? (header ?? listArea)?.parentElement : rootScope
 
-      // If native search shortcut expands while viewing Messages, restore the Workspaces view seamlessly.
-      if (modeRef.current === VIEW_MODE.MESSAGES && header) {
-        const searchExpanded = header.querySelector('button[aria-expanded="true"]')
-        if (searchExpanded) {
-          if (listArea) savedScrollRef.current[VIEW_MODE.MESSAGES] = listArea.scrollTop
-          setMode(VIEW_MODE.WORKSPACES)
-          window.requestAnimationFrame(() => {
-            header.querySelector('input')?.focus({ preventScroll: true })
-          })
-        }
-      }
-
       let switcherHost = null
       if (header && header.parentElement) {
         switcherHost = findDirectChild(header.parentElement, DOM_ATTRS.SWITCHER_HOST)
@@ -468,6 +643,19 @@ function WorkspaceStatus({ wide, useWorkspaces, useSessions, useSessionStatus, u
           header.parentElement.insertBefore(switcherHost, header)
         } else if (switcherHost.nextElementSibling !== header) {
           header.parentElement.insertBefore(switcherHost, header)
+        }
+      }
+
+      let globalSearchHost = null
+      if (header) {
+        const nativeSearchSlot = findNativeSearchSlot(header)
+        if (nativeSearchSlot) {
+          globalSearchHost = findDirectChild(nativeSearchSlot, DOM_ATTRS.GLOBAL_SEARCH_HOST)
+          if (!globalSearchHost) {
+            globalSearchHost = document.createElement('div')
+            globalSearchHost.setAttribute(DOM_ATTRS.GLOBAL_SEARCH_HOST, '')
+            nativeSearchSlot.appendChild(globalSearchHost)
+          }
         }
       }
 
@@ -504,13 +692,14 @@ function WorkspaceStatus({ wide, useWorkspaces, useSessions, useSessionStatus, u
         if (
           prev.switcherHost === switcherHost
           && prev.messagesHost === messagesHost
+          && prev.globalSearchHost === globalSearchHost
           && prev.listArea === listArea
           && prev.header === header
           && sameWorkspaceRows(prev.workspaceRows, workspaceRows)
         ) {
           return prev
         }
-        return { switcherHost, messagesHost, listArea, header, workspaceRows }
+        return { switcherHost, messagesHost, globalSearchHost, listArea, header, workspaceRows }
       })
       stickyRef.current?.sync(listArea, isWide && modeRef.current === VIEW_MODE.WORKSPACES)
     }
@@ -583,6 +772,13 @@ function WorkspaceStatus({ wide, useWorkspaces, useSessions, useSessionStatus, u
       }),
       anchors.switcherHost,
     ),
+    canPortal && isWide && anchors.globalSearchHost && createPortal(
+      React.createElement(HeaderGlobalSearchButton, {
+        active: globalSearchActive,
+        onTrigger: handleTriggerGlobalSearch,
+      }),
+      anchors.globalSearchHost,
+    ),
     canPortal && isWide && mode === VIEW_MODE.MESSAGES && anchors.messagesHost && createPortal(
       React.createElement(MessagesView, {
         rows: projected.rows,
@@ -591,6 +787,8 @@ function WorkspaceStatus({ wide, useWorkspaces, useSessions, useSessionStatus, u
         currentId,
         now: clockNow,
         visibleLimit,
+        readCollapsed,
+        onToggleReadCollapsed: handleToggleReadCollapsed,
         onLoadMore: handleLoadMore,
         onSelectSession: openSession,
         listContainerRef,
@@ -629,6 +827,7 @@ export function apply(ctx) {
         order: SLOT_CONFIG.ORDER,
         inject: () => ({
           openSession: sessionId => openNativeSession(ctx, sessionId),
+          onToggleGlobalSearch: currentlyActive => toggleGlobalSearchPanel(ctx, currentlyActive),
         }),
       },
       WorkspaceStatus,

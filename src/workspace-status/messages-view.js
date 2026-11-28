@@ -1,5 +1,7 @@
 import React from 'react'
-import { CLS, LIMITS, VIEW_MODE } from './styles.js'
+import { MESSAGE_GROUP } from './activity.js'
+import { pollBridgeIndexActivity, subscribeBridgeSearchState } from './search-bridge.js'
+import { CLS, DOM_ATTRS, LIMITS, VIEW_MODE } from './styles.js'
 
 const h = React.createElement
 
@@ -17,9 +19,14 @@ const DICTIONARIES = {
     'view.workspaces': 'Workspaces',
     'view.messages': 'Messages',
     'view.messagesAria': 'Messages ({counts})',
+    'headerSearch.label': 'Global search',
+    'headerSearch.indexing': 'Updating search index',
     'msg.panelLabel': 'Messages list',
     'msg.section.running': 'Running',
-    'msg.section.finished': 'Finished',
+    'msg.section.waiting': 'Waiting for reply',
+    'msg.section.finished': 'Completed',
+    'msg.readGroup.expand': 'Show read & completed',
+    'msg.readGroup.collapse': 'Collapse read & completed',
     'msg.summary.progress': '{shown} / {total}',
     'msg.summary.total': '{n} sessions',
     'msg.status.running': 'Running',
@@ -53,9 +60,14 @@ const DICTIONARIES = {
     'view.workspaces': '工作区',
     'view.messages': '消息',
     'view.messagesAria': '消息列表（{counts}）',
+    'headerSearch.label': '全局搜索',
+    'headerSearch.indexing': '索引更新中',
     'msg.panelLabel': '消息列表',
     'msg.section.running': '运行中',
-    'msg.section.finished': '已结束',
+    'msg.section.waiting': '待回复',
+    'msg.section.finished': '已完成',
+    'msg.readGroup.expand': '展开已读已完成',
+    'msg.readGroup.collapse': '收起已读已完成',
     'msg.summary.progress': '{shown} / {total}',
     'msg.summary.total': '共 {n} 条',
     'msg.status.running': '运行中',
@@ -453,6 +465,145 @@ function renderRailIndicator(row) {
   return h('span', { className: `${CLS.MSG_DOT} ${CLS.MSG_DOT_IDLE}` })
 }
 
+function HeaderSearchSvg(size = 15) {
+  return h(
+    'svg',
+    { viewBox: '0 0 20 20', width: size, height: size, fill: 'none', 'aria-hidden': 'true', focusable: 'false' },
+    h('circle', { cx: '8.5', cy: '8.5', r: '5.2', stroke: 'currentColor', strokeWidth: 1.5 }),
+    h('path', { d: 'M12.4 12.4 17 17', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round' }),
+    h('path', { d: 'M6.2 8.7h4.6M6.2 6.3h2.6', stroke: 'currentColor', strokeWidth: 1.1, strokeLinecap: 'round', opacity: '0.72' }),
+  )
+}
+
+function ChevronRightIcon(size = 12) {
+  return h(
+    'svg',
+    { width: size, height: size, viewBox: '0 0 12 12', fill: 'none', 'aria-hidden': 'true', focusable: 'false' },
+    h('path', {
+      d: 'M4.5 2.5L8 6l-3.5 3.5',
+      stroke: 'currentColor',
+      strokeWidth: 1.4,
+      strokeLinecap: 'round',
+      strokeLinejoin: 'round',
+    }),
+  )
+}
+
+/** Global Search trigger mounted in place of the native search button next to "工作区". */
+export function HeaderGlobalSearchButton({ active, onTrigger }) {
+  const [indexing, setIndexing] = React.useState(false)
+  const [inSearch, setInSearch] = React.useState(false)
+
+  React.useEffect(() => subscribeBridgeSearchState((snap) => {
+    setIndexing(snap.active)
+    setInSearch(snap.searchMounts > 0)
+  }), [])
+
+  React.useEffect(() => {
+    if (inSearch) return undefined
+    let cancelled = false
+    let timer = null
+    let controller = null
+    const poll = () => {
+      controller = new AbortController()
+      const promise = pollBridgeIndexActivity(controller.signal)
+      if (!promise || typeof promise.then !== 'function') return
+      promise.then(
+        (val) => {
+          if (cancelled) return
+          setIndexing(Boolean(val && (val.progress ? val.progress.active : val.active)))
+          timer = setTimeout(poll, 2500)
+        },
+        () => {
+          if (!cancelled) timer = setTimeout(poll, 4000)
+        },
+      )
+    }
+    poll()
+    return () => {
+      cancelled = true
+      controller?.abort()
+      if (timer !== null) clearTimeout(timer)
+    }
+  }, [inSearch])
+
+  const label = getMessage('headerSearch.label')
+  return h(
+    'button',
+    {
+      type: 'button',
+      className: CLS.HEADER_SEARCH_BTN,
+      [DOM_ATTRS.GLOBAL_SEARCH_BTN]: 'true',
+      'data-active': active ? 'true' : undefined,
+      'aria-label': label,
+      'aria-pressed': active ? 'true' : 'false',
+      title: indexing ? `${label} · ${getMessage('headerSearch.indexing')}` : label,
+      onClick: onTrigger,
+    },
+    HeaderSearchSvg(15),
+    indexing && h('span', {
+      className: CLS.HEADER_SEARCH_DOT,
+      role: 'status',
+      'aria-label': getMessage('headerSearch.indexing'),
+    }),
+  )
+}
+
+/** Partition sorted activity rows into Messages sections with collapsible read+completed slicing. */
+export function partitionMessageRows(rows, { visibleLimit = LIMITS.INITIAL_PAGE_SIZE, readCollapsed = false } = {}) {
+  const safeRows = Array.isArray(rows) ? rows : []
+  const running = []
+  const waiting = []
+  const finishedUnread = []
+  const finishedRead = []
+  for (const row of safeRows) {
+    const group = row.group ?? (row.waiting ? MESSAGE_GROUP.WAITING : row.running ? MESSAGE_GROUP.RUNNING : MESSAGE_GROUP.FINISHED)
+    if (group === MESSAGE_GROUP.RUNNING) running.push(row)
+    else if (group === MESSAGE_GROUP.WAITING) waiting.push(row)
+    else if (row.unread) finishedUnread.push(row)
+    else finishedRead.push(row)
+  }
+
+  const limit = Number.isFinite(visibleLimit) && visibleLimit > 0 ? visibleLimit : LIMITS.INITIAL_PAGE_SIZE
+  let budget = limit
+  const take = (list) => {
+    if (budget <= 0 || list.length === 0) return []
+    const slice = list.slice(0, budget)
+    budget -= slice.length
+    return slice
+  }
+
+  const runningSlice = take(running)
+  const waitingSlice = take(waiting)
+  const finishedUnreadSlice = take(finishedUnread)
+  const finishedReadSlice = readCollapsed ? [] : take(finishedRead)
+
+  const shownCount = runningSlice.length + waitingSlice.length + finishedUnreadSlice.length + finishedReadSlice.length
+  const expandedTotal = running.length + waiting.length + finishedUnread.length + (readCollapsed ? 0 : finishedRead.length)
+  const remaining = Math.max(0, expandedTotal - shownCount)
+
+  return {
+    totals: {
+      total: safeRows.length,
+      running: running.length,
+      waiting: waiting.length,
+      unread: finishedUnread.length,
+      finished: finishedUnread.length + finishedRead.length,
+      finishedUnread: finishedUnread.length,
+      finishedRead: finishedRead.length,
+    },
+    slices: {
+      running: runningSlice,
+      waiting: waitingSlice,
+      finishedUnread: finishedUnreadSlice,
+      finishedRead: finishedReadSlice,
+    },
+    shownCount,
+    expandedTotal,
+    remaining,
+  }
+}
+
 function renderMessageRow({ row, session, status, currentId, now, onSelectSession }) {
   const isCurrent = row.id === currentId
   const rawTitle = typeof row.title === 'string' ? row.title.trim() : ''
@@ -464,19 +615,20 @@ function renderMessageRow({ row, session, status, currentId, now, onSelectSessio
   const wsTitle = typeof row.workspaceTitle === 'string' && row.workspaceTitle.trim() !== ''
     ? row.workspaceTitle.trim()
     : getMessage('activity.unnamed')
-  const relTime = formatRelativeTime(row.updatedAt, now)
-  const absTime = formatAbsoluteTime(row.updatedAt)
+  const displayTime = row.sortAt || row.updatedAt
+  const relTime = formatRelativeTime(displayTime, now)
+  const absTime = formatAbsoluteTime(displayTime)
   const summary = extractNativeSummary(row, session, title)
 
   const badges = []
   if (row.waiting) badges.push({ cls: CLS.TAG_WARN, text: waitingKindLabel(status) })
-  if (row.running) badges.push({ cls: CLS.TAG_RUN, text: getMessage('msg.status.running') })
+  if (row.running && !row.waiting) badges.push({ cls: CLS.TAG_RUN, text: getMessage('msg.status.running') })
   if (row.failed) badges.push({ cls: CLS.TAG_ERR, text: getMessage('msg.status.failed') })
   else if (row.unread) badges.push({ cls: CLS.TAG_UNREAD, text: getMessage('msg.status.unread') })
 
   const rowClasses = [CLS.MSG_ROW]
   if (isCurrent) rowClasses.push(CLS.MSG_ROW_ACTIVE)
-  if (row.running) rowClasses.push(CLS.MSG_ROW_RUNNING)
+  if (row.running && !row.waiting) rowClasses.push(CLS.MSG_ROW_RUNNING)
   if (row.unread) rowClasses.push(CLS.MSG_ROW_UNREAD)
   if (row.waiting) rowClasses.push(CLS.MSG_ROW_WAITING)
   if (row.failed) rowClasses.push(CLS.MSG_ROW_FAILED)
@@ -538,6 +690,22 @@ function renderMessageRow({ row, session, status, currentId, now, onSelectSessio
   )
 }
 
+function renderRowList(items, context) {
+  if (items.length === 0) return null
+  return h(
+    'ul',
+    { className: CLS.MSG_LIST },
+    items.map(row => renderMessageRow({
+      row,
+      session: context.sessions?.[row.id],
+      status: context.statuses?.get?.(row.id),
+      currentId: context.currentId,
+      now: context.now,
+      onSelectSession: context.onSelectSession,
+    })),
+  )
+}
+
 function renderSection(title, totalCount, items, context) {
   if (items.length === 0) return null
   return h(
@@ -549,22 +717,53 @@ function renderSection(title, totalCount, items, context) {
       h('span', null, title),
       h('span', { className: CLS.MSG_SEC_COUNT }, String(totalCount)),
     ),
-    h(
-      'ul',
-      { className: CLS.MSG_LIST },
-      items.map(row => renderMessageRow({
-        row,
-        session: context.sessions?.[row.id],
-        status: context.statuses?.get?.(row.id),
-        currentId: context.currentId,
-        now: context.now,
-        onSelectSession: context.onSelectSession,
-      })),
-    ),
+    renderRowList(items, context),
   )
 }
 
-/** Switchable sidebar inbox list ordered running-first, then updatedAt descending. */
+function renderFinishedSection({
+  title,
+  totals,
+  slices,
+  readCollapsed,
+  onToggleReadCollapsed,
+  context,
+}) {
+  if (totals.finished === 0) return null
+  const showReadToggle = totals.finishedRead > 0
+    && (readCollapsed || slices.finishedUnread.length === totals.finishedUnread)
+  const hasVisibleItems = slices.finishedUnread.length > 0 || slices.finishedRead.length > 0
+  if (!hasVisibleItems && !showReadToggle) return null
+
+  const toggleLabel = getMessage(readCollapsed ? 'msg.readGroup.expand' : 'msg.readGroup.collapse')
+  return h(
+    'section',
+    { className: CLS.MSG_SEC, 'aria-label': `${title} (${totals.finished})` },
+    h(
+      'div',
+      { className: CLS.MSG_SEC_HEAD },
+      h('span', null, title),
+      h('span', { className: CLS.MSG_SEC_COUNT }, String(totals.finished)),
+    ),
+    renderRowList(slices.finishedUnread, context),
+    showReadToggle && h(
+      'button',
+      {
+        type: 'button',
+        className: CLS.MSG_READ_TOGGLE,
+        'data-dswb-read-toggle': 'true',
+        'aria-expanded': !readCollapsed,
+        onClick: onToggleReadCollapsed,
+      },
+      h('span', { className: CLS.MSG_READ_CHEVRON, 'aria-hidden': 'true' }, ChevronRightIcon(12)),
+      h('span', null, toggleLabel),
+      h('span', { className: CLS.MSG_READ_COUNT }, String(totals.finishedRead)),
+    ),
+    !readCollapsed && renderRowList(slices.finishedRead, context),
+  )
+}
+
+/** Switchable sidebar inbox list grouped into Running, Waiting, and Completed (unread first). */
 export function MessagesView({
   rows,
   sessions,
@@ -572,45 +771,33 @@ export function MessagesView({
   currentId,
   now,
   visibleLimit,
+  readCollapsed = false,
+  onToggleReadCollapsed,
   onLoadMore,
   onSelectSession,
   listContainerRef,
   onReturnToTabs,
 }) {
-  const safeRows = Array.isArray(rows) ? rows : []
-  let totalRunning = 0
-  let totalUnread = 0
-  let totalWaiting = 0
-  for (const row of safeRows) {
-    if (row.running) totalRunning += 1
-    if (row.unread) totalUnread += 1
-    if (row.waiting) totalWaiting += 1
-  }
-  const totalFinished = safeRows.length - totalRunning
-  const visibleRows = safeRows.slice(0, visibleLimit)
-  const runningSlice = []
-  const finishedSlice = []
-  for (const row of visibleRows) {
-    if (row.running) runningSlice.push(row)
-    else finishedSlice.push(row)
-  }
+  const { totals, slices, shownCount, expandedTotal, remaining } = partitionMessageRows(rows, {
+    visibleLimit,
+    readCollapsed,
+  })
 
   const sep = getMessage('activity.listSeparator')
   const summaryClauses = buildCountClauses({
-    waiting: totalWaiting,
-    running: totalRunning,
-    unread: totalUnread,
+    waiting: totals.waiting,
+    running: totals.running,
+    unread: totals.unread,
   })
   const summaryText = summaryClauses.length > 0
     ? summaryClauses.join(sep)
-    : getMessage('msg.summary.total', { n: safeRows.length })
-  const remaining = Math.max(0, safeRows.length - visibleRows.length)
+    : getMessage('msg.summary.total', { n: totals.total })
 
   const onPanelKeyDown = (event) => {
     if (event.altKey || event.ctrlKey || event.metaKey) return
     const root = listContainerRef?.current
     if (!root) return
-    const focusables = Array.from(root.querySelectorAll(`.${CLS.MSG_ROW}, .${CLS.LOAD_MORE}`))
+    const focusables = Array.from(root.querySelectorAll(`.${CLS.MSG_ROW}, .${CLS.MSG_READ_TOGGLE}, .${CLS.LOAD_MORE}`))
     if (focusables.length === 0) return
     const activeEl = typeof document !== 'undefined' ? document.activeElement : null
     const activeIndex = focusables.indexOf(activeEl)
@@ -631,6 +818,8 @@ export function MessagesView({
     }
   }
 
+  const rowContext = { sessions, statuses, currentId, now, onSelectSession }
+
   return h(
     'div',
     {
@@ -642,7 +831,7 @@ export function MessagesView({
       className: CLS.MSG_ROOT,
       onKeyDown: onPanelKeyDown,
     },
-    safeRows.length === 0
+    totals.total === 0
       ? h(
         'div',
         { className: CLS.EMPTY },
@@ -659,22 +848,18 @@ export function MessagesView({
           remaining > 0 && h(
             'span',
             { className: CLS.MSG_BAR_COUNT },
-            getMessage('msg.summary.progress', { shown: visibleRows.length, total: safeRows.length }),
+            getMessage('msg.summary.progress', { shown: shownCount, total: expandedTotal }),
           ),
         ),
-        renderSection(getMessage('msg.section.running'), totalRunning, runningSlice, {
-          sessions,
-          statuses,
-          currentId,
-          now,
-          onSelectSession,
-        }),
-        renderSection(getMessage('msg.section.finished'), totalFinished, finishedSlice, {
-          sessions,
-          statuses,
-          currentId,
-          now,
-          onSelectSession,
+        renderSection(getMessage('msg.section.running'), totals.running, slices.running, rowContext),
+        renderSection(getMessage('msg.section.waiting'), totals.waiting, slices.waiting, rowContext),
+        renderFinishedSection({
+          title: getMessage('msg.section.finished'),
+          totals,
+          slices,
+          readCollapsed,
+          onToggleReadCollapsed,
+          context: rowContext,
         }),
         remaining > 0 && h(
           'button',

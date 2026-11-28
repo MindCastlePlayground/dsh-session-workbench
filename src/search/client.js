@@ -1,3 +1,5 @@
+import { setBridgeIndexActive, setBridgePoller, setBridgeSearchMounts } from '../workspace-status/search-bridge.js'
+
 export function createSearchClient(React) {
   const h = React.createElement
   const { useCallback, useEffect, useMemo, useRef, useState } = React
@@ -2594,25 +2596,10 @@ export function createSearchClient(React) {
       indexUpdate: 'Update index', indexSaved: 'Saved', indexMinErr: 'Enter at least 1 MiB, or leave blank',
     },
   }
-  const indexStore = { active: false, searchMounts: 0, listeners: new Set() }
-  function notifyIndexStore() {
-    const snap = { active: indexStore.active, searchMounts: indexStore.searchMounts }
-    indexStore.listeners.forEach((fn) => fn(snap))
-  }
-  function setSharedIndexActive(active) {
-    const next = Boolean(active)
-    if (indexStore.active === next) return
-    indexStore.active = next
-    notifyIndexStore()
-  }
+  let searchMounts = 0
   function trackSearchMount(delta) {
-    indexStore.searchMounts = Math.max(0, indexStore.searchMounts + delta)
-    notifyIndexStore()
-  }
-  function subscribeIndexActivity(fn) {
-    indexStore.listeners.add(fn)
-    fn({ active: indexStore.active, searchMounts: indexStore.searchMounts })
-    return () => indexStore.listeners.delete(fn)
+    searchMounts = Math.max(0, searchMounts + delta)
+    setBridgeSearchMounts(searchMounts)
   }
   function isIndexFull(st) {
     return st?.error?.code === 'index-full'
@@ -2638,8 +2625,6 @@ export function createSearchClient(React) {
     return !Number.isFinite(n) || n < 1 ? { ok: false, value: null } : { ok: true, value: Math.round(n * MIN_INDEX_BYTES) }
   }
   const INDEX_CSS = [
-    '.dsh-cg-icon-wrap{position:relative;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0}',
-    '.dsh-cg-index-marker{position:absolute;top:-1px;right:-1px;width:6px;height:6px;border-radius:999px;background:var(--dsh-cg-accent,#0284c7);box-shadow:0 0 0 1.5px var(--dsh-cg-surface,#fff);animation:dsh-cg-idx-pulse 1.5s ease-in-out infinite}',
     '.dsh-cg-index-controls{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px 12px;margin:8px 0 10px;padding:7px 10px;border-radius:8px;border:1px solid color-mix(in srgb,currentColor 13%,transparent);background:color-mix(in srgb,currentColor 3.5%,transparent);font-size:12px;line-height:1.35;font-variant-numeric:tabular-nums}',
     '.dsh-cg-index-meta{display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px;min-width:0}',
     '.dsh-cg-index-dot{width:6px;height:6px;border-radius:999px;flex-shrink:0;background:color-mix(in srgb,currentColor 35%,transparent)}',
@@ -2665,7 +2650,7 @@ export function createSearchClient(React) {
     '.dsh-cg-index-btn--primary:hover:not(:disabled){background:color-mix(in srgb,var(--dsh-cg-accent,#0284c7) 20%,transparent)}',
     '.dsh-cg-index-btn:disabled{opacity:.48;cursor:not-allowed}',
     '@keyframes dsh-cg-idx-pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.45;transform:scale(.85)}}',
-    '@media (prefers-reduced-motion:reduce){.dsh-cg-index-marker,.dsh-cg-index-dot,.dsh-cg-index-controls *{animation:none!important;transition:none!important}}',
+    '@media (prefers-reduced-motion:reduce){.dsh-cg-index-dot,.dsh-cg-index-controls *{animation:none!important;transition:none!important}}',
     '@media (max-width:520px){.dsh-cg-index-actions{margin-left:0;width:100%}.dsh-cg-index-input{width:76px}}',
   ].join('')
 
@@ -3008,50 +2993,6 @@ export function createSearchClient(React) {
       h('path', {
         d: 'M590.665387 86.129778v178.119111c-390.144 0-713.386667 129.649778-544.995556 703.260444-26.396444-358.570667 147.456-471.096889 544.995556-471.096889v174.762667a30.606222 30.606222 0 0 0 52.451555 21.959111l371.768889-291.783111a31.232 31.232 0 0 0 0-44.032l-371.768889-293.205333a30.606222 30.606222 0 1 0-52.451555 22.016z',
       }),
-    )
-  }
-
-  /** The left rail's glyph: a magnifier over message lines. */
-  function GlobalSearchIcon(props) {
-    const size = typeof props.size === 'number' ? props.size : 18
-    const [active, setActive] = useState(() => indexStore.active)
-    const [inSearch, setInSearch] = useState(() => indexStore.searchMounts > 0)
-    useEffect(() => {
-      return subscribeIndexActivity((snap) => { setActive(snap.active); setInSearch(snap.searchMounts > 0) })
-    }, [])
-    useEffect(() => {
-      if (inSearch) return undefined
-      let cancelled = false, timer = null, controller = null
-      const poll = () => {
-        controller = new AbortController()
-        fetchIndexActivity(controller.signal).then(
-          (val) => {
-            if (cancelled) return
-            setSharedIndexActive(Boolean(val && (val.progress ? val.progress.active : val.active)))
-            timer = setTimeout(poll, 2500)
-          },
-          () => { if (!cancelled) timer = setTimeout(poll, 4000) },
-        )
-      }
-      poll()
-      return () => { cancelled = true; if (controller) controller.abort(); if (timer !== null) clearTimeout(timer) }
-    }, [inSearch])
-    return h(
-      'span',
-      { className: 'dsh-cg-icon-wrap', style: { width: size, height: size } },
-      h(
-        'svg',
-        { viewBox: '0 0 20 20', width: size, height: size, fill: 'none', 'aria-hidden': 'true' },
-        h('circle', { cx: '8.5', cy: '8.5', r: '5.2', stroke: 'currentColor', strokeWidth: 1.5 }),
-        h('path', { d: 'M12.4 12.4 17 17', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round' }),
-        h('path', { d: 'M6.2 8.7h4.6M6.2 6.3h2.6', stroke: 'currentColor', strokeWidth: 1.1, strokeLinecap: 'round', opacity: '0.7' }),
-      ),
-      active ? h('span', {
-        className: 'dsh-cg-index-marker',
-        title: props.t?.('indexUpdating'),
-        role: 'status',
-        'aria-label': props.t?.('indexUpdating'),
-      }) : null,
     )
   }
 
@@ -3736,7 +3677,7 @@ export function createSearchClient(React) {
       setBuild(next)
       const built = Boolean(st && typeof st.builtAt === 'number' && st.builtAt > 0)
       setIndexBuilt(built)
-      setSharedIndexActive(Boolean(next && next.active === true))
+      setBridgeIndexActive(Boolean(next && next.active === true))
       if (syncCap && !capDirtyRef.current) setCapInput(formatMibInput(st && st.maxBytes))
       setIndexError(!built ? readIndexError(st?.error) : '')
       setCapError(built && !isIndexFull(st) ? readIndexError(st?.error) : '')
@@ -3768,7 +3709,7 @@ export function createSearchClient(React) {
             (res) => {
               if (cancelled) return
               setStartingUpdate(false)
-              if (res && res.progress) { setBuild(res.progress); setSharedIndexActive(res.progress.active === true) }
+              if (res && res.progress) { setBuild(res.progress); setBridgeIndexActive(res.progress.active === true) }
               if (res && res.error) setCapError(readIndexError(res.error))
               if (res && res.progress && res.progress.active === true) setPollSeq((n) => n + 1)
             },
@@ -3845,7 +3786,7 @@ export function createSearchClient(React) {
         (res) => {
           if (c.signal.aborted) return
           setStartingUpdate(false)
-          if (res && res.progress) { setBuild(res.progress); setSharedIndexActive(res.progress.active === true) }
+          if (res && res.progress) { setBuild(res.progress); setBridgeIndexActive(res.progress.active === true) }
           if (res && res.error) setCapError(readIndexError(res.error))
           setPollSeq((n) => n + 1)
         },
@@ -4986,23 +4927,11 @@ export function createSearchClient(React) {
       'conversation-search: header button',
     )
 
-    /* The left rail entry and the page it opens: the icon's id addresses the `main` key. */
-    ctx.effect(
-      () =>
-        ctx.slots.inject('sidebar.panellist', () =>
-          ctx.slots.register(
-            {
-              name: 'sidebar.panellist',
-              id: PANEL_ID,
-              order: 5,
-              label: () => t('global.title'),
-              locale: NS,
-            },
-            GlobalSearchIcon,
-          ),
-        ),
-      'conversation-search: global panel icon',
-    )
+    /* Global search is launched from the workspaces header; share index polling for its indicator. */
+    ctx.effect(() => {
+      setBridgePoller(fetchIndexActivity)
+      return () => setBridgePoller(null)
+    }, 'conversation-search: index poller bridge')
 
     ctx.effect(
       () =>

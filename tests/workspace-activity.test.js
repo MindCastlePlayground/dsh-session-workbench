@@ -25,10 +25,11 @@ test('messages prioritize running sessions and count native unread independently
 
   const { counts, rows } = projectActivity(items, sessions, statuses, ['archived'])
 
-  assert.deepEqual(rows.map(row => row.id), ['pending', 'parent', 'recent', 'ungrouped'])
+  assert.deepEqual(rows.map(row => row.id), ['parent', 'pending', 'recent', 'ungrouped'])
   assert.deepEqual(counts.get('alpha'), { running: 1, unread: 2, waiting: 1 })
-  assert.equal(rows[0].waiting, true)
-  assert.equal(rows[1].unread, true)
+  assert.equal(rows[0].running, true)
+  assert.equal(rows[1].waiting, true)
+  assert.equal(rows[1].unread, false)
   assert.equal(rows[2].failed, true)
   assert.equal(rows[2].workspaceTitle, 'Alpha')
 })

@@ -566,7 +566,7 @@ check(
   'jump runner registered',
   byName('conversation.session.header.utilities').some((entry) => entry.options.id === 'dsh-chat-search/tab:jump'),
 )
-check('left rail icon registered', byName('sidebar.panellist').some((entry) => entry.options.id === 'global-search'))
+check('left rail icon omitted', !byName('sidebar.panellist').some((entry) => entry.options.id === 'global-search'))
 check('global page registered', byName('main').some((entry) => entry.options.key === 'global-search'))
 check('tab type registered', tabDefinition !== null)
 /* The start-page guide lists registered types that contribute a capsule; picking it opens the tab. */
